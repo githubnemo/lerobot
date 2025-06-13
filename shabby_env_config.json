@@ -1,0 +1,82 @@
+{
+  "type": "gym_manipulator",
+  "robot": {
+    "type": "so101_follower_end_effector",
+    "port": "/dev/ttyACM4",
+    "id": "shabby",
+    "cameras": {
+      "side": {
+        "type": "opencv", 
+        "index_or_path": 2,
+        "height": 480,
+        "width": 640,
+        "fps": 30
+      }
+    },
+    "end_effector_bounds": {
+      "min": [0.0806, -0.117, 0.145],
+      "max": [0.4148, 0.3537, 0.6458]
+    },
+    "end_effector_step_sizes": {
+      "x": 0.02,
+      "y": 0.02,
+      "z": 0.02
+    },
+    "max_gripper_pos": 50,
+    "use_degrees": false
+  },
+  "teleop": {
+    "type": "so101_leader",
+    "port": "/dev/ttyACM3",
+    "id": "shabby_leader",
+    "use_degrees": false
+  },
+  "wrapper": {
+    "display_cameras": false,
+    "add_joint_velocity_to_observation": false,
+    "add_current_to_observation": false,
+    "add_ee_pose_to_observation": false,
+    "crop_params_dict": null,
+    "resize_size": [128, 128],
+    "control_time_s": 20.0,
+    "use_gripper": true,
+    "gripper_quantization_threshold": 0.8,
+    "gripper_penalty": 0.0,
+    "gripper_penalty_in_reward": false,
+    "fixed_reset_joint_positions": [0.0, 0.0, 0.0, 0.0, 0.0, 25.0],
+    "reset_time_s": 5.0,
+    "control_mode": "leader"
+  },
+  "name": "shabby_robot",
+  "mode": "record",
+  "repo_id": "your_username/shabby_task_dataset",
+  "dataset_root": null,
+  "task": "shabby_manipulation_task",
+  "num_episodes": 15,
+  "episode": 0,
+  "pretrained_policy_name_or_path": null,
+  "device": "cuda",
+  "push_to_hub": true,
+  "fps": 10,
+  "reward_classifier_pretrained_path": null,
+  "number_of_steps_after_success": 10,
+  "features": {
+    "observation.image.side": {
+      "type": "VISUAL", 
+      "shape": [3, 128, 128]
+    },
+    "observation.state": {
+      "type": "STATE",
+      "shape": [6]
+    },
+    "action": {
+      "type": "ACTION",
+      "shape": [4]
+    }
+  },
+  "features_map": {
+    "observation.image.side": "observation.image.side", 
+    "observation.state": "observation.state",
+    "action": "action"
+  }
+} 

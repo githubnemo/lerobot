@@ -139,11 +139,13 @@ class RecordConfig:
     resume: bool = False
 
     def __post_init__(self):
+        # HACK: We parse again the cli args here to get the pretrained path if there was one.
+        policy_path = parser.get_path_arg("policy")
+        
         if self.teleop is not None and self.policy is not None:
             raise ValueError("Choose either a policy or a teleoperator to control the robot")
 
-        # HACK: We parse again the cli args here to get the pretrained path if there was one.
-        policy_path = parser.get_path_arg("policy")
+
         if policy_path:
             cli_overrides = parser.get_cli_overrides("policy")
             self.policy = PreTrainedConfig.from_pretrained(policy_path, cli_overrides=cli_overrides)
@@ -176,6 +178,7 @@ def record_loop(
 
     timestamp = 0
     start_episode_t = time.perf_counter()
+    print(f"Recording for {control_time_s} seconds")
     while timestamp < control_time_s:
         start_loop_t = time.perf_counter()
 

@@ -185,6 +185,7 @@ def capture_timestamp_utc():
 
 
 def say(text, blocking=False):
+    return
     system = platform.system()
 
     if system == "Darwin":
@@ -214,6 +215,7 @@ def say(text, blocking=False):
 
 def log_say(text, play_sounds, blocking=False):
     logging.info(text)
+    print(text)
 
     if play_sounds:
         say(text, blocking)

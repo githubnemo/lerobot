@@ -55,11 +55,13 @@ from lerobot.common.robots import (  # noqa: F401
     RobotConfig,
     make_robot_from_config,
     so100_follower,
+    so101_follower,
 )
 from lerobot.common.teleoperators import (
     gamepad,  # noqa: F401
     make_teleoperator_from_config,
     so101_leader,  # noqa: F401
+    
 )
 from lerobot.common.teleoperators.gamepad.teleop_gamepad import GamepadTeleop
 from lerobot.common.utils.robot_utils import busy_wait
@@ -2026,6 +2028,8 @@ def record_dataset(env, policy, cfg):
                 frame["next.reward"] = np.array([1.0], dtype=np.float32)
             else:
                 frame["next.reward"] = np.array([reward], dtype=np.float32)
+
+            import pdb; pdb.set_trace()
 
             # Only mark as done if we're truly done (reached end or collected enough success states)
             really_done = terminated or truncated
