@@ -25,7 +25,7 @@ while [ "$#" -gt 0 ]; do
 	shift 1
 done
 
-num_warmup_steps="$(echo "${num_steps} * 0.05" | bc -q)"
+num_warmup_steps="$(( $num_steps / 20 ))"
 num_decay_steps="$num_steps"
 
 if $do_resume; then
@@ -36,8 +36,8 @@ if $do_resume; then
 	  --output_dir=outputs/train/matchbox \
 	  --job_name=matchbox \
 	  --policy.device=cuda \
-	  --policy.warmup_steps=$num_warmup_steps \
-	  --policy.decay_steps=$num_decay_steps \
+	  --policy.scheduler_warmup_steps=$num_warmup_steps \
+	  --policy.scheduler_decay_steps=$num_decay_steps \
 	  --steps=$num_steps \
 	  --wandb.enable=false \
 	  --resume=true \
@@ -54,5 +54,4 @@ else
 	  --policy.decay_steps=$num_decay_steps \
 	  --steps=$num_steps \
 	  --wandb.enable=false \
-	  --resume=true 
 fi
