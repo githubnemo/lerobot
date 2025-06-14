@@ -142,6 +142,43 @@ def train(cfg: TrainPipelineConfig):
         ds_meta=dataset.meta,
     )
 
+    if cfg.use_peft:
+        print(f"Using PEFT! device is {device}")
+        from peft import LoraConfig, get_peft_model
+
+        [n.requires_grad_(False) for n in policy.parameters()]
+        policy = get_peft_model(policy, LoraConfig(
+            target_modules='(model\.vlm_with_expert\.lm_expert\..*\.(q_proj|v_proj)|model\.action_.*|model\.state_proj.*)',
+            r=cfg.peft_rank,
+        ))
+
+        # This makes sure that we target all the target modules via regex. This also limits us to
+        # the regex above.
+        # TODO remove this in the future or generalize better. it is quite helpful...
+        targeted_names = [n for n, p in policy.named_parameters() if p.requires_grad]
+        required_prefixes = ['model.vlm_with_expert.lm_expert', 'model.action_', 'model.state_proj']
+        peft_prefix = 'base_model.model'
+        prefixes_found = set()
+        for tname in targeted_names:
+            for prefix in required_prefixes:
+                full_prefix = f'{peft_prefix}.{prefix}'
+                if tname.startswith(full_prefix):
+                    prefixes_found.add(full_prefix)
+        assert len(prefixes_found) == len(set(required_prefixes))
+
+    #  'model.action_in_proj.bias'
+    #  'model.action_in_proj.weight'
+    #  'model.action_out_proj.bias'
+    #  'model.action_out_proj.weight'
+    #  'model.action_time_mlp_in.bias'
+    #  'model.action_time_mlp_in.weight'
+    #  'model.action_time_mlp_out.bias'
+    #  'model.action_time_mlp_out.weight'
+    #  'model.state_proj.bias'}
+    #  'model.state_proj.weight'
+    #  'model.vlm_with_expert.lm_expert'
+
+
     logging.info("Creating optimizer and scheduler")
     optimizer, lr_scheduler = make_optimizer_and_scheduler(cfg, policy)
     grad_scaler = GradScaler(device.type, enabled=cfg.policy.use_amp)
