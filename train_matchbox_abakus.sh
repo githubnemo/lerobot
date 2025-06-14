@@ -6,9 +6,7 @@
 set -eu
 
 do_resume=false
-num_steps=1000
-use_peft=true
-suffix=""
+num_steps=2000
 
 while [ "$#" -gt 0 ]; do
 	case $1 in
@@ -18,13 +16,6 @@ while [ "$#" -gt 0 ]; do
 		--steps)
 			shift 1
 			num_steps=$1
-			;;
-		--suffix)
-			shift 1
-			suffix=$1
-			;;
-		--use-peft)
-			use_peft=true
 			;;
 		*)
 			echo "Usage: $0 [--steps=n] [resume]"
@@ -40,8 +31,6 @@ num_decay_steps="$num_steps"
 echo "do resume: $do_resume"
 echo "num_warmup_steps: $num_warmup_steps"
 
-# Clear cache for updated dataset (uncomment if dataset was updated)
-# rm -r ~/.cache/huggingface/lerobot/hubnemo/so101_matchbox
 
 MODEL_NAME="so101_matchbox_smolvla_$(date +%Y%m%d_%H%M)"
 echo "MODEL_NAME: $MODEL_NAME"
@@ -51,14 +40,14 @@ common_args=(
   --dataset.repo_id=hubnemo/so101_matchbox
   --policy.type=smolvla 
   --output_dir=outputs/train/matchbox_${MODEL_NAME}
-  --job_name=matchbox_${MODEL_NAME}
+  --job_name=matchbox
   --policy.device=cuda
   --policy.scheduler_warmup_steps="$num_warmup_steps"
   --policy.scheduler_decay_steps="$num_decay_steps"
   --steps="$num_steps"
   --wandb.enable=true
   --dataset.image_transforms.enable=true
-  --policy.optimizer_lr=1e-4
+  --policy.optimizer_lr=5e-5
   --batch_size=32
   --log_freq=50
   # Validation settings for supervised learning
@@ -66,9 +55,7 @@ common_args=(
   --val_split=0.2
   --val_freq=50
   --val_batch_size=32
-  --use_peft=$use_peft
 )
-run_name="matchbox${suffix}"
 
 if $do_resume; then
   echo "Resuming for $num_steps steps"
