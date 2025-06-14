@@ -43,6 +43,10 @@ from pprint import pformat
 
 import numpy as np
 import rerun as rr
+                
+from peft import PeftConfig, get_peft_model
+import importlib
+
 
 from lerobot.common.cameras import (  # noqa: F401
     CameraConfig,  # noqa: F401
@@ -140,6 +144,7 @@ class RecordConfig:
     play_sounds: bool = True
     # Resume recording on an existing dataset.
     resume: bool = False
+    use_peft: bool = False
 
     def __post_init__(self):
         # HACK: We parse again the cli args here to get the pretrained path if there was one.
@@ -147,8 +152,21 @@ class RecordConfig:
 
         if policy_path:
             cli_overrides = parser.get_cli_overrides("policy")
-            self.policy = PreTrainedConfig.from_pretrained(policy_path, cli_overrides=cli_overrides)
-            self.policy.pretrained_path = policy_path
+
+            self.use_peft = True
+
+            if self.use_peft:
+                self.peft_config = PeftConfig.from_pretrained(policy_path)
+
+                # XXX hard-coded because instantiation is complicated and we don't have the
+                # original config in the checkpoint :/ would be good if PEFT could store
+                # the config as well.
+                from lerobot.common.policies import SmolVLAConfig
+                self.policy = SmolVLAConfig()
+
+            else:
+                self.policy = PreTrainedConfig.from_pretrained(policy_path, cli_overrides=cli_overrides)
+                self.policy.pretrained_path = policy_path
 
         if self.teleop is None and self.policy is None:
             raise ValueError("Choose a policy, a teleoperator or both to control the robot")
@@ -279,7 +297,16 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
         )
 
     # Load pretrained policy
-    policy = None if cfg.policy is None else make_policy(cfg.policy, ds_meta=dataset.meta)
+
+    if cfg.use_peft:
+        policy = make_policy(cfg.policy, ds_meta=dataset.meta)
+        peft_config = cfg.peft_config
+
+        policy = get_peft_model(policy, peft_config)
+        policy = policy.merge_and_unload()
+
+    else:
+        policy = None if cfg.policy is None else make_policy(cfg.policy, ds_meta=dataset.meta)
 
     robot.connect()
     if teleop is not None:

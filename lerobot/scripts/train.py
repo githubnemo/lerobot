@@ -147,9 +147,16 @@ def train(cfg: TrainPipelineConfig):
         from peft import LoraConfig, get_peft_model
 
         [n.requires_grad_(False) for n in policy.parameters()]
+
         policy = get_peft_model(policy, LoraConfig(
             target_modules='(model\.vlm_with_expert\.lm_expert\..*\.(q_proj|v_proj)|model\.action_.*|model\.state_proj.*)',
             r=cfg.peft_rank,
+            modules_to_save=[
+                # These are inf on load otherwise
+                'policy.normalize_inputs',
+                'policy.normalize_targets',
+                'policy.unnormalize_outputs',
+            ],
         ))
 
         # This makes sure that we target all the target modules via regex. This also limits us to
