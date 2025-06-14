@@ -66,8 +66,17 @@ class TrainPipelineConfig(HubMixin):
     use_peft: bool = False
     peft_rank: int = 16
 
+    # Validation parameters for supervised learning
+    use_validation: bool = False
+    val_split: float = 0.1  # Fraction of data to use for validation (0.0-1.0)
+    val_freq: int = 2000  # Frequency of validation evaluation (in training steps)
+    val_batch_size: int | None = None  # Validation batch size (defaults to batch_size if None)
+
     def __post_init__(self):
         self.checkpoint_path = None
+        # Set default validation batch size if not specified
+        if self.val_batch_size is None:
+            self.val_batch_size = self.batch_size
 
     def validate(self):
         # HACK: We parse again the cli args here to get the pretrained paths if there was some.
