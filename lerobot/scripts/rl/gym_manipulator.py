@@ -1345,7 +1345,9 @@ class BaseLeaderControlWrapper(gym.Wrapper):
 
         # Add intervention info
         info["is_intervention"] = is_intervention
-        info["action_intervention"] = action if is_intervention else None
+        # info["action_intervention"] = action if is_intervention else None
+        info["action_intervention"] = action
+
 
         self.prev_leader_gripper = np.clip(
             self.robot_leader.bus.sync_read("Present_Position")["gripper"],
@@ -1878,6 +1880,8 @@ def make_robot_env(cfg: EnvConfig) -> gym.Env:
 
     if cfg.robot is None:
         raise ValueError("RobotConfig (cfg.robot) must be provided for gym_manipulator environment.")
+    
+
     robot = make_robot_from_config(cfg.robot)
 
     teleop_device = make_teleoperator_from_config(cfg.teleop)
@@ -2103,9 +2107,16 @@ def record_dataset(env, policy, cfg):
                 break
 
             # For teleop, get action from intervention
-            recorded_action = {
-                "action": info["action_intervention"].cpu().squeeze(0).float() if policy is None else action
-            }
+            if policy is None:
+                recorded_action = {
+                    "action": info["action_intervention"].cpu().squeeze(0).float().numpy() if torch.is_tensor(info["action_intervention"]) else info["action_intervention"].astype(np.float32)
+                }
+            else:
+                recorded_action = {
+                    "action": action
+                }
+                
+            print(recorded_action)
 
             # Process observation for dataset
             obs_processed = {k: v.cpu().squeeze(0).float() for k, v in obs.items()}
@@ -2124,7 +2135,7 @@ def record_dataset(env, policy, cfg):
             else:
                 frame["next.reward"] = np.array([reward], dtype=np.float32)
 
-            import pdb; pdb.set_trace()
+            # import pdb; pdb.set_trace()
 
             # Only mark as done if we're truly done (reached end or collected enough success states)
             really_done = terminated or truncated
@@ -2136,6 +2147,12 @@ def record_dataset(env, policy, cfg):
             frame["complementary_info.discrete_penalty"] = torch.tensor(
                 [info.get("discrete_penalty", 0.0)], dtype=torch.float32
             )
+            
+            # move channels to last dimension
+            for key in frame:
+                if "image" in key:
+                    frame[key] = frame[key].permute(1, 2, 0)
+
             dataset.add_frame(frame, task=cfg.task)
 
             # Maintain consistent timing

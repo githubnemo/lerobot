@@ -8,9 +8,9 @@ python -m lerobot.record \
     --teleop.id=shabby_leader \
     --display_data=true \
     --dataset.repo_id=hubnemo/so101_matchbox \
-    --dataset.episode_time_s=20 \
-    --dataset.reset_time_s=10 \
-    --dataset.num_episodes=2 \
+    --dataset.episode_time_s=40 \
+    --dataset.reset_time_s=20 \
+    --dataset.num_episodes=10 \
     --dataset.single_task="Put the matchbox on the bag" \
     --dataset.push_to_hub=true \
     --resume=true

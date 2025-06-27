@@ -5,31 +5,31 @@
     "port": "/dev/ttyACM4",
     "id": "shabby",
     "cameras": {
-      "side": {
+      "front": {
         "type": "opencv", 
-        "index_or_path": 2,
+        "index_or_path": 0,
         "height": 480,
         "width": 640,
         "fps": 30
       }
     },
     "end_effector_bounds": {
-      "min": [0.0806, -0.117, 0.145],
-      "max": [0.4148, 0.3537, 0.6458]
+      "min": [-1.0, -1.0, 0.0],
+      "max": [1.0, 1.0, 1.0]
     },
     "end_effector_step_sizes": {
-      "x": 0.02,
-      "y": 0.02,
-      "z": 0.02
+      "x": 0.008,
+      "y": 0.008,
+      "z": 0.008
     },
     "max_gripper_pos": 50,
-    "use_degrees": false
+    "use_degrees": true
   },
   "teleop": {
     "type": "so101_leader",
     "port": "/dev/ttyACM3",
     "id": "shabby_leader",
-    "use_degrees": false
+    "use_degrees": true
   },
   "wrapper": {
     "display_cameras": false,
@@ -38,12 +38,12 @@
     "add_ee_pose_to_observation": false,
     "crop_params_dict": null,
     "resize_size": [128, 128],
-    "control_time_s": 20.0,
+    "control_time_s": 300.0,
     "use_gripper": true,
     "gripper_quantization_threshold": 0.8,
     "gripper_penalty": 0.0,
     "gripper_penalty_in_reward": false,
-    "fixed_reset_joint_positions": [0.0, 0.0, 0.0, 0.0, 0.0, 25.0],
+    "fixed_reset_joint_positions": [0.0, -90.0, 90.0, -90.0, 0.0, 25.0],
     "reset_time_s": 5.0,
     "control_mode": "leader"
   },
@@ -52,7 +52,7 @@
   "repo_id": "your_username/shabby_task_dataset",
   "dataset_root": null,
   "task": "shabby_manipulation_task",
-  "num_episodes": 15,
+  "num_episodes": 5,
   "episode": 0,
   "pretrained_policy_name_or_path": null,
   "device": "cuda",
@@ -61,7 +61,7 @@
   "reward_classifier_pretrained_path": null,
   "number_of_steps_after_success": 10,
   "features": {
-    "observation.image.side": {
+    "observation.image.front": {
       "type": "VISUAL", 
       "shape": [3, 128, 128]
     },
@@ -75,7 +75,7 @@
     }
   },
   "features_map": {
-    "observation.image.side": "observation.image.side", 
+    "observation.image.front": "observation.image.front", 
     "observation.state": "observation.state",
     "action": "action"
   }

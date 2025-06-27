@@ -153,7 +153,7 @@ class RecordConfig:
         if policy_path:
             cli_overrides = parser.get_cli_overrides("policy")
 
-            self.use_peft = True
+            self.use_peft = False
 
             if self.use_peft:
                 self.peft_config = PeftConfig.from_pretrained(policy_path)
