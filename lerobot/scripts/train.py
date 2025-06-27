@@ -14,17 +14,21 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import logging
+import math
 import time
 from contextlib import nullcontext
 from pprint import pformat
 from typing import Any
 
+import numpy as np
 import torch
 from termcolor import colored
 from torch.amp import GradScaler
 from torch.optim import Optimizer
+from tqdm import tqdm
 
 from lerobot.common.datasets.factory import make_dataset
+from lerobot.common.datasets.lerobot_dataset import LeRobotDataset, LeRobotDatasetMetadata
 from lerobot.common.datasets.sampler import EpisodeAwareSampler
 from lerobot.common.datasets.utils import cycle
 from lerobot.common.envs.factory import make_env
@@ -127,6 +131,13 @@ def train(cfg: TrainPipelineConfig):
     logging.info("Creating dataset")
     dataset = make_dataset(cfg)
 
+    # Create train/validation splits if validation is enabled
+    if cfg.use_validation:
+        train_indices, val_indices = create_train_val_splits(cfg, dataset)
+    else:
+        train_indices = list(range(len(dataset)))
+        val_indices = None
+
     # Create environment used for evaluating checkpoints during training on simulation data.
     # On real-world data, no need to create an environment as evaluations are done outside train.py,
     # using the eval.py instead, with gym_dora environment and dora-rs.
@@ -171,8 +182,13 @@ def train(cfg: TrainPipelineConfig):
             shuffle=True,
         )
     else:
-        shuffle = True
-        sampler = None
+        # Use subset sampler for training indices if validation is enabled
+        if cfg.use_validation:
+            sampler = torch.utils.data.SubsetRandomSampler(train_indices)
+            shuffle = False
+        else:
+            sampler = None
+            shuffle = True
 
     dataloader = torch.utils.data.DataLoader(
         dataset,
@@ -200,7 +216,9 @@ def train(cfg: TrainPipelineConfig):
     )
 
     logging.info("Start offline training on a fixed dataset")
-    for _ in range(step, cfg.steps):
+    pbar = tqdm(range(step, cfg.steps), desc="Training")
+    latest_val_loss = None  # Track latest validation loss for progress bar
+    for _ in pbar:
         start_time = time.perf_counter()
         batch = next(dl_iter)
         train_tracker.dataloading_s = time.perf_counter() - start_time
@@ -224,9 +242,16 @@ def train(cfg: TrainPipelineConfig):
         # increment `step` here.
         step += 1
         train_tracker.step()
+
+        # Update progress bar with current loss and validation loss if available
+        postfix_dict = {"loss": f"{train_tracker.loss.avg:.2e}"}
+        if latest_val_loss is not None:
+            postfix_dict["val_loss"] = f"{latest_val_loss:.2e}"
+        pbar.set_postfix(postfix_dict)
         is_log_step = cfg.log_freq > 0 and step % cfg.log_freq == 0
         is_saving_step = step % cfg.save_freq == 0 or step == cfg.steps
         is_eval_step = cfg.eval_freq > 0 and step % cfg.eval_freq == 0
+        is_val_step = cfg.use_validation and cfg.val_freq > 0 and step % cfg.val_freq == 0
 
         if is_log_step:
             logging.info(train_tracker)
@@ -244,6 +269,39 @@ def train(cfg: TrainPipelineConfig):
             update_last_checkpoint(checkpoint_dir)
             if wandb_logger:
                 wandb_logger.log_policy(checkpoint_dir)
+
+        if is_val_step and val_indices is not None:
+            logging.info(f"Computing validation loss at step {step}")
+            start_time = time.perf_counter()
+            val_results = compute_validation_loss(
+                policy,
+                dataset,
+                val_indices,
+                device,
+                cfg.val_batch_size,
+                cfg.num_workers,
+                use_amp=cfg.policy.use_amp,
+            )
+            val_time = time.perf_counter() - start_time
+
+            val_loss = val_results["val_loss"]
+            val_n_samples = val_results["val_n_samples"]
+            latest_val_loss = val_loss  # Update for progress bar display
+
+            logging.info(
+                f"Validation - Step {step}: loss={val_loss:.4f}, samples={val_n_samples}, time={val_time:.2f}s"
+            )
+
+            if wandb_logger:
+                wandb_log_dict = {
+                    "val_loss": val_loss,
+                    "val_n_samples": val_n_samples,
+                    "val_time_s": val_time,
+                }
+                wandb_logger.log_dict(wandb_log_dict, step)
+
+            # Return policy to training mode
+            policy.train()
 
         if cfg.env and is_eval_step:
             step_id = get_step_identifier(step, cfg.steps)
@@ -281,6 +339,128 @@ def train(cfg: TrainPipelineConfig):
     if eval_env:
         eval_env.close()
     logging.info("End of training")
+
+
+def create_train_val_splits(
+    cfg: TrainPipelineConfig, dataset: LeRobotDataset
+) -> tuple[list[int], list[int] | None]:
+    """Create train/validation index splits from the full dataset.
+
+    This split is deterministic and reproducible if a seed is provided in the config:
+    - Always splits at episode boundaries (maintains episode integrity)
+    - Uses the same episodes for train/val across runs with the same val_split and seed.
+    - If no seed is provided, the split will be random.
+    """
+    if not cfg.use_validation:
+        return list(range(len(dataset))), None
+
+
+    # Calculate indices for train/val split based on episodes
+    episode_data_index = dataset.episode_data_index
+    total_episodes = len(episode_data_index["from"])
+
+    # Create a list of episode indices
+    all_episode_indices = list(range(total_episodes))
+
+    # Shuffle episodes for random split, but seeded for reproducibility
+    rng = np.random.default_rng(cfg.seed)
+    rng.shuffle(all_episode_indices)
+
+    num_val_episodes = math.ceil(total_episodes * cfg.val_split)
+    num_train_episodes = total_episodes - num_val_episodes
+
+    val_ep_indices = all_episode_indices[:num_val_episodes]
+    train_ep_indices = all_episode_indices[num_val_episodes:]
+
+    # Get frame indices for training episodes
+    train_indices = []
+    for ep_idx in train_ep_indices:
+        start_idx = episode_data_index["from"][ep_idx].item()
+        end_idx = episode_data_index["to"][ep_idx].item()
+        train_indices.extend(range(start_idx, end_idx))
+
+    # Get frame indices for validation episodes
+
+    # Get frame indices for validation episodes
+    val_indices = []
+    for ep_idx in val_ep_indices:
+        start_idx = episode_data_index["from"][ep_idx].item()
+        end_idx = episode_data_index["to"][ep_idx].item()
+        val_indices.extend(range(start_idx, end_idx))
+
+
+    logging.info(f"Dataset split - Total episodes: {total_episodes}")
+    logging.info(f"Training episodes: {num_train_episodes} ({100 * num_train_episodes / total_episodes:.1f}%)")
+    logging.info(f"Validation episodes: {num_val_episodes} ({100 * num_val_episodes / total_episodes:.1f}%)")
+    logging.info(f"Training frames: {len(train_indices)}")
+    logging.info(f"Validation frames: {len(val_indices)}")
+    if cfg.seed is not None:
+        logging.info(f"Validation split is reproducible with seed={cfg.seed}")
+    else:
+        logging.info("Validation split is random (no seed provided)")
+
+    return train_indices, val_indices
+
+
+def compute_validation_loss(
+    policy: PreTrainedPolicy,
+    dataset: LeRobotDataset,
+    val_indices: list[int],
+    device: torch.device,
+    val_batch_size: int,
+    num_workers: int,
+    use_amp: bool = False,
+) -> dict[str, float]:
+    """Compute validation loss on the validation subset."""
+    policy.eval()
+
+    # Create deterministic sampler for validation (no shuffling for reproducibility)
+    # Use a simple sequential sampler over the validation indices
+    class SubsetSequentialSampler(torch.utils.data.Sampler):
+        def __init__(self, indices):
+            self.indices = indices
+
+        def __iter__(self):
+            return iter(self.indices)
+
+        def __len__(self):
+            return len(self.indices)
+
+    val_sampler = SubsetSequentialSampler(val_indices)
+
+    # Create validation dataloader with subset sampler
+    val_dataloader = torch.utils.data.DataLoader(
+        dataset,
+        batch_size=val_batch_size,
+        sampler=val_sampler,
+        num_workers=num_workers,
+        pin_memory=device.type != "cpu",
+        drop_last=False,
+    )
+
+    val_loss_sum = 0.0
+    val_n_samples = 0
+
+    with torch.no_grad():
+        for batch in val_dataloader:
+            # Move batch to device
+            for key in batch:
+                if isinstance(batch[key], torch.Tensor):
+                    batch[key] = batch[key].to(device, non_blocking=True)
+
+            # Forward pass with mixed precision if enabled
+            with torch.autocast(device_type=device.type) if use_amp else nullcontext():
+                loss, _ = policy.forward(batch)
+
+            val_loss_sum += loss.item() * batch["index"].shape[0]
+            val_n_samples += batch["index"].shape[0]
+
+    avg_val_loss = val_loss_sum / val_n_samples if val_n_samples > 0 else 0.0
+
+    return {
+        "val_loss": avg_val_loss,
+        "val_n_samples": val_n_samples,
+    }
 
 
 if __name__ == "__main__":
