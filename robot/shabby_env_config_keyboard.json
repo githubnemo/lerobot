@@ -5,7 +5,7 @@
     "port": "/dev/ttyACM4",
     "id": "shabby",
     "cameras": {
-      "front": {
+      "side": {
         "type": "opencv", 
         "index_or_path": 2,
         "height": 480,
@@ -16,19 +16,16 @@
     "use_degrees": false
   },
   "teleop": {
-    "type": "so101_leader",
-    "port": "/dev/ttyACM3",
-    "id": "shabby_leader",
-    "use_degrees": false
+    "type": "keyboard"
   },
   "wrapper": {
-    "display_cameras": true,
-    "add_joint_velocity_to_observation": true,
+    "display_cameras": false,
+    "add_joint_velocity_to_observation": false,
     "add_current_to_observation": false,
     "add_ee_pose_to_observation": false,
     "crop_params_dict": null,
     "resize_size": [128, 128],
-    "control_time_s": 60.0,
+    "control_time_s": 20.0,
     "use_gripper": true,
     "gripper_quantization_threshold": 0.8,
     "gripper_penalty": 0.0,
@@ -39,10 +36,10 @@
   },
   "name": "shabby_robot",
   "mode": "record",
-  "repo_id": "nemo/so101_matchbox_reward_dataset_v2",
-  "dataset_root": "datasets/so101_matchbox_reward_dataset_v2",
+  "repo_id": "your_username/shabby_task_dataset",
+  "dataset_root": null,
   "task": "shabby_manipulation_task",
-  "num_episodes": 10,
+  "num_episodes": 15,
   "episode": 0,
   "pretrained_policy_name_or_path": null,
   "device": "cuda",
@@ -51,13 +48,13 @@
   "reward_classifier_pretrained_path": null,
   "number_of_steps_after_success": 10,
   "features": {
-    "observation.image.front": {
+    "observation.image.side": {
       "type": "VISUAL", 
       "shape": [3, 128, 128]
     },
     "observation.state": {
       "type": "STATE",
-      "shape": [12]
+      "shape": [6]
     },
     "action": {
       "type": "ACTION",
@@ -65,7 +62,7 @@
     }
   },
   "features_map": {
-    "observation.image.front": "observation.image.front", 
+    "observation.image.side": "observation.image.side", 
     "observation.state": "observation.state",
     "action": "action"
   }
