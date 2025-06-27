@@ -55,6 +55,7 @@ from lerobot.common.robots import (  # noqa: F401
     RobotConfig,
     make_robot_from_config,
     so100_follower,
+    so101_follower,
 )
 from lerobot.common.teleoperators import (
     gamepad,  # noqa: F401
@@ -225,6 +226,7 @@ class RobotEnv(gym.Env):
     def __init__(
         self,
         robot,
+        action_space_type: str,
         use_gripper: bool = False,
         display_cameras: bool = False,
     ):
@@ -236,12 +238,14 @@ class RobotEnv(gym.Env):
 
         Args:
             robot: The robot interface object used to connect and interact with the physical robot.
+            action_space_type: The control mode, e.g., 'end_effector' or 'joint'.
             display_cameras: If True, the robot's camera feeds will be displayed during execution.
         """
         super().__init__()
 
         self.robot = robot
         self.display_cameras = display_cameras
+        self.action_space_type = action_space_type
 
         # Connect to the robot if not already connected.
         if not self.robot.is_connected:
@@ -305,15 +309,21 @@ class RobotEnv(gym.Env):
         self.observation_space = gym.spaces.Dict(observation_spaces)
 
         # Define the action space for joint positions along with setting an intervention flag.
-        action_dim = 3
-        bounds = {}
-        bounds["min"] = -np.ones(action_dim)
-        bounds["max"] = np.ones(action_dim)
+        if self.action_space_type == "joint":
+            action_dim = len(self.robot.bus.motors)
+            bounds = {"min": -np.ones(action_dim), "max": np.ones(action_dim)}
+        else:  # end_effector
+            action_dim = 3
+            bounds = {"min": -np.ones(action_dim), "max": np.ones(action_dim)}
 
         if self.use_gripper:
-            action_dim += 1
-            bounds["min"] = np.concatenate([bounds["min"], [0]])
-            bounds["max"] = np.concatenate([bounds["max"], [2]])
+            if self.action_space_type == "joint":
+                bounds["min"][-1] = 0
+                bounds["max"][-1] = 2
+            else:
+                action_dim += 1
+                bounds["min"] = np.concatenate([bounds["min"], [0]])
+                bounds["max"] = np.concatenate([bounds["max"], [2]])
 
         self.action_space = gym.spaces.Box(
             low=bounds["min"],
@@ -369,10 +379,14 @@ class RobotEnv(gym.Env):
         """
         self.current_joint_positions = self._get_observation()["agent_pos"]
 
-        action_dict = {"delta_x": action[0], "delta_y": action[1], "delta_z": action[2]}
+        if self.action_space_type == "joint":
+            # In joint space mode, the action from the wrapper is an array of absolute joint positions.
+            action_dict = {f"{name}": action[i] for i, name in enumerate(self._joint_names)}
+        else:
+            action_dict = {"delta_x": action[0], "delta_y": action[1], "delta_z": action[2]}
 
-        # 1.0 action corresponds to no-op action
-        action_dict["gripper"] = action[3] if self.use_gripper else 1.0
+        # The last element of the action array is always the gripper. 1.0 corresponds to no-op action
+        action_dict["gripper"] = action[-1] if self.use_gripper else 1.0
 
         self.robot.send_action(action_dict)
 
@@ -848,10 +862,20 @@ class ResetWrapper(gym.Wrapper):
             log_say("Reset the environment done.", play_sounds=True)
 
             if hasattr(self.env, "robot_leader"):
+                is_intervention = self.env._check_intervention() if hasattr(self.env, "_check_intervention") else False
+
                 self.env.robot_leader.bus.sync_write("Torque_Enable", 1)
+                if hasattr(self.env, "leader_torque_enabled"):
+                    self.env.leader_torque_enabled = True
+
                 log_say("Reset the leader robot.", play_sounds=True)
                 reset_follower_position(self.env.robot_leader, self.reset_pose)
                 log_say("Reset the leader robot done.", play_sounds=True)
+
+                if is_intervention:
+                    self.env.robot_leader.bus.sync_write("Torque_Enable", 0)
+                    if hasattr(self.env, "leader_torque_enabled"):
+                        self.env.leader_torque_enabled = False
         else:
             log_say(
                 f"Manually reset the environment for {self.reset_time_s} seconds.",
@@ -1132,6 +1156,7 @@ class BaseLeaderControlWrapper(gym.Wrapper):
         self,
         env,
         teleop_device,
+        action_space_type: str,
         end_effector_step_sizes,
         use_geared_leader_arm: bool = False,
         use_gripper=False,
@@ -1142,6 +1167,7 @@ class BaseLeaderControlWrapper(gym.Wrapper):
         Args:
             env: The environment to wrap.
             teleop_device: The teleoperation device.
+            action_space_type: The control mode, e.g., 'end_effector' or 'joint'.
             use_geared_leader_arm: Whether to use a geared leader arm setup.
             use_gripper: Whether to include gripper control.
         """
@@ -1150,7 +1176,10 @@ class BaseLeaderControlWrapper(gym.Wrapper):
         self.robot_follower = env.unwrapped.robot
         self.use_geared_leader_arm = use_geared_leader_arm
         self.use_gripper: bool = use_gripper
-        self.end_effector_step_sizes = np.array(list(end_effector_step_sizes.values()))
+        self.action_space_type = action_space_type
+        self.end_effector_step_sizes = (
+            np.array(list(end_effector_step_sizes.values())) if end_effector_step_sizes is not None else None
+        )
 
         # Set up keyboard event tracking
         self._init_keyboard_events()
@@ -1260,37 +1289,48 @@ class BaseLeaderControlWrapper(gym.Wrapper):
         leader_pos_dict = self.robot_leader.bus.sync_read("Present_Position")
         follower_pos_dict = self.robot_follower.bus.sync_read("Present_Position")
 
-        leader_pos = np.array([leader_pos_dict[name] for name in leader_pos_dict], dtype=np.float32)
-        follower_pos = np.array([follower_pos_dict[name] for name in follower_pos_dict], dtype=np.float32)
+        leader_pos = np.array(
+            [leader_pos_dict[name] for name in self.robot_leader.bus.motors], dtype=np.float32
+        )
+        follower_pos = np.array(
+            [follower_pos_dict[name] for name in self.robot_follower.bus.motors], dtype=np.float32
+        )
 
         self.leader_tracking_error_queue.append(np.linalg.norm(follower_pos[:-1] - leader_pos[:-1]))
 
-        # [:3, 3] Last column of the transformation matrix corresponds to the xyz translation
-        leader_ee = self.kinematics.forward_kinematics(leader_pos, frame="gripper_tip")[:3, 3]
-        follower_ee = self.kinematics.forward_kinematics(follower_pos, frame="gripper_tip")[:3, 3]
+        if self.action_space_type == "end_effector":
+            # [:3, 3] Last column of the transformation matrix corresponds to the xyz translation
+            leader_ee = self.kinematics.forward_kinematics(leader_pos, frame="gripper_tip")[:3, 3]
+            follower_ee = self.kinematics.forward_kinematics(follower_pos, frame="gripper_tip")[:3, 3]
 
-        action = np.clip(leader_ee - follower_ee, -self.end_effector_step_sizes, self.end_effector_step_sizes)
-        # Normalize the action to the range [-1, 1]
-        action = action / self.end_effector_step_sizes
+            action = np.clip(leader_ee - follower_ee, -self.end_effector_step_sizes, self.end_effector_step_sizes)
+            # Normalize the action to the range [-1, 1]
+            action = action / self.end_effector_step_sizes
+        else:
+            # For joint space control, the action is the leader's absolute joint positions.
+            action = leader_pos[:-1]
 
         if self.use_gripper:
-            if self.prev_leader_gripper is None:
-                self.prev_leader_gripper = np.clip(
-                    leader_pos[-1], 0, self.robot_follower.config.max_gripper_pos
-                )
+            if self.action_space_type == "end_effector":
+                if self.prev_leader_gripper is None:
+                    self.prev_leader_gripper = np.clip(
+                        leader_pos[-1], 0, self.robot_follower.config.max_gripper_pos
+                    )
 
-            # Get gripper action delta based on leader pose
-            leader_gripper = leader_pos[-1]
-            gripper_delta = leader_gripper - self.prev_leader_gripper
+                # Get gripper action delta based on leader pose
+                leader_gripper = leader_pos[-1]
+                gripper_delta = leader_gripper - self.prev_leader_gripper
 
-            # Normalize by max angle and quantize to {0,1,2}
-            normalized_delta = gripper_delta / self.robot_follower.config.max_gripper_pos
-            if normalized_delta >= 0.3:
-                gripper_action = 2
-            elif normalized_delta <= 0.1:
-                gripper_action = 0
+                # Normalize by max angle and quantize to {0,1,2}
+                normalized_delta = gripper_delta / self.robot_follower.config.max_gripper_pos
+                if normalized_delta >= 0.3:
+                    gripper_action = 2
+                elif normalized_delta <= -0.3:
+                    gripper_action = 0
+                else:
+                    gripper_action = 1
             else:
-                gripper_action = 1
+                gripper_action = leader_pos[-1]
 
             action = np.append(action, gripper_action)
 
@@ -1395,6 +1435,10 @@ class GearedLeaderControlWrapper(BaseLeaderControlWrapper):
     of human intervention mode with keyboard controls.
     """
 
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.is_manual_intervention_active = False
+
     def _init_keyboard_events(self):
         """
         Initialize keyboard events including human intervention flag.
@@ -1403,7 +1447,6 @@ class GearedLeaderControlWrapper(BaseLeaderControlWrapper):
         intervention state toggled by keyboard.
         """
         super()._init_keyboard_events()
-        self.keyboard_events["human_intervention_step"] = False
 
     def _handle_key_press(self, key, keyboard_device):
         """
@@ -1417,15 +1460,14 @@ class GearedLeaderControlWrapper(BaseLeaderControlWrapper):
         """
         super()._handle_key_press(key, keyboard_device)
         if key == keyboard_device.Key.space:
-            if not self.keyboard_events["human_intervention_step"]:
+            self.is_manual_intervention_active = not self.is_manual_intervention_active
+            if self.is_manual_intervention_active:
                 logging.info(
                     "Space key pressed. Human intervention required.\n"
                     "Place the leader in similar pose to the follower and press space again."
                 )
-                self.keyboard_events["human_intervention_step"] = True
                 log_say("Human intervention step.", play_sounds=True)
             else:
-                self.keyboard_events["human_intervention_step"] = False
                 logging.info("Space key pressed for a second time.\nContinuing with policy actions.")
                 log_say("Continuing with policy actions.", play_sounds=True)
 
@@ -1436,7 +1478,7 @@ class GearedLeaderControlWrapper(BaseLeaderControlWrapper):
         Returns:
             Boolean indicating whether intervention mode is active.
         """
-        return self.keyboard_events["human_intervention_step"]
+        return self.is_manual_intervention_active
 
 
 class GearedLeaderAutomaticControlWrapper(BaseLeaderControlWrapper):
@@ -1451,6 +1493,7 @@ class GearedLeaderAutomaticControlWrapper(BaseLeaderControlWrapper):
         self,
         env,
         teleop_device,
+        action_space_type,
         end_effector_step_sizes,
         use_gripper=False,
         intervention_threshold=10.0,
@@ -1462,12 +1505,19 @@ class GearedLeaderAutomaticControlWrapper(BaseLeaderControlWrapper):
         Args:
             env: The environment to wrap.
             teleop_device: The teleoperation device.
+            action_space_type: The control mode, e.g., 'end_effector' or 'joint'.
             use_gripper: Whether to include gripper control.
             intervention_threshold: Error threshold to trigger intervention.
             release_threshold: Error threshold to release intervention.
             queue_size: Number of error measurements to track for smoothing.
         """
-        super().__init__(env, teleop_device, end_effector_step_sizes, use_gripper=use_gripper)
+        super().__init__(
+            env,
+            teleop_device,
+            action_space_type,
+            end_effector_step_sizes=end_effector_step_sizes,
+            use_gripper=use_gripper,
+        )
 
         # Error tracking parameters
         self.intervention_threshold = intervention_threshold  # Threshold to trigger intervention
@@ -1884,6 +1934,7 @@ def make_robot_env(cfg: EnvConfig) -> gym.Env:
     # Create base environment
     env = RobotEnv(
         robot=robot,
+        action_space_type=cfg.wrapper.action_space,
         use_gripper=cfg.wrapper.use_gripper,
         display_cameras=cfg.wrapper.display_cameras if cfg.wrapper else False,
     )
@@ -1919,41 +1970,45 @@ def make_robot_env(cfg: EnvConfig) -> gym.Env:
         )
 
     # Control mode specific wrappers
-    control_mode = cfg.wrapper.control_mode
-    if control_mode == "gamepad":
-        assert isinstance(teleop_device, GamepadTeleop), (
-            "teleop_device must be an instance of GamepadTeleop for gamepad control mode"
-        )
+    teleop_device_type = cfg.teleop.type
+    if teleop_device_type == "gamepad":
+        assert isinstance(
+            teleop_device, GamepadTeleop
+        ), "teleop_device must be an instance of GamepadTeleop for gamepad control mode"
         env = GamepadControlWrapper(
             env=env,
             teleop_device=teleop_device,
             use_gripper=cfg.wrapper.use_gripper,
         )
-    elif control_mode == "keyboard_ee":
-        assert isinstance(teleop_device, KeyboardEndEffectorTeleop), (
-            "teleop_device must be an instance of KeyboardEndEffectorTeleop for keyboard control mode"
-        )
+    elif teleop_device_type == "keyboard_ee":
+        assert isinstance(
+            teleop_device, KeyboardEndEffectorTeleop
+        ), "teleop_device must be an instance of KeyboardEndEffectorTeleop for keyboard control mode"
         env = KeyboardControlWrapper(
             env=env,
             teleop_device=teleop_device,
             use_gripper=cfg.wrapper.use_gripper,
         )
-    elif control_mode == "leader":
+    elif "leader" in teleop_device_type and not "automatic" in teleop_device_type:
         env = GearedLeaderControlWrapper(
             env=env,
             teleop_device=teleop_device,
-            end_effector_step_sizes=cfg.robot.end_effector_step_sizes,
+            action_space_type=cfg.wrapper.action_space,
+            end_effector_step_sizes=(
+                cfg.robot.end_effector_step_sizes if hasattr(cfg.robot, "end_effector_step_sizes") else None
+            ),
             use_gripper=cfg.wrapper.use_gripper,
         )
-    elif control_mode == "leader_automatic":
+    elif "leader_automatic" in teleop_device_type:
         env = GearedLeaderAutomaticControlWrapper(
             env=env,
             teleop_device=teleop_device,
+            action_space_type=cfg.wrapper.action_space,
             end_effector_step_sizes=cfg.robot.end_effector_step_sizes,
             use_gripper=cfg.wrapper.use_gripper,
         )
     else:
-        raise ValueError(f"Invalid control mode: {control_mode}")
+        raise ValueError(f"Invalid teleop device type: {teleop_device_type}")
 
     env = ResetWrapper(
         env=env,
@@ -2028,9 +2083,15 @@ def record_dataset(env, policy, cfg):
     # Setup initial action (zero action if using teleop)
     action = env.action_space.sample() * 0.0
 
-    action_names = ["delta_x_ee", "delta_y_ee", "delta_z_ee"]
-    if cfg.wrapper.use_gripper:
-        action_names.append("gripper_delta")
+    if cfg.wrapper.action_space == "end_effector":
+        action_names = ["delta_x_ee", "delta_y_ee", "delta_z_ee"]
+        if cfg.wrapper.use_gripper:
+            action_names.append("gripper_delta")
+    else:  # joint space
+        # get joint names from env
+        action_names = env.unwrapped._joint_names
+        if not cfg.wrapper.use_gripper:
+            action_names = action_names[:-1]
 
     # Configure dataset features based on environment spaces
     features = {
@@ -2041,7 +2102,7 @@ def record_dataset(env, policy, cfg):
         },
         "action": {
             "dtype": "float32",
-            "shape": (len(action_names),),
+            "shape": env.action_space.shape,
             "names": action_names,
         },
         "next.reward": {"dtype": "float32", "shape": (1,), "names": None},
@@ -2056,10 +2117,12 @@ def record_dataset(env, policy, cfg):
     # Add image features
     for key in env.observation_space:
         if "image" in key:
+            # The observation space is CHW, but dataset expects HWC for video.
+            c, h, w = env.observation_space[key].shape
             features[key] = {
                 "dtype": "video",
-                "shape": env.observation_space[key].shape,
-                "names": ["channels", "height", "width"],
+                "shape": (h, w, c),
+                "names": ["height", "width", "channels"],
             }
 
     # Create dataset
@@ -2101,9 +2164,15 @@ def record_dataset(env, policy, cfg):
                 break
 
             # For teleop, get action from intervention
-            recorded_action = {
-                "action": info["action_intervention"].cpu().squeeze(0).float() if policy is None else action
-            }
+            if policy is None:
+                action = (
+                    info["action_intervention"].cpu().squeeze(0).float()
+                    if torch.is_tensor(info["action_intervention"])
+                    else torch.from_numpy(info["action_intervention"])
+                )
+            else:
+                action = action
+            recorded_action = {"action": action.to(torch.float32) if torch.is_tensor(action) else action.astype(np.float32)}
 
             # Process observation for dataset
             obs_processed = {k: v.cpu().squeeze(0).float() for k, v in obs.items()}

@@ -174,7 +174,8 @@ class EnvTransformConfig:
     """Configuration for environment wrappers."""
 
     # ee_action_space_params: EEActionSpaceConfig = field(default_factory=EEActionSpaceConfig)
-    control_mode: str = "gamepad"
+    teleop_device_type: str = "gamepad"
+    action_space: str = "end_effector"
     display_cameras: bool = False
     add_joint_velocity_to_observation: bool = False
     add_current_to_observation: bool = False

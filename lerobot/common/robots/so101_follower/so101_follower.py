@@ -133,6 +133,9 @@ class SO101Follower(Robot):
         self._save_calibration()
         print("Calibration saved to", self.calibration_fpath)
 
+    def reset(self) -> None:
+        self.configure()
+
     def configure(self) -> None:
         with self.bus.torque_disabled():
             self.bus.configure_motors()

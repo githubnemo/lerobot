@@ -34,6 +34,9 @@ class SO101FollowerConfig(RobotConfig):
     # the number of motors in your follower arms.
     max_relative_target: int | None = None
 
+    # Max gripper position. This is used to normalize the gripper state and actions.
+    max_gripper_pos: float = 50.0
+
     # cameras
     cameras: dict[str, CameraConfig] = field(default_factory=dict)
 
