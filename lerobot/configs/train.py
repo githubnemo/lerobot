@@ -58,6 +58,17 @@ class TrainPipelineConfig(HubMixin):
     save_checkpoint: bool = True
     # Checkpoint is saved every `save_freq` training iterations and after the last training step.
     save_freq: int = 20_000
+
+    # ---- Validation arguments for supervised learning ----
+    # Set `use_validation` to true to enable supervised validation during training.
+    use_validation: bool = False
+    # The fraction of the dataset to use for validation.
+    val_split: float = 0.05
+    # Validation is performed every `val_freq` training iterations.
+    val_freq: int = 10_000
+    # Batch size for validation. Can be higher than the training batch size.
+    val_batch_size: int = 16
+
     use_policy_training_preset: bool = True
     optimizer: OptimizerConfig | None = None
     scheduler: LRSchedulerConfig | None = None
