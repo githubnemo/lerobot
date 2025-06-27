@@ -39,7 +39,9 @@ def preprocess_observation(observations: dict[str, np.ndarray]) -> dict[str, Ten
     return_observations = {}
     if "pixels" in observations:
         if isinstance(observations["pixels"], dict):
-            imgs = {f"observation.images.{key}": img for key, img in observations["pixels"].items()}
+            # Use singular 'image' for single camera, plural 'images' for multiple cameras
+            prefix = "observation.image" if len(observations["pixels"]) == 1 else "observation.images"
+            imgs = {f"{prefix}.{key}": img for key, img in observations["pixels"].items()}
         else:
             imgs = {"observation.image": observations["pixels"]}
 
