@@ -15,10 +15,12 @@
 # limitations under the License.
 import logging
 import math
+import os
 import time
 from contextlib import nullcontext
 from pprint import pformat
 from typing import Any
+import copy
 
 import numpy as np
 import torch
@@ -112,6 +114,9 @@ def update_policy(
 
 @parser.wrap()
 def train(cfg: TrainPipelineConfig):
+    # Set TOKENIZERS_PARALLELISM to false to avoid warnings when forking processes for data loading.
+    os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
     cfg.validate()
     logging.info(pformat(cfg.to_dict()))
 
@@ -129,15 +134,38 @@ def train(cfg: TrainPipelineConfig):
     torch.backends.cudnn.benchmark = True
     torch.backends.cuda.matmul.allow_tf32 = True
 
-    logging.info("Creating dataset")
-    dataset = make_dataset(cfg)
-
-    # Create train/validation splits if validation is enabled
+    logging.info("Creating dataset(s)")
     if cfg.use_validation:
-        train_indices, val_indices = create_train_val_splits(cfg, dataset)
+        # Create train dataset with augmentations
+        train_dataset = make_dataset(cfg)
+
+        # Create validation dataset without augmentations
+        val_cfg = copy.deepcopy(cfg)
+        val_cfg.dataset.image_transforms.enable = False
+        val_dataset = make_dataset(val_cfg)
+
+        train_indices, val_indices, num_train_episodes, num_val_episodes = create_train_val_splits(cfg, train_dataset)
+
+        train_dataset = Subset(train_dataset, train_indices)
+        val_dataset = Subset(val_dataset, val_indices)
+
+        val_dataloader = torch.utils.data.DataLoader(
+            val_dataset,
+            batch_size=cfg.val_batch_size,
+            shuffle=False,
+            num_workers=cfg.num_workers,
+            pin_memory=device.type != "cpu",
+            drop_last=False,
+        )
+        dataset = train_dataset
+        num_frames = len(train_indices)
+        num_episodes = num_train_episodes
+
     else:
-        train_indices = list(range(len(dataset)))
-        val_indices = None
+        dataset = make_dataset(cfg)
+        val_dataloader = None
+        train_indices, val_indices, num_episodes, _ = create_train_val_splits(cfg, dataset)
+        num_frames = len(train_indices)
 
     # Create environment used for evaluating checkpoints during training on simulation data.
     # On real-world data, no need to create an environment as evaluations are done outside train.py,
@@ -148,9 +176,10 @@ def train(cfg: TrainPipelineConfig):
         eval_env = make_env(cfg.env, n_envs=cfg.eval.batch_size, use_async_envs=cfg.eval.use_async_envs)
 
     logging.info("Creating policy")
+    ds_meta = dataset.dataset.meta if isinstance(dataset, Subset) else dataset.meta
     policy = make_policy(
         cfg=cfg.policy,
-        ds_meta=dataset.meta,
+        ds_meta=ds_meta,
     )
 
     logging.info("Creating optimizer and scheduler")
@@ -169,8 +198,8 @@ def train(cfg: TrainPipelineConfig):
     if cfg.env is not None:
         logging.info(f"{cfg.env.task=}")
     logging.info(f"{cfg.steps=} ({format_big_number(cfg.steps)})")
-    logging.info(f"{dataset.num_frames=} ({format_big_number(dataset.num_frames)})")
-    logging.info(f"{dataset.num_episodes=}")
+    logging.info(f"{num_frames=} ({format_big_number(num_frames)})")
+    logging.info(f"{num_episodes=}")
     logging.info(f"{num_learnable_params=} ({format_big_number(num_learnable_params)})")
     logging.info(f"{num_total_params=} ({format_big_number(num_total_params)})")
 
@@ -183,13 +212,8 @@ def train(cfg: TrainPipelineConfig):
             shuffle=True,
         )
     else:
-        # Use subset sampler for training indices if validation is enabled
-        if cfg.use_validation:
-            sampler = torch.utils.data.SubsetRandomSampler(train_indices)
-            shuffle = False
-        else:
-            sampler = None
-            shuffle = True
+        sampler = None
+        shuffle = True
 
     dataloader = torch.utils.data.DataLoader(
         dataset,
@@ -213,7 +237,7 @@ def train(cfg: TrainPipelineConfig):
     }
 
     train_tracker = MetricsTracker(
-        cfg.batch_size, dataset.num_frames, dataset.num_episodes, train_metrics, initial_step=step
+        cfg.batch_size, num_frames, num_episodes, train_metrics, initial_step=step
     )
 
     logging.info("Start offline training on a fixed dataset")
@@ -271,16 +295,12 @@ def train(cfg: TrainPipelineConfig):
             if wandb_logger:
                 wandb_logger.log_policy(checkpoint_dir)
 
-        if is_val_step and val_indices is not None:
-            logging.info(f"Computing validation loss at step {step}")
+        if is_val_step and val_dataloader is not None:
             start_time = time.perf_counter()
             val_results = compute_validation_loss(
                 policy,
-                dataset,
-                val_indices,
+                val_dataloader,
                 device,
-                cfg.val_batch_size,
-                cfg.num_workers,
                 use_amp=cfg.policy.use_amp,
             )
             val_time = time.perf_counter() - start_time
@@ -326,7 +346,7 @@ def train(cfg: TrainPipelineConfig):
                 "eval_s": AverageMeter("eval_s", ":.3f"),
             }
             eval_tracker = MetricsTracker(
-                cfg.batch_size, dataset.num_frames, dataset.num_episodes, eval_metrics, initial_step=step
+                cfg.batch_size, num_frames, num_episodes, eval_metrics, initial_step=step
             )
             eval_tracker.eval_s = eval_info["aggregated"].pop("eval_s")
             eval_tracker.avg_sum_reward = eval_info["aggregated"].pop("avg_sum_reward")
@@ -344,22 +364,28 @@ def train(cfg: TrainPipelineConfig):
 
 def create_train_val_splits(
     cfg: TrainPipelineConfig, dataset: LeRobotDataset
-) -> tuple[list[int], list[int] | None]:
+) -> tuple[list[int], list[int] | None, int, int | None]:
     """Create train/validation index splits from the full dataset.
 
     This split is deterministic and reproducible if a seed is provided in the config:
     - Always splits at episode boundaries (maintains episode integrity)
     - Uses the same episodes for train/val across runs with the same val_split and seed.
     - If no seed is provided, the split will be random.
+
+    Returns:
+        A tuple containing:
+        - train_indices (list[int]): Frame indices for the training set.
+        - val_indices (list[int] | None): Frame indices for the validation set.
+        - num_train_episodes (int): Number of episodes in the training set.
+        - num_val_episodes (int | None): Number of episodes in the validation set.
     """
-    if not cfg.use_validation:
-        return list(range(len(dataset))), None
-
-
-    # Calculate indices for train/val split based on episodes
     episode_data_index = dataset.episode_data_index
     total_episodes = len(episode_data_index["from"])
 
+    if not cfg.use_validation:
+        return list(range(len(dataset))), None, total_episodes, None
+
+    # Calculate indices for train/val split based on episodes
     # Create a list of episode indices
     all_episode_indices = list(range(total_episodes))
 
@@ -390,45 +416,37 @@ def create_train_val_splits(
     logging.info(f"Dataset split - Total episodes: {total_episodes}")
     logging.info(f"Training episodes: {num_train_episodes} ({100 * num_train_episodes / total_episodes:.1f}%)")
     logging.info(f"Validation episodes: {num_val_episodes} ({100 * num_val_episodes / total_episodes:.1f}%)")
-    logging.info(f"Training frames: {len(train_indices)}")
-    logging.info(f"Validation frames: {len(val_indices)}")
+
+    avg_len_train = len(train_indices) / num_train_episodes if num_train_episodes > 0 else 0
+    logging.info(f"Training frames: {len(train_indices)} (avg length: {avg_len_train:.1f})")
+
+    avg_len_val = len(val_indices) / num_val_episodes if num_val_episodes > 0 else 0
+    logging.info(f"Validation frames: {len(val_indices)} (avg length: {avg_len_val:.1f})")
+
     if cfg.seed is not None:
         logging.info(f"Validation split is reproducible with seed={cfg.seed}")
     else:
         logging.info("Validation split is random (no seed provided)")
 
-    return train_indices, val_indices
+    return train_indices, val_indices, num_train_episodes, num_val_episodes
 
 
 def compute_validation_loss(
     policy: PreTrainedPolicy,
-    dataset: LeRobotDataset,
-    val_indices: list[int],
+    val_dataloader: torch.utils.data.DataLoader,
     device: torch.device,
-    val_batch_size: int,
-    num_workers: int,
     use_amp: bool = False,
 ) -> dict[str, float]:
     """Compute validation loss on the validation subset."""
     policy.eval()
 
-    val_dataset = Subset(dataset, val_indices)
-
-    # Create validation dataloader
-    val_dataloader = torch.utils.data.DataLoader(
-        val_dataset,
-        batch_size=val_batch_size,
-        shuffle=False,
-        num_workers=num_workers,
-        pin_memory=device.type != "cpu",
-        drop_last=False,
-    )
-
     val_loss_sum = 0.0
     val_n_samples = 0
+    
+    val_start_time = time.perf_counter()
 
     with torch.no_grad():
-        for batch in val_dataloader:
+        for batch in tqdm(val_dataloader, desc="Validation"):
             # Move batch to device
             for key in batch:
                 if isinstance(batch[key], torch.Tensor):
@@ -442,7 +460,9 @@ def compute_validation_loss(
             val_n_samples += batch["index"].shape[0]
 
     avg_val_loss = val_loss_sum / val_n_samples if val_n_samples > 0 else 0.0
-
+    val_time = time.perf_counter() - val_start_time
+    
+    logging.info(f"Validation time: {val_time:.2f}s")
     return {
         "val_loss": avg_val_loss,
         "val_n_samples": val_n_samples,
