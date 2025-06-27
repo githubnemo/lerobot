@@ -25,10 +25,11 @@ import torch
 from termcolor import colored
 from torch.amp import GradScaler
 from torch.optim import Optimizer
+from torch.utils.data import Subset
 from tqdm import tqdm
 
 from lerobot.common.datasets.factory import make_dataset
-from lerobot.common.datasets.lerobot_dataset import LeRobotDataset, LeRobotDatasetMetadata
+from lerobot.common.datasets.lerobot_dataset import LeRobotDataset
 from lerobot.common.datasets.sampler import EpisodeAwareSampler
 from lerobot.common.datasets.utils import cycle
 from lerobot.common.envs.factory import make_env
@@ -373,21 +374,18 @@ def create_train_val_splits(
     train_ep_indices = all_episode_indices[num_val_episodes:]
 
     # Get frame indices for training episodes
-    train_indices = []
-    for ep_idx in train_ep_indices:
-        start_idx = episode_data_index["from"][ep_idx].item()
-        end_idx = episode_data_index["to"][ep_idx].item()
-        train_indices.extend(range(start_idx, end_idx))
+    train_indices = [
+        i
+        for ep_idx in train_ep_indices
+        for i in range(episode_data_index["from"][ep_idx].item(), episode_data_index["to"][ep_idx].item())
+    ]
 
     # Get frame indices for validation episodes
-
-    # Get frame indices for validation episodes
-    val_indices = []
-    for ep_idx in val_ep_indices:
-        start_idx = episode_data_index["from"][ep_idx].item()
-        end_idx = episode_data_index["to"][ep_idx].item()
-        val_indices.extend(range(start_idx, end_idx))
-
+    val_indices = [
+        i
+        for ep_idx in val_ep_indices
+        for i in range(episode_data_index["from"][ep_idx].item(), episode_data_index["to"][ep_idx].item())
+    ]
 
     logging.info(f"Dataset split - Total episodes: {total_episodes}")
     logging.info(f"Training episodes: {num_train_episodes} ({100 * num_train_episodes / total_episodes:.1f}%)")
@@ -414,25 +412,13 @@ def compute_validation_loss(
     """Compute validation loss on the validation subset."""
     policy.eval()
 
-    # Create deterministic sampler for validation (no shuffling for reproducibility)
-    # Use a simple sequential sampler over the validation indices
-    class SubsetSequentialSampler(torch.utils.data.Sampler):
-        def __init__(self, indices):
-            self.indices = indices
+    val_dataset = Subset(dataset, val_indices)
 
-        def __iter__(self):
-            return iter(self.indices)
-
-        def __len__(self):
-            return len(self.indices)
-
-    val_sampler = SubsetSequentialSampler(val_indices)
-
-    # Create validation dataloader with subset sampler
+    # Create validation dataloader
     val_dataloader = torch.utils.data.DataLoader(
-        dataset,
+        val_dataset,
         batch_size=val_batch_size,
-        sampler=val_sampler,
+        shuffle=False,
         num_workers=num_workers,
         pin_memory=device.type != "cpu",
         drop_last=False,
