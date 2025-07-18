@@ -69,7 +69,7 @@ from lerobot.common.utils.robot_utils import busy_wait
 from lerobot.common.utils.utils import log_say
 from lerobot.configs import parser
 
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.DEBUG)  # Changed from INFO to DEBUG
 
 
 def reset_follower_position(robot_arm, target_position):
@@ -584,6 +584,7 @@ class RewardWrapper(gym.Wrapper):
                 if self.reward_classifier is not None
                 else 0.0
             )
+
         info["Reward classifier frequency"] = 1 / (time.perf_counter() - start_time)
 
         reward = 0.0
