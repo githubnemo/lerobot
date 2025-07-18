@@ -69,7 +69,7 @@ from lerobot.common.utils.robot_utils import busy_wait
 from lerobot.common.utils.utils import log_say
 from lerobot.configs import parser
 
-logging.basicConfig(level=logging.DEBUG)  # Changed from INFO to DEBUG
+logging.basicConfig(level=logging.INFO)  # Changed from INFO to DEBUG
 
 
 def reset_follower_position(robot_arm, target_position):
