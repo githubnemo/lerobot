@@ -98,6 +98,7 @@ class LeRobotDatasetMetadata:
 
             (self.root / "meta").mkdir(exist_ok=True, parents=True)
             self.pull_from_repo(allow_patterns="meta/")
+            
             self.load_metadata()
 
     def load_metadata(self):

@@ -1,0 +1,52 @@
+{
+    "dataset": {
+        "repo_id": "hubnemo/so101_matchbox_reward",
+        "root": null
+    },
+    "policy": {
+        "normalization_mapping": {
+            "VISUAL": "IDENTITY",
+            "STATE": "MEAN_STD",
+            "ACTION": "MEAN_STD"
+        },
+        "type": "reward_classifier",
+        "model_name": "helper2424/resnet10",
+        "model_type": "cnn",
+        "num_cameras": 1,
+        "num_classes": 2,
+        "hidden_dim": 256,
+        "dropout_rate": 0.1,
+        "learning_rate": 1e-4,
+        "device": "cuda",
+        "use_amp": true,
+        "input_features": {
+            "observation.image.front": {
+                "type": "VISUAL",
+                "shape": [
+                    3,
+                    128,
+                    128
+                ]
+            }
+        },
+        "repo_id": "orellius/so101_matchbox_reward_model"
+    },
+    "batch_size": 16,
+    "num_workers": 4,
+    "steps": 5000,
+    "log_freq": 10,
+    "eval_freq": 1000,
+    "save_freq": 1000,
+    "save_checkpoint": true,
+    "seed": 2,
+    "resume": false,
+    "optimizer": {
+        "grad_clip_norm": 10.0
+    },
+    "wandb": {
+        "enable": true,
+        "project": "reward-classifier",
+        "disable_artifact": false
+    },
+    "job_name": "reward-classifier"
+}

@@ -1,0 +1,1 @@
+python -m lerobot.scripts.train --config_path robot/reward_net.json

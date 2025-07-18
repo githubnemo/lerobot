@@ -19,14 +19,30 @@ import json
 from copy import deepcopy
 from pathlib import Path
 from typing import Dict, Tuple
+from unittest.mock import patch
 
 import cv2
+from huggingface_hub import snapshot_download
 
 # import torch.nn.functional as F  # noqa: N812
 import torchvision.transforms.functional as F  # type: ignore  # noqa: N812
 from tqdm import tqdm  # type: ignore
 
 from lerobot.common.datasets.lerobot_dataset import LeRobotDataset
+
+
+def mock_get_safe_version(repo_id, version):
+    """Mock function that returns a valid version string to bypass version checking."""
+    print(f"Bypassing version check for {repo_id}, using 'v2.1' instead of {version}")
+    return "v2.1"
+
+
+def mock_snapshot_download(repo_id, repo_type=None, revision=None, **kwargs):
+    """Mock snapshot_download to use 'main' revision instead of version tags."""
+    if revision and revision.startswith('v'):
+        print(f"Using 'main' revision instead of '{revision}' for download")
+        revision = 'main'
+    return snapshot_download(repo_id, repo_type=repo_type, revision=revision, **kwargs)
 
 
 def select_rect_roi(img):
@@ -277,7 +293,21 @@ if __name__ == "__main__":
     )
     args = parser.parse_args()
 
-    dataset = LeRobotDataset(repo_id=args.repo_id, root=args.root)
+    bypass_version_check = True
+
+    # Apply version checking bypass patches
+    patches = [
+        patch('lerobot.common.datasets.utils.get_safe_version', side_effect=mock_get_safe_version),
+        patch('lerobot.common.datasets.lerobot_dataset.get_safe_version', side_effect=mock_get_safe_version),
+        patch('lerobot.common.datasets.lerobot_dataset.snapshot_download', side_effect=mock_snapshot_download),
+        patch('huggingface_hub.snapshot_download', side_effect=mock_snapshot_download),
+    ]
+    
+    if bypass_version_check:
+        with patches[0], patches[1], patches[2], patches[3]:
+            dataset = LeRobotDataset(repo_id=args.repo_id, root=args.root)
+    else:
+        dataset = LeRobotDataset(repo_id=args.repo_id, root=args.root)
 
     images = get_image_from_lerobot_dataset(dataset)
     images = {k: v.cpu().permute(1, 2, 0).numpy() for k, v in images.items()}

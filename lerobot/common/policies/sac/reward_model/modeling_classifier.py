@@ -18,6 +18,7 @@ import logging
 
 import torch
 from torch import Tensor, nn
+from torch.nn import functional as F
 
 from lerobot.common.constants import OBS_IMAGE, REWARD
 from lerobot.common.policies.normalize import Normalize, Unnormalize
@@ -77,7 +78,11 @@ class SpatialLearnedEmbeddings(nn.Module):
             Output tensor of shape [B, C*F] or [C*F] if no batch
         """
 
+
         features = features.last_hidden_state
+        
+        # print(f"Features shape: {features.shape}")
+
 
         original_shape = features.shape
         if features.dim() == 3:
@@ -85,6 +90,9 @@ class SpatialLearnedEmbeddings(nn.Module):
 
         features_expanded = features.unsqueeze(-1)  # [B, H, W, C, 1]
         kernel_expanded = self.kernel.unsqueeze(0)  # [1, H, W, C, F]
+
+
+
 
         # Element-wise multiplication and spatial reduction
         output = (features_expanded * kernel_expanded).sum(dim=(2, 3))  # Sum H,W
@@ -114,6 +122,23 @@ class Classifier(PreTrainedPolicy):
 
         super().__init__(config)
         self.config = config
+        
+        # Add resizer to ensure images are 128x128 or smaller
+        class ImageResizer(nn.Module):
+            def __init__(self, target_size=(128, 128)):
+                super().__init__()
+                self.target_size = target_size
+                
+            def forward(self, x):
+                # Get current dimensions
+                _, _, h, w = x.shape
+                
+                # Only resize if larger than target
+                if h > self.target_size[0] or w > self.target_size[1]:
+                    x = F.interpolate(x, size=self.target_size, mode='bilinear', align_corners=False)
+                return x
+                
+        self.resizer = ImageResizer()
 
         # Initialize normalization (standardized with the policy framework)
         self.normalize_inputs = Normalize(config.input_features, config.normalization_mapping, dataset_stats)
@@ -172,8 +197,9 @@ class Classifier(PreTrainedPolicy):
         for param in self.encoder.parameters():
             param.requires_grad = False
 
-    def _create_single_encoder(self):
+    def _create_single_encoder(self):    
         encoder = nn.Sequential(
+            self.resizer,
             self.encoder,
             SpatialLearnedEmbeddings(
                 height=4,
