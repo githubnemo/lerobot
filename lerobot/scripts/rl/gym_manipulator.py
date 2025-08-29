@@ -1479,6 +1479,7 @@ class GearedLeaderControlWrapper(BaseLeaderControlWrapper):
         Returns:
             Boolean indicating whether intervention mode is active.
         """
+        return True
         return self.is_manual_intervention_active
 
 

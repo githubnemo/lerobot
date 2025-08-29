@@ -23,7 +23,7 @@
   },
   "wrapper": {
     "display_cameras": true,
-    "add_joint_velocity_to_observation": true,
+    "add_joint_velocity_to_observation": false,
     "add_current_to_observation": false,
     "add_ee_pose_to_observation": false,
     "crop_params_dict": null,
@@ -39,16 +39,16 @@
   },
   "name": "shabby_robot",
   "mode": "record",
-  "repo_id": "nemo/so101_matchbox_reward_dataset_v2",
-  "dataset_root": "datasets/so101_matchbox_reward_dataset_v2",
+  "repo_id": "nemo/so101_matchbox_reward_dataset_fpv",
+  "dataset_root": "datasets/so101_matchbox_reward_dataset_fpv",
   "task": "shabby_manipulation_task",
-  "num_episodes": 10,
+  "num_episodes": 40,
   "episode": 0,
   "pretrained_policy_name_or_path": null,
   "device": "cuda",
   "push_to_hub": true,
   "fps": 10,
-  "reward_classifier_pretrained_path": "Orellius/so101_matchbox_reward_model",
+  "reward_classifier_pretrained_path": "Orellius/so101_matchbox_fpv_reward_model",
   "number_of_steps_after_success": 10,
   "features": {
     "observation.image.front": {
@@ -57,7 +57,7 @@
     },
     "observation.state": {
       "type": "STATE",
-      "shape": [12]
+      "shape": [6]
     },
     "action": {
       "type": "ACTION",
