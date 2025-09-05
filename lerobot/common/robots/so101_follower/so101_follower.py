@@ -20,7 +20,11 @@ from functools import cached_property
 from typing import Any
 
 from lerobot.common.cameras.utils import make_cameras_from_configs
-from lerobot.common.errors import DeviceAlreadyConnectedError, DeviceNotConnectedError
+from lerobot.common.errors import (
+    DeviceAlreadyConnectedError,
+    DeviceNotConnectedError,
+    MotorOverloadError,
+)
 from lerobot.common.motors import Motor, MotorCalibration, MotorNormMode
 from lerobot.common.motors.feetech import (
     FeetechMotorsBus,
@@ -154,13 +158,30 @@ class SO101Follower(Robot):
             print(f"'{motor}' motor id set to {self.bus.motors[motor].id}")
 
     def get_observation(self) -> dict[str, Any]:
+        """
+        Get the current observation from the robot.
+        This includes motor positions and camera images.
+        """
         if not self.is_connected:
             raise DeviceNotConnectedError(f"{self} is not connected.")
 
         # Read arm position
         start = time.perf_counter()
         obs_dict = self.bus.sync_read("Present_Position")
-        obs_dict = {f"{motor}.pos": val for motor, val in obs_dict.items()}
+        obs_dict = {f"{motor_name}.pos": pos for motor_name, pos in obs_dict.items()}
+
+        if self.config.max_load is not None:
+            try:
+                motor_loads = self.bus.read_all("Present_Load", normalize=False)
+                for motor_name, load in motor_loads.items():
+                    if abs(load) > self.config.max_load:
+                        error_msg = f"Motor '{motor_name}' exceeded max load ({load} > {self.config.max_load})."
+                        logger.critical(f"{error_msg} Disabling torque for safety.")
+                        self.bus.write_all("Torque_Enable", [0 for _ in self.bus.motors])
+                        raise MotorOverloadError(error_msg)
+            except Exception as e:
+                logger.error(f"Error reading motor loads: {e}")
+
         dt_ms = (time.perf_counter() - start) * 1e3
         logger.debug(f"{self} read state: {dt_ms:.1f}ms")
 
@@ -202,7 +223,10 @@ class SO101Follower(Robot):
         self.bus.sync_write("Goal_Position", goal_pos)
         return {f"{motor}.pos": val for motor, val in goal_pos.items()}
 
-    def disconnect(self):
+    def disconnect(self) -> None:
+        """
+        Disconnect from the robot and optionally disable torque on motors.
+        """
         if not self.is_connected:
             raise DeviceNotConnectedError(f"{self} is not connected.")
 

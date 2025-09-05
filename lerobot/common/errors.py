@@ -41,3 +41,14 @@ class InvalidActionError(ValueError):
     ):
         self.message = message
         super().__init__(self.message)
+
+
+class MotorOverloadError(RuntimeError):
+    """Exception raised when a motor's load exceeds the safety limit."""
+
+    def __init__(
+        self,
+        message="A motor has exceeded its maximum configured load. The robot has been stopped for safety.",
+    ):
+        self.message = message
+        super().__init__(self.message)
