@@ -60,7 +60,7 @@ echo "MODEL_NAME: $MODEL_NAME"
 # Common arguments for both resume and fresh training
 common_args=(
   --dataset.repo_id=hubnemo/so101_matchbox_reward_fpv
-  --dataset.root=datasets/so101_matchbox_reward_dataset_fpv
+  --dataset.root=datasets/so101_matchbox_reward_fpv
   --policy.type=${POLICY_TYPE}
   --output_dir=outputs/train/matchbox_${MODEL_NAME}
   --job_name=matchbox_${MODEL_NAME}
@@ -70,13 +70,13 @@ common_args=(
   --steps="$num_steps"
   --wandb.enable=$wandb
   --dataset.image_transforms.enable=true
-  --policy.optimizer_lr=1e-4
+  --policy.optimizer_lr=1e-3
   --batch_size=$batch_size
   --policy.push_to_hub=False
   --log_freq=100
   # Validation settings for supervised learning
   --use_validation=true
-  --val_split=0.1
+  --val_split=0.02
   --val_freq=100
   --val_batch_size=$val_batch_size
   --use_peft=$use_peft
