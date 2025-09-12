@@ -33,6 +33,11 @@ class SO101FollowerConfig(RobotConfig):
     # Set this to a positive scalar to have the same value for all motors, or a list that is the same length as
     # the number of motors in your follower arms.
     max_relative_target: int | None = None
+    
+    # Maximum motor load in percentage (%). If exceeded, torque is disabled.
+    # Set to a value determined by experimentation to be safe.
+    # For example, start with 50 and adjust.
+    max_load: int | None = 30
 
     # Max gripper position. This is used to normalize the gripper state and actions.
     max_gripper_pos: float = 50.0

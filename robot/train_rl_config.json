@@ -1,0 +1,104 @@
+{
+  "seed": 1000,
+  "output_dir": "outputs/train/matchbox_rl",
+  "job_name": "matchbox_rl_act",
+  "wandb": {
+    "enable": true,
+    "project": "lerobot-rl"
+  },
+  "resume": false,
+  "save_checkpoint": true,
+  "save_freq": 20000,
+  "log_freq": 50,
+  "dataset": {
+    "repo_id": "hubnemo/so101_matchbox_reward_dataset_fpv"
+  },
+  "policy": {
+    "type": "sac",
+    "device": "cuda",
+    "storage_device": "cuda",
+    "online_steps": 500000,
+    "online_step_before_learning": 1000,
+    "online_buffer_capacity": 500000,
+    "utd_ratio": 20,
+    "batch_size": 256,
+    "actor_lr": 3e-4,
+    "critic_lr": 3e-4,
+    "policy_update_freq": 2,
+    "actor_learner_config": {
+      "learner_host": "127.0.0.1",
+      "learner_port": 50051,
+      "policy_parameters_push_frequency": 2.0,
+      "queue_get_timeout": 0.001
+    },
+    "input_features": {
+      "observation.image.front": {
+        "type": "rgb",
+        "modality": "vision"
+      },
+      "observation.state": {
+        "type": "low_dim",
+        "modality": "proprio"
+      }
+    },
+    "output_features": {
+      "action": {
+        "type": "action",
+        "modality": "action"
+      }
+    }
+  },
+  "env": {
+    "type": "gym_manipulator",
+    "robot": {
+      "type": "so101_follower",
+      "port": "/dev/ttyACM4",
+      "id": "shabby",
+      "cameras": {
+        "front": {
+          "type": "opencv",
+          "index_or_path": 2,
+          "height": 480,
+          "width": 640,
+          "fps": 30
+        }
+      },
+      "use_degrees": false
+    },
+    "teleop": {
+      "type": "so101_leader",
+      "port": "/dev/ttyACM3",
+      "id": "shabby_leader",
+      "use_degrees": false
+    },
+    "wrapper": {
+      "display_cameras": true,
+      "add_joint_velocity_to_observation": false,
+      "add_current_to_observation": false,
+      "add_ee_pose_to_observation": false,
+      "crop_params_dict": null,
+      "resize_size": [
+        128,
+        128
+      ],
+      "control_time_s": 60.0,
+      "use_gripper": true,
+      "gripper_quantization_threshold": 0.8,
+      "gripper_penalty": 0.0,
+      "gripper_penalty_in_reward": false,
+      "fixed_reset_joint_positions": [
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        25.0
+      ],
+      "reset_time_s": 5.0,
+      "action_space": "joint"
+    },
+    "name": "shabby_robot",
+    "device": "cuda",
+    "fps": 10
+  }
+}

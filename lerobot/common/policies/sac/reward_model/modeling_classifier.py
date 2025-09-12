@@ -245,6 +245,10 @@ class Classifier(PreTrainedPolicy):
                 outputs = self.encoders[image_key](x)
                 return outputs
             else:  # Transformer models
+                # Transformer models like CLIP expect a fixed input size.
+                if hasattr(self.vision_config, "image_size"):
+                    target_size = (self.vision_config.image_size, self.vision_config.image_size)
+                    x = F.interpolate(x, size=target_size, mode="bilinear", align_corners=False)
                 outputs = self.encoder(x)
                 return outputs.last_hidden_state[:, 0, :]
 
