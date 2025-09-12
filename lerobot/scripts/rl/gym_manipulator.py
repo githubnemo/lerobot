@@ -42,6 +42,7 @@ from collections import deque
 from threading import Lock
 from typing import Annotated, Any, Sequence
 
+import rerun as rr
 import gymnasium as gym
 import numpy as np
 import torch
@@ -68,6 +69,7 @@ from lerobot.common.teleoperators.keyboard.teleop_keyboard import KeyboardEndEff
 from lerobot.common.utils.robot_utils import busy_wait
 from lerobot.common.utils.utils import log_say
 from lerobot.configs import parser
+from lerobot.common.utils.visualization_utils import _init_rerun
 
 logging.basicConfig(level=logging.INFO)  # Changed from INFO to DEBUG
 
@@ -269,6 +271,12 @@ class RobotEnv(gym.Env):
         """Helper to convert a dictionary from bus.sync_read to an ordered numpy array."""
         obs_dict = self.robot.get_observation()
         joint_positions = np.array([obs_dict[name] for name in self._joint_names], dtype=np.float32)
+
+        for obs, val in obs_dict.items():
+            if isinstance(val, float):
+                rr.log(f"observation.{obs}", rr.Scalar(val))
+            elif isinstance(val, np.ndarray):
+                rr.log(f"observation.{obs}", rr.Image(val), static=True)
 
         images = {key: obs_dict[key] for key in self._image_keys}
         return {"agent_pos": joint_positions, "pixels": images}
@@ -2277,6 +2285,8 @@ def main(cfg: EnvConfig):
              including mode (record, replay, random) and other settings.
     """
     env = make_robot_env(cfg)
+
+    _init_rerun(session_name="rl_recording")
 
     if cfg.mode == "record":
         policy = None
