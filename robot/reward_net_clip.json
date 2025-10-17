@@ -1,0 +1,74 @@
+{
+    "dataset": {
+        "repo_id": "hubnemo/so101_matchbox_reward_fpv_less_bias",
+        "root": null,
+        "image_transforms": {
+            "enable": true,
+            "tfs": {
+                "color_jitter": {
+                    "type": "ColorJitter",
+                    "kwargs": {
+                        "brightness": 0.2,
+                        "contrast": 0.2,
+                        "saturation": 0.2,
+                        "hue": 0.1
+                    }
+                }
+            }
+        }
+    },
+    "policy": {
+        "normalization_mapping": {
+            "VISUAL": "IDENTITY",
+            "STATE": "MEAN_STD",
+            "ACTION": "MEAN_STD"
+        },
+        "type": "reward_classifier",
+        "model_name": "openai/clip-vit-base-patch32",
+        "model_type": "transformer",
+        "num_cameras": 1,
+        "num_classes": 2,
+        "hidden_dim": 256,
+        "dropout_rate": 0.1,
+        "learning_rate": 3e-4,
+        "device": "cuda",
+        "use_amp": true,
+        "input_features": {
+            "observation.image.front": {
+                "type": "VISUAL",
+                "shape": [
+                    3,
+                    128,
+                    128
+                ]
+            }
+        },
+        "repo_id": "orellius/so101_matchbox_fpv_reward_model"
+    },
+    "batch_size": 16,
+    "num_workers": 4,
+    "steps": 3000,
+    "log_freq": 100,
+    "eval_freq": 1000,
+    "save_freq": 10000,
+    "save_checkpoint": true,
+    "seed": 2,
+    "resume": false,
+    "use_validation": true,
+    "val_split": 0.05,
+    "val_freq": 500,
+    "optimizer": {
+        "grad_clip_norm": 10.0
+    },
+    "scheduler": {
+        "type": "diffuser",
+        "name": "cosine",
+        "num_warmup_steps": 100
+    },
+    "wandb": {
+        "enable": true,
+        "project": "reward-classifier",
+        "disable_artifact": false
+    },
+    "job_name": "reward-classifier"
+}

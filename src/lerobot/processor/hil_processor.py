@@ -404,10 +404,12 @@ class InterventionActionProcessorStep(ProcessorStep):
         use_gripper: Whether to include the gripper in the teleoperated action.
         terminate_on_success: If True, automatically sets the `done` flag when a
                               `success` event is received.
+        action_space_type: Type of action space - "end_effector" or "joint".
     """
 
     use_gripper: bool = False
     terminate_on_success: bool = True
+    action_space_type: str = "end_effector"
 
     def __call__(self, transition: EnvTransition) -> EnvTransition:
         """
@@ -439,13 +441,19 @@ class InterventionActionProcessorStep(ProcessorStep):
         if is_intervention and teleop_action is not None:
             if isinstance(teleop_action, dict):
                 # Convert teleop_action dict to tensor format
-                action_list = [
-                    teleop_action.get("delta_x", 0.0),
-                    teleop_action.get("delta_y", 0.0),
-                    teleop_action.get("delta_z", 0.0),
-                ]
-                if self.use_gripper:
-                    action_list.append(teleop_action.get(GRIPPER_KEY, 1.0))
+                if self.action_space_type == "joint":
+                    # For joint space: teleop returns joint positions
+                    # Extract values in order (assuming dict keys are joint names)
+                    action_list = list(teleop_action.values())
+                else:
+                    # For end-effector space: teleop returns delta commands
+                    action_list = [
+                        teleop_action.get("delta_x", 0.0),
+                        teleop_action.get("delta_y", 0.0),
+                        teleop_action.get("delta_z", 0.0),
+                    ]
+                    if self.use_gripper:
+                        action_list.append(teleop_action.get(GRIPPER_KEY, 1.0))
             elif isinstance(teleop_action, np.ndarray):
                 action_list = teleop_action.tolist()
             else:

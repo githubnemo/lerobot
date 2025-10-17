@@ -190,6 +190,7 @@ class HILSerlProcessorConfig:
     """Configuration for environment processing pipeline."""
 
     control_mode: str = "gamepad"
+    action_space_type: str = "end_effector"  # "end_effector" or "joint"
     observation: ObservationConfig | None = None
     image_preprocessing: ImagePreprocessingConfig | None = None
     gripper: GripperConfig | None = None
@@ -209,6 +210,19 @@ class HILSerlRobotEnvConfig(EnvConfig):
     processor: HILSerlProcessorConfig = field(default_factory=HILSerlProcessorConfig)
 
     name: str = "real_robot"
+
+    def set_action_features_from_env(self, action_dim: int):
+        """Set action features based on the actual environment action space.
+
+        This should be called after the environment is created, so we know
+        the exact action dimension for the specific robot being used.
+
+        Args:
+            action_dim: The action dimension from env.action_space.shape[0]
+        """
+        if not self.features:
+            self.features = {ACTION: PolicyFeature(type=FeatureType.ACTION, shape=(action_dim,))}
+            self.features_map = {ACTION: ACTION}
 
     @property
     def gym_kwargs(self) -> dict:

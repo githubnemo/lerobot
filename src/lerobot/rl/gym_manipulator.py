@@ -127,6 +127,7 @@ class RobotEnv(gym.Env):
         display_cameras: bool = False,
         reset_pose: list[float] | None = None,
         reset_time_s: float = 5.0,
+        action_space_type: str = "end_effector",
     ) -> None:
         """Initialize robot environment with configuration options.
 
@@ -136,11 +137,14 @@ class RobotEnv(gym.Env):
             display_cameras: Whether to show camera feeds during execution.
             reset_pose: Joint positions for environment reset.
             reset_time_s: Time to wait during reset.
+            action_space_type: Type of action space - "end_effector" for 3D
+                delta control or "joint" for direct joint control.
         """
         super().__init__()
 
         self.robot = robot
         self.display_cameras = display_cameras
+        self.action_space_type = action_space_type
 
         # Connect to the robot if not already connected.
         if not self.robot.is_connected:
@@ -200,16 +204,29 @@ class RobotEnv(gym.Env):
 
         self.observation_space = gym.spaces.Dict(observation_spaces)
 
-        # Define the action space for joint positions along with setting an intervention flag.
-        action_dim = 3
-        bounds = {}
-        bounds["min"] = -np.ones(action_dim)
-        bounds["max"] = np.ones(action_dim)
+        # Define the action space based on action_space_type
+        if self.action_space_type == "joint":
+            # Joint space: one action per motor
+            action_dim = len(self.robot.bus.motors)
+            bounds = {}
+            bounds["min"] = -np.ones(action_dim)
+            bounds["max"] = np.ones(action_dim)
 
-        if self.use_gripper:
-            action_dim += 1
-            bounds["min"] = np.concatenate([bounds["min"], [0]])
-            bounds["max"] = np.concatenate([bounds["max"], [2]])
+            if self.use_gripper:
+                # For joint space, gripper bounds are different
+                bounds["min"][-1] = 0
+                bounds["max"][-1] = 2
+        else:  # end_effector
+            # End-effector space: 3D delta control
+            action_dim = 3
+            bounds = {}
+            bounds["min"] = -np.ones(action_dim)
+            bounds["max"] = np.ones(action_dim)
+
+            if self.use_gripper:
+                action_dim += 1
+                bounds["min"] = np.concatenate([bounds["min"], [0]])
+                bounds["max"] = np.concatenate([bounds["max"], [2]])
 
         self.action_space = gym.spaces.Box(
             low=bounds["min"],
@@ -251,7 +268,15 @@ class RobotEnv(gym.Env):
 
     def step(self, action) -> tuple[dict[str, np.ndarray], float, bool, bool, dict[str, Any]]:
         """Execute one environment step with given action."""
-        joint_targets_dict = {f"{key}.pos": action[i] for i, key in enumerate(self.robot.bus.motors.keys())}
+        if self.action_space_type == "joint":
+            # In joint space, action is direct joint positions
+            motor_keys = list(self.robot.bus.motors.keys())
+            joint_targets_dict = {f"{key}.pos": action[i] for i, key in enumerate(motor_keys)}
+        else:
+            # In end-effector space, action processing is handled by pipeline
+            # This step method should not be called directly for EE control
+            motor_keys = list(self.robot.bus.motors.keys())
+            joint_targets_dict = {f"{key}.pos": action[i] for i, key in enumerate(motor_keys)}
 
         self.robot.send_action(joint_targets_dict)
 
@@ -340,13 +365,20 @@ def make_robot_env(cfg: HILSerlRobotEnvConfig) -> tuple[gym.Env, Any]:
         cfg.processor.observation.display_cameras if cfg.processor.observation is not None else False
     )
     reset_pose = cfg.processor.reset.fixed_reset_joint_positions if cfg.processor.reset is not None else None
+    action_space_type = cfg.processor.action_space_type
 
     env = RobotEnv(
         robot=robot,
         use_gripper=use_gripper,
         display_cameras=display_cameras,
         reset_pose=reset_pose,
+        action_space_type=action_space_type,
     )
+
+    # Set action features based on actual environment action space
+    # This ensures compatibility with any robot (SO100, SO101, Koch, etc.)
+    action_dim = env.action_space.shape[0]
+    cfg.set_action_features_from_env(action_dim)
 
     return env, teleop_device
 
@@ -373,7 +405,10 @@ def make_processors(
 
     if cfg.name == "gym_hil":
         action_pipeline_steps = [
-            InterventionActionProcessorStep(terminate_on_success=terminate_on_success),
+            InterventionActionProcessorStep(
+                terminate_on_success=terminate_on_success,
+                action_space_type=cfg.processor.action_space_type,
+            ),
             Torch2NumpyActionProcessorStep(),
         ]
 
@@ -465,38 +500,48 @@ def make_processors(
         InterventionActionProcessorStep(
             use_gripper=cfg.processor.gripper.use_gripper if cfg.processor.gripper is not None else False,
             terminate_on_success=terminate_on_success,
+            action_space_type=cfg.processor.action_space_type,
         ),
     ]
 
-    # Replace InverseKinematicsProcessor with new kinematic processors
-    if cfg.processor.inverse_kinematics is not None and kinematics_solver is not None:
-        # Add EE bounds and safety processor
-        inverse_kinematics_steps = [
-            MapTensorToDeltaActionDictStep(
-                use_gripper=cfg.processor.gripper.use_gripper if cfg.processor.gripper is not None else False
-            ),
-            MapDeltaActionToRobotActionStep(),
-            EEReferenceAndDelta(
-                kinematics=kinematics_solver,
-                end_effector_step_sizes=cfg.processor.inverse_kinematics.end_effector_step_sizes,
-                motor_names=motor_names,
-                use_latched_reference=False,
-                use_ik_solution=True,
-            ),
-            EEBoundsAndSafety(
-                end_effector_bounds=cfg.processor.inverse_kinematics.end_effector_bounds,
-            ),
-            GripperVelocityToJoint(
-                clip_max=cfg.processor.max_gripper_pos,
-                speed_factor=1.0,
-                discrete_gripper=True,
-            ),
-            InverseKinematicsRLStep(
-                kinematics=kinematics_solver, motor_names=motor_names, initial_guess_current_joints=False
-            ),
-        ]
-        action_pipeline_steps.extend(inverse_kinematics_steps)
-        action_pipeline_steps.append(RobotActionToPolicyActionProcessorStep(motor_names=motor_names))
+    # Add action processing based on action_space_type
+    if cfg.processor.action_space_type == "end_effector":
+        # For end-effector control, add IK pipeline
+        if cfg.processor.inverse_kinematics is not None and kinematics_solver is not None:
+            # Add EE bounds and safety processor
+            use_gripper_cfg = (
+                cfg.processor.gripper.use_gripper if cfg.processor.gripper is not None else False
+            )
+            inverse_kinematics_steps = [
+                MapTensorToDeltaActionDictStep(use_gripper=use_gripper_cfg),
+                MapDeltaActionToRobotActionStep(),
+                EEReferenceAndDelta(
+                    kinematics=kinematics_solver,
+                    end_effector_step_sizes=(cfg.processor.inverse_kinematics.end_effector_step_sizes),
+                    motor_names=motor_names,
+                    use_latched_reference=False,
+                    use_ik_solution=True,
+                ),
+                EEBoundsAndSafety(
+                    end_effector_bounds=(cfg.processor.inverse_kinematics.end_effector_bounds),
+                ),
+                GripperVelocityToJoint(
+                    clip_max=cfg.processor.max_gripper_pos,
+                    speed_factor=1.0,
+                    discrete_gripper=True,
+                ),
+                InverseKinematicsRLStep(
+                    kinematics=kinematics_solver,
+                    motor_names=motor_names,
+                    initial_guess_current_joints=False,
+                ),
+            ]
+            action_pipeline_steps.extend(inverse_kinematics_steps)
+            action_pipeline_steps.append(RobotActionToPolicyActionProcessorStep(motor_names=motor_names))
+    elif cfg.processor.action_space_type == "joint":
+        # For joint control, actions are already in joint space
+        # Just need to convert to the right format
+        action_pipeline_steps.append(Torch2NumpyActionProcessorStep())
 
     return DataProcessorPipeline(
         steps=env_pipeline_steps, to_transition=identity_transition, to_output=identity_transition
