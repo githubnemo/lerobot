@@ -35,6 +35,7 @@ from torchvision.ops.misc import FrozenBatchNorm2d
 
 from lerobot.policies.act.configuration_act import ACTConfig
 from lerobot.policies.pretrained import PreTrainedPolicy
+from lerobot.policies.utils import populate_queues
 from lerobot.utils.constants import ACTION, OBS_ENV_STATE, OBS_IMAGES, OBS_STATE
 
 
@@ -90,6 +91,20 @@ class ACTPolicy(PreTrainedPolicy):
 
     def reset(self):
         """This should be called whenever the environment is reset."""
+        # Initialize observation queues for temporal observation support
+        self._queues = {}
+        if self.config.n_obs_steps > 1:
+            # Only create observation queues when we need temporal history
+            # For images, we queue each camera separately
+            if self.config.image_features:
+                for cam_key in self.config.image_features:
+                    self._queues[cam_key] = deque(maxlen=self.config.n_obs_steps)
+            if self.config.robot_state_feature:
+                self._queues[OBS_STATE] = deque(maxlen=self.config.n_obs_steps)
+            if self.config.env_state_feature:
+                self._queues[OBS_ENV_STATE] = deque(maxlen=self.config.n_obs_steps)
+        
+        # Initialize action queue or temporal ensembler
         if self.config.temporal_ensemble_coeff is not None:
             self.temporal_ensembler.reset()
         else:
@@ -105,6 +120,23 @@ class ACTPolicy(PreTrainedPolicy):
         """
         self.eval()  # keeping the policy in eval mode as it could be set to train mode while queue is consumed
 
+        # NOTE: for offline evaluation, we have action in the batch, so we need to pop it out
+        if ACTION in batch:
+            batch.pop(ACTION)
+
+        # Handle observation queues for n_obs_steps > 1
+        if self.config.n_obs_steps > 1:
+            batch = dict(batch)  # shallow copy so that modifying doesn't affect the original
+            
+            # Populate observation queues (will duplicate first observation to fill the queue initially)
+            self._queues = populate_queues(self._queues, batch)
+            
+            # Stack observations from queues for model input
+            # For each queued key, stack along temporal dimension
+            for key in list(self._queues.keys()):
+                # Stack the observations from the queue: (n_obs_steps, ...) batched along dim 1
+                batch[key] = torch.stack(list(self._queues[key]), dim=1)
+        
         if self.config.temporal_ensemble_coeff is not None:
             actions = self.predict_action_chunk(batch)
             action = self.temporal_ensembler.update(actions)
@@ -127,6 +159,9 @@ class ACTPolicy(PreTrainedPolicy):
 
         if self.config.image_features:
             batch = dict(batch)  # shallow copy so that adding a key doesn't modify the original
+            # Convert individual camera keys to list format expected by the model
+            # If we have temporal observations (n_obs_steps > 1), each camera will have shape (B, n_obs_steps, C, H, W)
+            # If n_obs_steps == 1, each camera will have shape (B, C, H, W)
             batch[OBS_IMAGES] = [batch[key] for key in self.config.image_features]
 
         actions = self.model(batch)[0]
@@ -379,14 +414,19 @@ class ACT(nn.Module):
 
         `batch` should have the following structure:
         {
-            [robot_state_feature] (optional): (B, state_dim) batch of robot states.
+            [robot_state_feature] (optional): (B, n_obs_steps, state_dim) batch of robot states.
 
-            [image_features]: (B, n_cameras, C, H, W) batch of images.
+            [image_features]: (B, n_obs_steps, n_cameras, C, H, W) batch of images.
                 AND/OR
-            [env_state_feature]: (B, env_dim) batch of environment states.
+            [env_state_feature]: (B, n_obs_steps, env_dim) batch of environment states.
 
             [action_feature] (optional, only if training with VAE): (B, chunk_size, action dim) batch of actions.
         }
+        
+        Note: When n_obs_steps=1, dimensions collapse to:
+            - robot_state_feature: (B, state_dim)
+            - image_features: (B, n_cameras, C, H, W)
+            - env_state_feature: (B, env_dim)
 
         Returns:
             (B, chunk_size, action_dim) batch of action sequences
@@ -398,7 +438,30 @@ class ACT(nn.Module):
                 "actions must be provided when using the variational objective in training mode."
             )
 
-        batch_size = batch[OBS_IMAGES][0].shape[0] if OBS_IMAGES in batch else batch[OBS_ENV_STATE].shape[0]
+        # Determine batch size and n_obs_steps from the batch
+        if OBS_IMAGES in batch:
+            # Images have shape (B, n_obs_steps, n_cameras, C, H, W) or (B, n_cameras, C, H, W) if n_obs_steps=1
+            if batch[OBS_IMAGES][0].ndim == 5:  # (B, n_obs_steps, n_cameras, C, H, W)
+                batch_size, n_obs_steps = batch[OBS_IMAGES][0].shape[:2]
+            else:  # (B, n_cameras, C, H, W) - backward compatibility for n_obs_steps=1
+                batch_size = batch[OBS_IMAGES][0].shape[0]
+                n_obs_steps = 1
+        elif OBS_ENV_STATE in batch:
+            if batch[OBS_ENV_STATE].ndim == 3:  # (B, n_obs_steps, env_dim)
+                batch_size, n_obs_steps = batch[OBS_ENV_STATE].shape[:2]
+            else:  # (B, env_dim) - backward compatibility for n_obs_steps=1
+                batch_size = batch[OBS_ENV_STATE].shape[0]
+                n_obs_steps = 1
+        else:
+            # Fallback to OBS_STATE if available
+            if OBS_STATE in batch:
+                if batch[OBS_STATE].ndim == 3:  # (B, n_obs_steps, state_dim)
+                    batch_size, n_obs_steps = batch[OBS_STATE].shape[:2]
+                else:  # (B, state_dim)
+                    batch_size = batch[OBS_STATE].shape[0]
+                    n_obs_steps = 1
+            else:
+                raise ValueError("batch must contain at least one of: OBS_IMAGES, OBS_ENV_STATE, or OBS_STATE")
 
         # Prepare the latent for input to the transformer encoder.
         if self.config.use_vae and ACTION in batch and self.training:
@@ -407,7 +470,12 @@ class ACT(nn.Module):
                 self.vae_encoder_cls_embed.weight, "1 d -> b 1 d", b=batch_size
             )  # (B, 1, D)
             if self.config.robot_state_feature:
-                robot_state_embed = self.vae_encoder_robot_state_input_proj(batch[OBS_STATE])
+                # Handle both temporal and non-temporal robot states
+                robot_state = batch[OBS_STATE]
+                if robot_state.ndim == 3:  # (B, n_obs_steps, state_dim)
+                    # Use the most recent observation (last timestep)
+                    robot_state = robot_state[:, -1]  # (B, state_dim)
+                robot_state_embed = self.vae_encoder_robot_state_input_proj(robot_state)
                 robot_state_embed = robot_state_embed.unsqueeze(1)  # (B, 1, D)
             action_embed = self.vae_encoder_action_input_proj(batch[ACTION])  # (B, S, D)
 
@@ -424,10 +492,12 @@ class ACT(nn.Module):
             # Prepare key padding mask for the transformer encoder. We have 1 or 2 extra tokens at the start of the
             # sequence depending whether we use the input states or not (cls and robot state)
             # False means not a padding token.
+            # Get device from available tensors
+            device = robot_state_embed.device if self.config.robot_state_feature else cls_embed.device
             cls_joint_is_pad = torch.full(
                 (batch_size, 2 if self.config.robot_state_feature else 1),
                 False,
-                device=batch[OBS_STATE].device,
+                device=device,
             )
             key_padding_mask = torch.cat(
                 [cls_joint_is_pad, batch["action_is_pad"]], axis=1
@@ -450,37 +520,112 @@ class ACT(nn.Module):
             # When not using the VAE encoder, we set the latent to be all zeros.
             mu = log_sigma_x2 = None
             # TODO(rcadene, alexander-soare): remove call to `.to` to speedup forward ; precompute and use buffer
-            latent_sample = torch.zeros([batch_size, self.config.latent_dim], dtype=torch.float32).to(
-                batch[OBS_STATE].device
-            )
+            # Get device from available tensors
+            if OBS_STATE in batch:
+                device = batch[OBS_STATE].device
+            elif OBS_IMAGES in batch:
+                device = batch[OBS_IMAGES][0].device
+            elif OBS_ENV_STATE in batch:
+                device = batch[OBS_ENV_STATE].device
+            else:
+                device = torch.device("cpu")
+            latent_sample = torch.zeros([batch_size, self.config.latent_dim], dtype=torch.float32).to(device)
 
         # Prepare transformer encoder inputs.
         encoder_in_tokens = [self.encoder_latent_input_proj(latent_sample)]
-        encoder_in_pos_embed = list(self.encoder_1d_feature_pos_embed.weight.unsqueeze(1))
-        # Robot state token.
+        # Expand 1D positional embeddings to match batch size: (n_1d_tokens, dim_model) -> (n_1d_tokens, B, dim_model)
+        encoder_in_pos_embed = list(self.encoder_1d_feature_pos_embed.weight.unsqueeze(1).expand(-1, batch_size, -1))
+        
+        # Robot state token - handle temporal observations
         if self.config.robot_state_feature:
-            encoder_in_tokens.append(self.encoder_robot_state_input_proj(batch[OBS_STATE]))
-        # Environment state token.
+            robot_state = batch[OBS_STATE]
+            if robot_state.ndim == 3:  # (B, n_obs_steps, state_dim)
+                # Flatten temporal observations: concatenate all timesteps
+                robot_state = einops.rearrange(robot_state, "b t d -> b (t d)")
+            # Project state (potentially concatenated across time) to model dimension
+            # Note: This requires updating the projection layer size if n_obs_steps > 1,
+            # but to keep it simple initially, we'll use only the latest observation
+            if robot_state.shape[-1] != self.config.robot_state_feature.shape[0]:
+                # Temporal concatenation case - use only latest for now
+                robot_state = batch[OBS_STATE]
+                if robot_state.ndim == 3:
+                    robot_state = robot_state[:, -1]  # Use most recent observation
+            encoder_in_tokens.append(self.encoder_robot_state_input_proj(robot_state))
+            
+        # Environment state token - handle temporal observations
         if self.config.env_state_feature:
-            encoder_in_tokens.append(self.encoder_env_state_input_proj(batch[OBS_ENV_STATE]))
+            env_state = batch[OBS_ENV_STATE]
+            if env_state.ndim == 3:  # (B, n_obs_steps, env_dim)
+                # Use only the latest observation (similar to robot state)
+                env_state = env_state[:, -1]
+            encoder_in_tokens.append(self.encoder_env_state_input_proj(env_state))
 
         if self.config.image_features:
             # For a list of images, the H and W may vary but H*W is constant.
             # NOTE: If modifying this section, verify on MPS devices that
             # gradients remain stable (no explosions or NaNs).
-            for img in batch[OBS_IMAGES]:
-                cam_features = self.backbone(img)["feature_map"]
-                cam_pos_embed = self.encoder_cam_feat_pos_embed(cam_features).to(dtype=cam_features.dtype)
-                cam_features = self.encoder_img_feat_input_proj(cam_features)
+            
+            # Handle temporal image observations
+            for cam_idx, img in enumerate(batch[OBS_IMAGES]):
+                if img.ndim == 5:  # (B, n_obs_steps, C, H, W) - temporal observations
+                    # Process each timestep through the backbone and aggregate
+                    # Reshape to (B*n_obs_steps, C, H, W) for batch processing
+                    b, t, c, h, w = img.shape
+                    img_flat = einops.rearrange(img, "b t c h w -> (b t) c h w")
+                    
+                    # Extract features for all timesteps at once
+                    cam_features = self.backbone(img_flat)["feature_map"]
+                    # Project features to model dimension
+                    cam_features = self.encoder_img_feat_input_proj(cam_features)
+                    
+                    # Get spatial dimensions
+                    bt, c_feat, h_feat, w_feat = cam_features.shape
+                    
+                    # For temporal observations, we need to avoid quadratic memory explosion
+                    # Strategy: Pool spatial features first, then create temporal sequence
+                    # This gives us n_obs_steps tokens per camera instead of n_obs_steps*H*W
+                    
+                    # Compute positional embeddings and add to features
+                    cam_pos_embed = self.encoder_cam_feat_pos_embed(cam_features).to(dtype=cam_features.dtype)
+                    cam_pos_embed = cam_pos_embed.expand(bt, -1, -1, -1)  # (1, C, H', W') -> (B*t, C, H', W')
+                    
+                    # Add positional embeddings to features
+                    cam_features_with_pos = cam_features + cam_pos_embed
+                    
+                    # Global average pooling over spatial dimensions: (B*t, C, H, W) -> (B*t, C)
+                    cam_features_pooled = einops.reduce(cam_features_with_pos, "bt c h w -> bt c", "mean")
+                    
+                    # Reshape to separate batch and temporal: (B*t, C) -> (t, B, C)
+                    cam_features_seq = einops.rearrange(cam_features_pooled, "(b t) c -> t b c", b=b, t=t)
+                    
+                    # Note: We don't need separate positional embeddings now since they're baked in
+                    # We extend with the temporal sequence tokens
+                    encoder_in_tokens.extend(list(cam_features_seq))
+                    # Positional embeddings are already added, so we add zero embeddings as placeholders
+                    encoder_in_pos_embed.extend([torch.zeros_like(cam_features_seq[0]) for _ in range(t)])
+                    
+                elif img.ndim == 4:  # (B, C, H, W) - single timestep (backward compatibility)
+                    cam_features = self.backbone(img)["feature_map"]
+                    cam_features = self.encoder_img_feat_input_proj(cam_features)
+                    
+                    # Compute positional embeddings (returns shape (1, C, H', W'))
+                    cam_pos_embed = self.encoder_cam_feat_pos_embed(cam_features).to(dtype=cam_features.dtype)
+                    # Expand positional embeddings to match batch size
+                    b_single = cam_features.shape[0]
+                    cam_pos_embed = cam_pos_embed.expand(b_single, -1, -1, -1)  # (1, C, H', W') -> (B, C, H', W')
 
-                # Rearrange features to (sequence, batch, dim).
-                cam_features = einops.rearrange(cam_features, "b c h w -> (h w) b c")
-                cam_pos_embed = einops.rearrange(cam_pos_embed, "b c h w -> (h w) b c")
-
-                # Extend immediately instead of accumulating and concatenating
-                # Convert to list to extend properly
-                encoder_in_tokens.extend(list(cam_features))
-                encoder_in_pos_embed.extend(list(cam_pos_embed))
+                    # Rearrange features to (sequence, batch, dim).
+                    cam_features = einops.rearrange(cam_features, "b c h w -> (h w) b c")
+                    cam_pos_embed = einops.rearrange(cam_pos_embed, "b c h w -> (h w) b c")
+                    
+                    # Extend immediately instead of accumulating and concatenating
+                    encoder_in_tokens.extend(list(cam_features))
+                    encoder_in_pos_embed.extend(list(cam_pos_embed))
+                else:
+                    raise ValueError(
+                        f"Expected image tensor to have 4 or 5 dimensions, got {img.ndim}. "
+                        f"Shape: {img.shape}"
+                    )
 
         # Stack all tokens along the sequence dimension.
         encoder_in_tokens = torch.stack(encoder_in_tokens, axis=0)
