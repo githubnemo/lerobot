@@ -106,6 +106,11 @@ fi
 # Add batch size suffix
 MODEL_REPO_ID="${MODEL_REPO_ID}_bs${batch_size}"
 
+# Add user provided suffix
+if [ -n "$suffix" ]; then
+  MODEL_REPO_ID="${MODEL_REPO_ID}_${suffix}"
+fi
+
 echo "================================"
 echo "MODEL_REPO_ID: $MODEL_REPO_ID"
 echo "Create this repo on HuggingFace before training:"
