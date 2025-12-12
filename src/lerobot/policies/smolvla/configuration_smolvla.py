@@ -147,8 +147,10 @@ class SmolVLAConfig(PreTrainedConfig):
         )
 
     @property
-    def observation_delta_indices(self) -> list:
-        return [0]
+    def observation_delta_indices(self) -> list | None:
+        if self.n_obs_steps == 1:
+            return None
+        return list(range(1 - self.n_obs_steps, 1))
 
     @property
     def action_delta_indices(self) -> list:

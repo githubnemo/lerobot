@@ -250,6 +250,10 @@ class SmolVLAPolicy(PreTrainedPolicy):
         self._queues = {
             ACTION: deque(maxlen=self.config.n_action_steps),
         }
+        if self.config.n_obs_steps > 1:
+            for key in self.config.input_features:
+                if key.startswith("observation."):
+                    self._queues[key] = deque(maxlen=self.config.n_obs_steps)
 
     def init_rtc_processor(self):
         """Initialize RTC processor if RTC is enabled in config."""
@@ -270,17 +274,25 @@ class SmolVLAPolicy(PreTrainedPolicy):
     def get_optim_params(self) -> dict:
         return self.parameters()
 
+    def _has_temporal_dim(self, batch: dict[str, Tensor]) -> bool:
+        if self.config.n_obs_steps <= 1:
+            return False
+        for key in batch:
+            if key in self.config.input_features:
+                val = batch[key]
+                # Image (5D) or State (3D) and temporal dim matches n_obs_steps
+                if (val.ndim == 5 or val.ndim == 3) and val.shape[1] == self.config.n_obs_steps:
+                    return True
+        return False
+
     def _get_action_chunk(
         self, batch: dict[str, Tensor], noise: Tensor | None = None, **kwargs: Unpack[ActionSelectKwargs]
     ) -> Tensor:
-        # TODO: Check if this for loop is needed.
-        # Context: In fact, self.queues contains only ACTION field, and in inference, we don't have action in the batch
-        # In the case of offline inference, we have the action in the batch
-        # that why without the k != ACTION check, it will raise an error because we are trying to stack
-        # on an empty container.
-        for k in batch:
-            if k in self._queues and k != ACTION:
-                batch[k] = torch.stack(list(self._queues[k]), dim=1)
+        # Only stack from queues if we need to (batch doesn't have history)
+        if not self._has_temporal_dim(batch):
+            for k in batch:
+                if k in self._queues and k != ACTION:
+                    batch[k] = torch.stack(list(self._queues[k]), dim=1)
 
         images, img_masks = self.prepare_images(batch)
         state = self.prepare_state(batch)
@@ -313,7 +325,8 @@ class SmolVLAPolicy(PreTrainedPolicy):
         self.eval()
 
         batch = self._prepare_batch(batch)
-        self._queues = populate_queues(self._queues, batch, exclude_keys=[ACTION])
+        if not self._has_temporal_dim(batch):
+            self._queues = populate_queues(self._queues, batch, exclude_keys=[ACTION])
 
         actions = self._get_action_chunk(batch, noise, **kwargs)
         return actions
@@ -335,7 +348,8 @@ class SmolVLAPolicy(PreTrainedPolicy):
 
         self.eval()
         batch = self._prepare_batch(batch)
-        self._queues = populate_queues(self._queues, batch, exclude_keys=[ACTION])
+        if not self._has_temporal_dim(batch):
+            self._queues = populate_queues(self._queues, batch, exclude_keys=[ACTION])
 
         if self._check_get_actions_condition():
             actions = self._get_action_chunk(batch, noise)
@@ -396,65 +410,91 @@ class SmolVLAPolicy(PreTrainedPolicy):
             raise ValueError(
                 f"All image features are missing from the batch. At least one expected. (batch: {batch.keys()}) (image_features:{self.config.image_features})"
             )
+
         # Preprocess image features present in the batch
-        for key in present_img_keys:
-            img = batch[key][:, -1, :, :, :] if batch[key].ndim == 5 else batch[key]
-            if self.config.resize_imgs_with_padding is not None:
-                img = resize_with_pad(img, *self.config.resize_imgs_with_padding, pad_value=0)
+        # We loop over time steps if n_obs_steps > 1
+        n_obs_steps = self.config.n_obs_steps
+        has_temporal = False
+        # Check if first image has temporal dimension (B, T, C, H, W)
+        if present_img_keys and batch[present_img_keys[0]].ndim == 5:
+            has_temporal = True
 
-            # Normalize from range [0,1] to [-1,1] as expacted by siglip
-            img = img * 2.0 - 1.0
+        time_indices = range(n_obs_steps) if has_temporal and n_obs_steps > 1 else [None]
 
-            bsize = img.shape[0]
-            device = img.device
-            if f"{key}_padding_mask" in batch:
-                mask = batch[f"{key}_padding_mask"].bool()
-            else:
-                mask = torch.ones(bsize, dtype=torch.bool, device=device)
-            images.append(img)
-            img_masks.append(mask)
+        for t in time_indices:
+            for key in present_img_keys:
+                if t is not None:
+                    img = batch[key][:, t]
+                else:
+                    img = batch[key][:, -1] if batch[key].ndim == 5 else batch[key]
+
+                if self.config.resize_imgs_with_padding is not None:
+                    img = resize_with_pad(img, *self.config.resize_imgs_with_padding, pad_value=0)
+
+                # Normalize from range [0,1] to [-1,1] as expacted by siglip
+                img = img * 2.0 - 1.0
+
+                bsize = img.shape[0]
+                device = img.device
+                if f"{key}_padding_mask" in batch:
+                    mask = batch[f"{key}_padding_mask"].bool()
+                    if t is not None and mask.ndim == 2: # (B, T) padding mask?
+                         # Usually padding mask is per image. If (B, T), select t
+                         mask = mask[:, t]
+                else:
+                    mask = torch.ones(bsize, dtype=torch.bool, device=device)
+                images.append(img)
+                img_masks.append(mask)
 
         # Create image features not present in the batch
         # as fully 0 padded images.
-        for num_empty_cameras in range(len(missing_img_keys)):
-            if num_empty_cameras >= self.config.empty_cameras:
-                break
-            img = torch.ones_like(img) * -1
-            mask = torch.zeros_like(mask)
-            images.append(img)
-            img_masks.append(mask)
+        # We repeat this for each timestep if needed to match the sequence length
+        num_timesteps = len(time_indices)
+        for _ in range(num_timesteps):
+            for num_empty_cameras in range(len(missing_img_keys)):
+                if num_empty_cameras >= self.config.empty_cameras:
+                    break
+                # Use last processed img shape as reference
+                img = torch.ones_like(images[0]) * -1
+                mask = torch.zeros_like(img_masks[0])
+                images.append(img)
+                img_masks.append(mask)
         return images, img_masks
 
     def _pi_aloha_decode_state(self, state):
         # Flip the joints.
         for motor_idx in [1, 2, 8, 9]:
-            state[:, motor_idx] *= -1
+            state[..., motor_idx] *= -1
         # Reverse the gripper transformation that is being applied by the Aloha runtime.
         for motor_idx in [6, 13]:
-            state[:, motor_idx] = aloha_gripper_to_angular(state[:, motor_idx])
+            state[..., motor_idx] = aloha_gripper_to_angular(state[..., motor_idx])
         return state
 
     def _pi_aloha_encode_actions(self, actions):
         # Flip the joints.
         for motor_idx in [1, 2, 8, 9]:
-            actions[:, :, motor_idx] *= -1
+            actions[..., motor_idx] *= -1
         # Reverse the gripper transformation that is being applied by the Aloha runtime.
         for motor_idx in [6, 13]:
-            actions[:, :, motor_idx] = aloha_gripper_from_angular(actions[:, :, motor_idx])
+            actions[..., motor_idx] = aloha_gripper_from_angular(actions[..., motor_idx])
         return actions
 
     def _pi_aloha_encode_actions_inv(self, actions):
         # Flip the joints again.
         for motor_idx in [1, 2, 8, 9]:
-            actions[:, :, motor_idx] *= -1
+            actions[..., motor_idx] *= -1
         # Reverse the gripper transformation that is being applied by the Aloha runtime.
         for motor_idx in [6, 13]:
-            actions[:, :, motor_idx] = aloha_gripper_from_angular_inv(actions[:, :, motor_idx])
+            actions[..., motor_idx] = aloha_gripper_from_angular_inv(actions[..., motor_idx])
         return actions
 
     def prepare_state(self, batch):
         """Pad state"""
-        state = batch[OBS_STATE][:, -1, :] if batch[OBS_STATE].ndim > 2 else batch[OBS_STATE]
+        if self.config.n_obs_steps > 1 and batch[OBS_STATE].ndim == 3:
+             state = batch[OBS_STATE]
+        else:
+             state = batch[OBS_STATE][:, -1, :] if batch[OBS_STATE].ndim > 2 else batch[OBS_STATE]
+        
         state = pad_vector(state, self.config.max_state_dim)
         return state
 
