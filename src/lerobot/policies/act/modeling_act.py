@@ -90,6 +90,16 @@ class ACTPolicy(PreTrainedPolicy):
 
     def reset(self):
         """This should be called whenever the environment is reset."""
+        self._queues = {}
+        if self.config.n_obs_steps > 1:
+            if self.config.image_features:
+                for name in self.config.image_features:
+                    self._queues[name] = deque(maxlen=self.config.n_obs_steps)
+            if self.config.env_state_feature:
+                self._queues[OBS_ENV_STATE] = deque(maxlen=self.config.n_obs_steps)
+            if self.config.robot_state_feature:
+                self._queues[OBS_STATE] = deque(maxlen=self.config.n_obs_steps)
+
         if self.config.temporal_ensemble_coeff is not None:
             self.temporal_ensembler.reset()
         else:
@@ -104,6 +114,49 @@ class ACTPolicy(PreTrainedPolicy):
         queue is empty.
         """
         self.eval()  # keeping the policy in eval mode as it could be set to train mode while queue is consumed
+
+        if self.config.n_obs_steps > 1:
+            # Check if input already has temporal dimension (Batch, Time, ...)
+            # e.g. during validation with LeRobotDataset
+            has_temporal_dim = False
+            # We check one feature to determine if we are in batch mode
+            # Ideally we'd check all, but assuming consistency
+            check_keys = []
+            if self.config.robot_state_feature:
+                check_keys.append(OBS_STATE)
+            if self.config.image_features:
+                check_keys.extend(self.config.image_features)
+
+            for key in check_keys:
+                if key in batch:
+                    val = batch[key]
+                    # State: (B, T, D) -> ndim=3
+                    # Image: (B, T, C, H, W) -> ndim=5
+                    if (val.ndim == 3 or val.ndim == 5) and val.shape[1] == self.config.n_obs_steps:
+                        has_temporal_dim = True
+                    break
+
+            if not has_temporal_dim:
+                for key in self._queues:
+                    if key in batch:
+                        # Note: we only add the first element of the batch to the queue.
+                        # This is because the queue is used to cache observations for a single environment.
+                        # We assume that the batch size is 1 when using `select_action`.
+                        self._queues[key].append(batch[key][0])
+
+                # If the queue is not full, fill it with the current observation.
+                # This happens when the environment is reset.
+                for key in self._queues:
+                    while len(self._queues[key]) < self.config.n_obs_steps:
+                        self._queues[key].appendleft(batch[key][0])
+
+                # Helper to stack the queues into a single tensor.
+                # We stack along the 0-th dimension, which creates a tensor of shape (n_obs_steps, ...).
+                # Then we unsqueeze to add the batch dimension.
+                batch = {
+                    k: torch.stack(list(self._queues[k]), dim=0).unsqueeze(0) if k in self._queues else batch[k]
+                    for k in batch
+                }
 
         if self.config.temporal_ensemble_coeff is not None:
             actions = self.predict_action_chunk(batch)
@@ -330,6 +383,10 @@ class ACT(nn.Module):
             # Note: The forward method of this returns a dict: {"feature_map": output}.
             self.backbone = IntermediateLayerGetter(backbone_model, return_layers={"layer4": "feature_map"})
 
+        # Learnable temporal positional embedding for n_obs_steps > 1
+        if self.config.n_obs_steps > 1:
+            self.temporal_pos_embed = nn.Embedding(self.config.n_obs_steps, config.dim_model)
+
         # Transformer (acts as VAE decoder when training with the variational objective).
         self.encoder = ACTEncoder(config)
         self.decoder = ACTDecoder(config)
@@ -407,7 +464,12 @@ class ACT(nn.Module):
                 self.vae_encoder_cls_embed.weight, "1 d -> b 1 d", b=batch_size
             )  # (B, 1, D)
             if self.config.robot_state_feature:
-                robot_state_embed = self.vae_encoder_robot_state_input_proj(batch[OBS_STATE])
+                # Use current state for VAE conditioning
+                current_state = batch[OBS_STATE]
+                if current_state.ndim == 3:  # (B, T, D)
+                    current_state = current_state[:, -1]
+
+                robot_state_embed = self.vae_encoder_robot_state_input_proj(current_state)
                 robot_state_embed = robot_state_embed.unsqueeze(1)  # (B, 1, D)
             action_embed = self.vae_encoder_action_input_proj(batch[ACTION])  # (B, S, D)
 
@@ -456,35 +518,88 @@ class ACT(nn.Module):
 
         # Prepare transformer encoder inputs.
         encoder_in_tokens = [self.encoder_latent_input_proj(latent_sample)]
-        encoder_in_pos_embed = list(self.encoder_1d_feature_pos_embed.weight.unsqueeze(1))
-        # Robot state token.
+        # Get latent positional embedding (index 0) and repeat for batch
+        # self.encoder_1d_feature_pos_embed.weight[0] is (dim)
+        # unsqueeze(0) -> (1, dim). repeat -> (B, dim)
+        latent_pos_embed = self.encoder_1d_feature_pos_embed.weight[0].unsqueeze(0).repeat(batch_size, 1)
+        encoder_in_pos_embed = [latent_pos_embed]
+
+        # Determine input shapes and normalize to (B, T, ...)
+        robot_state = None
         if self.config.robot_state_feature:
-            encoder_in_tokens.append(self.encoder_robot_state_input_proj(batch[OBS_STATE]))
-        # Environment state token.
+            robot_state = batch[OBS_STATE]
+            if self.config.n_obs_steps == 1 and robot_state.ndim == 2:
+                robot_state = robot_state.unsqueeze(1)
+
+        env_state = None
         if self.config.env_state_feature:
-            encoder_in_tokens.append(self.encoder_env_state_input_proj(batch[OBS_ENV_STATE]))
+            env_state = batch[OBS_ENV_STATE]
+            if self.config.n_obs_steps == 1 and env_state.ndim == 2:
+                env_state = env_state.unsqueeze(1)
 
+        images = []
         if self.config.image_features:
-            # For a list of images, the H and W may vary but H*W is constant.
-            # NOTE: If modifying this section, verify on MPS devices that
-            # gradients remain stable (no explosions or NaNs).
             for img in batch[OBS_IMAGES]:
-                cam_features = self.backbone(img)["feature_map"]
-                cam_pos_embed = self.encoder_cam_feat_pos_embed(cam_features).to(dtype=cam_features.dtype)
-                cam_features = self.encoder_img_feat_input_proj(cam_features)
+                if self.config.n_obs_steps == 1 and img.ndim == 4:
+                    images.append(img.unsqueeze(1))
+                else:
+                    images.append(img)
 
-                # Rearrange features to (sequence, batch, dim).
-                cam_features = einops.rearrange(cam_features, "b c h w -> (h w) b c")
-                cam_pos_embed = einops.rearrange(cam_pos_embed, "b c h w -> (h w) b c")
+        # Loop over observation steps
+        for step_index in range(self.config.n_obs_steps):
+            step_tokens = []
+            step_pos_embeds = []
 
-                # Extend immediately instead of accumulating and concatenating
-                # Convert to list to extend properly
-                encoder_in_tokens.extend(list(cam_features))
-                encoder_in_pos_embed.extend(list(cam_pos_embed))
+            # Robot state token.
+            if robot_state is not None:
+                step_tokens.append(self.encoder_robot_state_input_proj(robot_state[:, step_index]))
+                # Pos embed index 1 is for robot state
+                pos_embed = self.encoder_1d_feature_pos_embed.weight[1].unsqueeze(0).repeat(batch_size, 1)
+                step_pos_embeds.append(pos_embed)
+
+            # Environment state token.
+            if env_state is not None:
+                step_tokens.append(self.encoder_env_state_input_proj(env_state[:, step_index]))
+                # Pos embed index 2 (or 1 if no robot state) is for env state
+                idx = 2 if self.config.robot_state_feature else 1
+                pos_embed = self.encoder_1d_feature_pos_embed.weight[idx].unsqueeze(0).repeat(batch_size, 1)
+                step_pos_embeds.append(pos_embed)
+
+            # Image tokens
+            if self.config.image_features:
+                for img in images:
+                    # Select time step: (B, C, H, W)
+                    img_step = img[:, step_index]
+                    cam_features = self.backbone(img_step)["feature_map"]
+                    cam_pos_embed = self.encoder_cam_feat_pos_embed(cam_features).to(dtype=cam_features.dtype)
+                    # cam_pos_embed is (1, C, H, W). Expand to batch size
+                    cam_pos_embed = cam_pos_embed.repeat(batch_size, 1, 1, 1)
+                    cam_features = self.encoder_img_feat_input_proj(cam_features)
+
+                    # Rearrange features to (sequence, batch, dim).
+                    cam_features = einops.rearrange(cam_features, "b c h w -> (h w) b c")
+                    cam_pos_embed = einops.rearrange(cam_pos_embed, "b c h w -> (h w) b c")
+
+                    # Convert to list of (B, dim) tensors
+                    # einops rearrange with "b c" at end means (seq, batch, dim)
+                    # So we need to unbind dim 0
+                    step_tokens.extend(list(torch.unbind(cam_features, dim=0)))
+                    step_pos_embeds.extend(list(torch.unbind(cam_pos_embed, dim=0)))
+
+            # Add temporal positional embedding if using multiple steps
+            if self.config.n_obs_steps > 1:
+                # (1, dim)
+                temporal_embed = self.temporal_pos_embed.weight[step_index].unsqueeze(0)
+                # Add to tokens
+                step_tokens = [t + temporal_embed for t in step_tokens]
+
+            encoder_in_tokens.extend(step_tokens)
+            encoder_in_pos_embed.extend(step_pos_embeds)
 
         # Stack all tokens along the sequence dimension.
-        encoder_in_tokens = torch.stack(encoder_in_tokens, axis=0)
-        encoder_in_pos_embed = torch.stack(encoder_in_pos_embed, axis=0)
+        # Elements are (B, dim)
+        encoder_in_tokens = torch.stack(encoder_in_tokens, axis=0) # (S, B, dim)
+        encoder_in_pos_embed = torch.stack(encoder_in_pos_embed, axis=0) # (S, B, dim)
 
         # Forward pass through the transformer modules.
         encoder_out = self.encoder(encoder_in_tokens, pos_embed=encoder_in_pos_embed)
