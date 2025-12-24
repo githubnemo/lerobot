@@ -606,8 +606,8 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
                     postprocessor=postprocessor,
                 )
                 update_last_checkpoint(checkpoint_dir)
-                if wandb_logger:
-                    wandb_logger.log_policy(checkpoint_dir)
+                #if wandb_logger:
+                #    wandb_logger.log_policy(checkpoint_dir)
 
             accelerator.wait_for_everyone()
 
