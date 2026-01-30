@@ -495,6 +495,60 @@ class InterventionActionProcessorStep(ProcessorStep):
 
 
 @dataclass
+@ProcessorStepRegistry.register("human_reward_processor")
+class HumanRewardProcessorStep(ProcessorStep):
+    """
+    Adds reward when human presses number keys (0-9) for graded feedback.
+
+    This enables RLHF-style training where the human provides reward signals
+    during policy execution. Unlike SUCCESS which terminates the episode,
+    this provides immediate reward feedback without ending the episode.
+
+    Can be used alongside or instead of reward classifier.
+
+    Attributes:
+        cumulative: If True, adds human reward to existing reward. If False, replaces it.
+    """
+
+    cumulative: bool = True
+
+    def __call__(self, transition: EnvTransition) -> EnvTransition:
+        """
+        Processes the transition, adding human reward if present.
+
+        Args:
+            transition: The incoming environment transition.
+
+        Returns:
+            The modified transition with updated reward if human provided feedback.
+        """
+        new_transition = transition.copy()
+        info = new_transition.get(TransitionKey.INFO, {})
+
+        human_reward = info.get(TeleopEvents.HUMAN_REWARD, None)
+
+        if human_reward is not None:
+            current_reward = new_transition.get(TransitionKey.REWARD, 0.0)
+            if self.cumulative:
+                new_transition[TransitionKey.REWARD] = current_reward + human_reward
+            else:
+                new_transition[TransitionKey.REWARD] = human_reward
+
+        return new_transition
+
+    def get_config(self) -> dict[str, Any]:
+        """Returns the configuration of the step for serialization."""
+        return {
+            "cumulative": self.cumulative,
+        }
+
+    def transform_features(
+        self, features: dict[PipelineFeatureType, dict[str, PolicyFeature]]
+    ) -> dict[PipelineFeatureType, dict[str, PolicyFeature]]:
+        return features
+
+
+@dataclass
 @ProcessorStepRegistry.register("reward_classifier_processor")
 class RewardClassifierProcessorStep(ProcessorStep):
     """

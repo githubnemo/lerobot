@@ -220,13 +220,14 @@ class KeyboardEndEffectorTeleop(KeyboardTeleop):
     def get_teleop_events(self) -> dict[str, Any]:
         """
         Get extra control events from the keyboard such as intervention status,
-        episode termination, success indicators, etc.
+        episode termination, success indicators, and human rewards.
 
         Keyboard mappings:
         - Any movement keys pressed = intervention active
         - 's' key = success (terminate episode successfully)
         - 'r' key = rerecord episode (terminate and rerecord)
         - 'q' key = quit episode (terminate without success)
+        - '0'-'9' keys = graded human reward (+0.0 to +0.9)
 
         Returns:
             Dictionary containing:
@@ -234,6 +235,7 @@ class KeyboardEndEffectorTeleop(KeyboardTeleop):
                 - terminate_episode: bool - Whether to terminate the current episode
                 - success: bool - Whether the episode was successful
                 - rerecord_episode: bool - Whether to rerecord the episode
+                - human_reward: float | None - Graded reward if number key pressed, else None
         """
         if not self.is_connected:
             return {
@@ -241,6 +243,7 @@ class KeyboardEndEffectorTeleop(KeyboardTeleop):
                 TeleopEvents.TERMINATE_EPISODE: False,
                 TeleopEvents.SUCCESS: False,
                 TeleopEvents.RERECORD_EPISODE: False,
+                TeleopEvents.HUMAN_REWARD: None,
             }
 
         # Check if any movement keys are currently pressed (indicates intervention)
@@ -260,6 +263,7 @@ class KeyboardEndEffectorTeleop(KeyboardTeleop):
         terminate_episode = False
         success = False
         rerecord_episode = False
+        human_reward = None
 
         # Process any pending misc keys
         while not self.misc_keys_queue.empty():
@@ -272,12 +276,17 @@ class KeyboardEndEffectorTeleop(KeyboardTeleop):
             elif key == "q":
                 terminate_episode = True
                 success = False
+            # Handle number keys 0-9 for graded rewards
+            elif key in "0123456789":
+                human_reward = int(key) / 10.0  # '0'->0.0, '1'->0.1, ..., '9'->0.9
+                logging.info(f"[HUMAN REWARD] +{human_reward:.1f} from key '{key}'")
 
         return {
             TeleopEvents.IS_INTERVENTION: is_intervention,
             TeleopEvents.TERMINATE_EPISODE: terminate_episode,
             TeleopEvents.SUCCESS: success,
             TeleopEvents.RERECORD_EPISODE: rerecord_episode,
+            TeleopEvents.HUMAN_REWARD: human_reward,
         }
 
 

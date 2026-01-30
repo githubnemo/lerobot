@@ -31,6 +31,7 @@ class TeleopEvents(Enum):
     RERECORD_EPISODE = "rerecord_episode"
     IS_INTERVENTION = "is_intervention"
     TERMINATE_EPISODE = "terminate_episode"
+    HUMAN_REWARD = "human_reward"  # float: graded reward from keyboard (0.0-0.9 via keys 0-9)
 
 
 def make_teleoperator_from_config(config: TeleoperatorConfig) -> "Teleoperator":

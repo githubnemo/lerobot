@@ -36,6 +36,7 @@ from lerobot.processor import (
     DeviceProcessorStep,
     EnvTransition,
     GripperPenaltyProcessorStep,
+    HumanRewardProcessorStep,
     ImageCropResizeProcessorStep,
     InterventionActionProcessorStep,
     MapDeltaActionToRobotActionStep,
@@ -463,6 +464,7 @@ def make_processors(
     action_pipeline_steps = [
         AddTeleopActionAsComplimentaryDataStep(teleop_device=teleop_device),
         AddTeleopEventsAsInfoStep(teleop_device=teleop_device),
+        HumanRewardProcessorStep(cumulative=True),  # Add human keyboard rewards (0-9 keys)
         InterventionActionProcessorStep(
             use_gripper=cfg.processor.gripper.use_gripper if cfg.processor.gripper is not None else False,
             terminate_on_success=terminate_on_success,

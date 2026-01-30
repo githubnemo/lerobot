@@ -130,6 +130,7 @@ class GamepadTeleop(Teleoperator):
                 TeleopEvents.TERMINATE_EPISODE: False,
                 TeleopEvents.SUCCESS: False,
                 TeleopEvents.RERECORD_EPISODE: False,
+                TeleopEvents.HUMAN_REWARD: None,
             }
 
         # Update gamepad state to get fresh inputs
@@ -152,6 +153,7 @@ class GamepadTeleop(Teleoperator):
             TeleopEvents.TERMINATE_EPISODE: terminate_episode,
             TeleopEvents.SUCCESS: success,
             TeleopEvents.RERECORD_EPISODE: rerecord_episode,
+            TeleopEvents.HUMAN_REWARD: None,  # Gamepad doesn't support graded rewards yet
         }
 
     def disconnect(self) -> None:
