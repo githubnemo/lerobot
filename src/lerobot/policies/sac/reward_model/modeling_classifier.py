@@ -107,10 +107,31 @@ class Classifier(PreTrainedPolicy):
     def __init__(
         self,
         config: RewardClassifierConfig,
+        dataset_stats: dict | None = None,  # Used for computing class weights
+        **kwargs,  # Accept any other kwargs from make_policy
     ):
         from transformers import AutoModel
 
         super().__init__(config)
+
+        # Compute pos_weight from dataset statistics if available and pos_weight=0 (auto)
+        self._pos_weight = None
+        if hasattr(config, 'pos_weight'):
+            if config.pos_weight > 0:
+                # Fixed weight from config
+                self._pos_weight = config.pos_weight
+            elif config.pos_weight == 0 and dataset_stats is not None:
+                # Auto-compute from dataset stats (reward column)
+                reward_key = "next.reward"
+                if reward_key in dataset_stats and "mean" in dataset_stats[reward_key]:
+                    mean_reward = float(dataset_stats[reward_key]["mean"].item())
+                    if 0 < mean_reward < 1:
+                        # mean_reward ≈ proportion of positive samples
+                        self._pos_weight = (1 - mean_reward) / mean_reward
+                        logging.info(
+                            f"Auto-computed pos_weight={self._pos_weight:.1f} from dataset "
+                            f"(positive rate: {mean_reward:.3f})"
+                        )
         self.config = config
 
         # Set up encoder
@@ -221,6 +242,10 @@ class Classifier(PreTrainedPolicy):
 
     def predict(self, xs: list) -> ClassifierOutput:
         """Forward pass of the classifier for inference."""
+        # Move inputs to the same device as the model
+        device = next(self.parameters()).device
+        xs = [x.to(device) for x in xs]
+        
         encoder_outputs = torch.hstack(
             [self._get_encoder_output(x, img_key) for x, img_key in zip(xs, self.image_keys, strict=True)]
         )
@@ -244,8 +269,13 @@ class Classifier(PreTrainedPolicy):
 
         # Calculate loss
         if self.config.num_classes == 2:
-            # Binary classification
-            loss = nn.functional.binary_cross_entropy_with_logits(outputs.logits, labels)
+            # Binary classification with optional class weighting for imbalanced data
+            pos_weight = None
+            if self._pos_weight is not None:
+                pos_weight = torch.tensor([self._pos_weight], device=outputs.logits.device)
+            loss = nn.functional.binary_cross_entropy_with_logits(
+                outputs.logits, labels, pos_weight=pos_weight
+            )
             predictions = (torch.sigmoid(outputs.logits) > 0.5).float()
         else:
             # Multi-class classification
@@ -268,11 +298,7 @@ class Classifier(PreTrainedPolicy):
 
     def predict_reward(self, batch, threshold=0.5):
         """Eval method. Returns predicted reward with the decision threshold as argument."""
-        # Check for both OBS_IMAGE and OBS_IMAGES prefixes
-        batch = self.normalize_inputs(batch)
-        batch = self.normalize_targets(batch)
-
-        # Extract images from batch dict
+        # Extract images from batch dict (no normalization needed - predict() handles it)
         images = [batch[key] for key in self.config.input_features if key.startswith(OBS_IMAGE)]
 
         if self.config.num_classes == 2:

@@ -40,6 +40,10 @@ class RewardClassifierConfig(PreTrainedConfig):
     learning_rate: float = 1e-4
     weight_decay: float = 0.01
     grad_clip_norm: float = 1.0
+    # Class weight for positive class in binary classification.
+    # Set to ratio of negative/positive samples (e.g., 30.0) to handle class imbalance.
+    # Set to 0.0 or null for auto-computation from batch, or 1.0 for no weighting.
+    pos_weight: float = 0.0
     normalization_mapping: dict[str, NormalizationMode] = field(
         default_factory=lambda: {
             "VISUAL": NormalizationMode.MEAN_STD,
