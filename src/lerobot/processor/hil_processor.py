@@ -15,6 +15,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import logging
 import math
 import time
 from dataclasses import dataclass
@@ -460,7 +461,9 @@ class InterventionActionProcessorStep(ProcessorStep):
         new_transition[TransitionKey.DONE] = bool(terminate_episode) or (
             self.terminate_on_success and success
         )
-        new_transition[TransitionKey.REWARD] = float(success)
+        # Add success reward to existing reward (don't overwrite human reward!)
+        current_reward = new_transition.get(TransitionKey.REWARD, 0.0)
+        new_transition[TransitionKey.REWARD] = current_reward + float(success)
 
         # Update info with intervention metadata
         info = new_transition.get(TransitionKey.INFO, {})
@@ -530,9 +533,11 @@ class HumanRewardProcessorStep(ProcessorStep):
         if human_reward is not None:
             current_reward = new_transition.get(TransitionKey.REWARD, 0.0)
             if self.cumulative:
-                new_transition[TransitionKey.REWARD] = current_reward + human_reward
+                new_reward = current_reward + human_reward
             else:
-                new_transition[TransitionKey.REWARD] = human_reward
+                new_reward = human_reward
+            new_transition[TransitionKey.REWARD] = new_reward
+            logging.info(f"[HumanRewardProcessor] Applied reward: {human_reward} -> total: {new_reward}")
 
         return new_transition
 
@@ -625,9 +630,10 @@ class RewardClassifierProcessorStep(ProcessorStep):
         new_transition[TransitionKey.REWARD] = reward
         new_transition[TransitionKey.DONE] = terminated
 
-        # Update info with classifier frequency
+        # Update info with classifier frequency and prediction
         info = new_transition.get(TransitionKey.INFO, {})
         info["reward_classifier_frequency"] = classifier_frequency
+        info["reward_classifier_prediction"] = float(success)
         new_transition[TransitionKey.INFO] = info
 
         return new_transition
