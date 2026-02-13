@@ -625,6 +625,42 @@ def add_actor_information_and_train(
                 training_infos["offline_replay_buffer_size"] = len(offline_replay_buffer)
             training_infos["Optimization step"] = optimization_step
 
+            # Expert action evaluation: compare policy actions to offline expert data
+            if offline_replay_buffer is not None and len(offline_replay_buffer) > 0:
+                try:
+                    with torch.no_grad():
+                        # Sample a batch of expert transitions
+                        expert_batch = offline_replay_buffer.sample(min(batch_size, len(offline_replay_buffer)))
+                        expert_obs = expert_batch["state"]
+                        expert_actions = expert_batch[ACTION].to(device)
+
+                        # Get observation features (cached encoder for frozen vision encoders)
+                        expert_obs_features, _ = get_observation_features(
+                            policy=policy, observations=expert_obs, next_observations=expert_obs
+                        )
+
+                        # Switch to eval mode (required for BatchNorm with variable batch sizes)
+                        was_training = policy.training
+                        policy.eval()
+
+                        # Forward actor to get predicted actions and means
+                        _, _, expert_means = policy.actor(expert_obs, expert_obs_features)
+
+                        # MSE between policy mean and expert actions
+                        expert_mse = torch.nn.functional.mse_loss(expert_means, expert_actions).item()
+                        training_infos["expert_action_mse"] = expert_mse
+
+                        # Cosine similarity (average over batch)
+                        cos_sim = torch.nn.functional.cosine_similarity(
+                            expert_means, expert_actions, dim=-1
+                        ).mean().item()
+                        training_infos["expert_action_cosine_sim"] = cos_sim
+
+                        if was_training:
+                            policy.train()
+                except Exception as e:
+                    logging.debug(f"[LEARNER] Expert eval failed: {e}")
+
             # Log losses to console for easy monitoring
             loss_str = f"[LEARNER] Step {optimization_step}: "
             loss_str += f"critic={training_infos.get('loss_critic', 0):.4f}, "
@@ -632,6 +668,9 @@ def add_actor_information_and_train(
             loss_str += f"temp={training_infos.get('loss_temperature', 0):.4f}, "
             loss_str += f"α={training_infos.get('temperature', 0):.4f}, "
             loss_str += f"buffer={training_infos.get('replay_buffer_size', 0)}"
+            if "expert_action_mse" in training_infos:
+                loss_str += f", expert_mse={training_infos['expert_action_mse']:.4f}"
+                loss_str += f", expert_cos={training_infos['expert_action_cosine_sim']:.4f}"
             logging.info(loss_str)
 
             # Log to rerun for visualization
@@ -647,6 +686,9 @@ def add_actor_information_and_train(
                     rr.log("learner/critic_grad_norm", rr.Scalars(training_infos["critic_grad_norm"]))
                 if "actor_grad_norm" in training_infos:
                     rr.log("learner/actor_grad_norm", rr.Scalars(training_infos["actor_grad_norm"]))
+                if "expert_action_mse" in training_infos:
+                    rr.log("learner/expert_action_mse", rr.Scalars(training_infos["expert_action_mse"]))
+                    rr.log("learner/expert_action_cosine_sim", rr.Scalars(training_infos["expert_action_cosine_sim"]))
             except Exception:
                 pass  # Don't crash if rerun fails
 
