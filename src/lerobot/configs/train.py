@@ -126,7 +126,7 @@ class TrainPipelineConfig(HubMixin):
             train_dir = f"{now:%Y-%m-%d}/{now:%H-%M-%S}_{self.job_name}"
             self.output_dir = Path("outputs/train") / train_dir
 
-        if isinstance(self.dataset.repo_id, list):
+        if self.dataset is not None and isinstance(self.dataset.repo_id, list):
             raise NotImplementedError("LeRobotMultiDataset is not currently implemented.")
 
         if not self.use_policy_training_preset and (self.optimizer is None or self.scheduler is None):
@@ -141,6 +141,8 @@ class TrainPipelineConfig(HubMixin):
             )
 
         if self.use_rabc and not self.rabc_progress_path:
+            if self.dataset is None:
+                raise ValueError("RA-BC requires a dataset. Please specify dataset.repo_id.")
             # Auto-detect from dataset path
             repo_id = self.dataset.repo_id
             if self.dataset.root:

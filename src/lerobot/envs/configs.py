@@ -185,6 +185,7 @@ class RewardClassifierConfig:
     """Configuration for reward classification."""
 
     pretrained_path: str | None = None
+    device: str = "cpu"
     success_threshold: float = 0.5
     success_reward: float = 1.0
 

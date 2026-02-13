@@ -224,6 +224,8 @@ def make_transform_from_config(cfg: ImageTransformConfig):
         return SharpnessJitter(**cfg.kwargs)
     elif cfg.type == "RandomAffine":
         return v2.RandomAffine(**cfg.kwargs)
+    elif cfg.type == "Resize":
+        return v2.Resize(**cfg.kwargs)
     else:
         raise ValueError(f"Transform '{cfg.type}' is not valid.")
 
