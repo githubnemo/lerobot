@@ -304,6 +304,9 @@ def add_actor_information_and_train(
     saving_checkpoint = cfg.save_checkpoint
     online_steps = cfg.policy.online_steps
     async_prefetch = cfg.policy.async_prefetch
+    # CER (Combined Experience Replay) config
+    use_cer = cfg.policy.use_cer
+    cer_num_recent = cfg.policy.cer_num_recent if use_cer else 0
 
     # Initialize logging for multiprocessing
     if not use_threads(cfg):
@@ -359,6 +362,9 @@ def add_actor_information_and_train(
     # Initialize iterators
     online_iterator = None
     offline_iterator = None
+    
+    # Training stats for CER (to send to actor)
+    latest_training_stats = None
 
     # NOTE: THIS IS THE MAIN LOOP OF THE LEARNER
     while True:
@@ -400,8 +406,11 @@ def add_actor_information_and_train(
 
         if online_iterator is None:
             online_iterator = replay_buffer.get_iterator(
-                batch_size=batch_size, async_prefetch=async_prefetch, queue_size=2
+                batch_size=batch_size, async_prefetch=async_prefetch, queue_size=2,
+                num_recent=cer_num_recent  # CER: always include most recent samples
             )
+            if use_cer:
+                logging.info(f"[LEARNER] CER enabled: always including {cer_num_recent} most recent samples in each batch")
 
         if offline_replay_buffer is not None and offline_iterator is None:
             offline_iterator = offline_replay_buffer.get_iterator(
@@ -453,6 +462,8 @@ def add_actor_information_and_train(
                 parameters=policy.critic_ensemble.parameters(), max_norm=clip_grad_norm_value
             )
             optimizers["critic"].step()
+            if hasattr(policy, "on_optimizer_step"):
+                policy.on_optimizer_step("critic")
 
             # Discrete critic optimization (if available)
             if policy.config.num_discrete_actions is not None:
@@ -509,12 +520,37 @@ def add_actor_information_and_train(
             parameters=policy.critic_ensemble.parameters(), max_norm=clip_grad_norm_value
         ).item()
         optimizers["critic"].step()
+        if hasattr(policy, "on_optimizer_step"):
+            policy.on_optimizer_step("critic")
 
         # Initialize training info dictionary
         training_infos = {
             "loss_critic": loss_critic.item(),
             "critic_grad_norm": critic_grad_norm,
         }
+
+        # CER: Compute Q-values for the most recent samples to send back to actor
+        if use_cer and cer_num_recent > 0:
+            with torch.no_grad():
+                # Get Q-values for the first cer_num_recent samples (which are the most recent)
+                recent_obs = {k: v[:cer_num_recent] for k, v in observations.items()}
+                recent_actions = actions[:cer_num_recent]
+                recent_obs_features = observation_features[:cer_num_recent] if observation_features is not None else None
+                
+                # Compute Q-values using critic ensemble
+                q_values = policy.critic_forward(
+                    observations=recent_obs,
+                    actions=recent_actions,
+                    observation_features=recent_obs_features,
+                    use_target=False
+                )
+                # q_values shape: [num_critics, num_recent]
+                recent_q_mean = q_values.mean().item()
+                recent_q_min = q_values.min(dim=0)[0].mean().item()  # Min across critics, mean across samples
+                
+                training_infos["recent_q_mean"] = recent_q_mean
+                training_infos["recent_q_min"] = recent_q_min
+                latest_training_stats = {"q_mean": recent_q_mean, "q_min": recent_q_min, "loss_critic": loss_critic.item()}
 
         # Discrete critic optimization (if available)
         if policy.config.num_discrete_actions is not None:
@@ -543,6 +579,8 @@ def add_actor_information_and_train(
                     parameters=policy.actor.parameters(), max_norm=clip_grad_norm_value
                 ).item()
                 optimizers["actor"].step()
+                if hasattr(policy, "on_optimizer_step"):
+                    policy.on_optimizer_step("actor")
 
                 # Add actor info to training info
                 training_infos["loss_actor"] = loss_actor.item()
@@ -563,9 +601,13 @@ def add_actor_information_and_train(
                 training_infos["temperature_grad_norm"] = temp_grad_norm
                 training_infos["temperature"] = policy.temperature
 
-        # Push policy to actors if needed
+        # Push policy to actors if needed (includes training stats for CER)
         if time.time() - last_time_policy_pushed > policy_parameters_push_frequency:
-            push_actor_policy_to_queue(parameters_queue=parameters_queue, policy=policy)
+            push_actor_policy_to_queue(
+                parameters_queue=parameters_queue, 
+                policy=policy, 
+                training_stats=latest_training_stats
+            )
             last_time_policy_pushed = time.time()
 
         # Update target networks (main and discrete)
@@ -1042,7 +1084,43 @@ def initialize_offline_replay_buffer(
             root=dataset_offline_path,
         )
 
-    logging.info("Convert to a offline replay buffer")
+    # Try loading cached replay buffer for faster startup
+    cache_path = os.path.join(cfg.dataset.root or "", ".replay_buffer_cache.pt") if cfg.dataset.root else None
+    if cache_path and os.path.exists(cache_path):
+        try:
+            cache = torch.load(cache_path, weights_only=False)  # nosec B614
+            expected_frames = len(offline_dataset)
+            if cache.get("num_frames") == expected_frames:
+                logging.info(f"Loading cached replay buffer ({expected_frames} frames)")
+                offline_replay_buffer = ReplayBuffer(
+                    capacity=cache["capacity"],
+                    device=device,
+                    state_keys=list(cfg.policy.input_features.keys()),
+                    storage_device=storage_device,
+                    optimize_memory=True,
+                )
+                # Restore buffer state
+                offline_replay_buffer.states = {k: v.to(storage_device) for k, v in cache["states"].items()}
+                offline_replay_buffer.next_states = {k: v.to(storage_device) for k, v in cache["next_states"].items()}
+                offline_replay_buffer.actions = cache["actions"].to(storage_device)
+                offline_replay_buffer.rewards = cache["rewards"].to(storage_device)
+                offline_replay_buffer.dones = cache["dones"].to(storage_device)
+                offline_replay_buffer.truncateds = cache["truncateds"].to(storage_device)
+                offline_replay_buffer.episode_ends = cache.get("episode_ends", torch.zeros(cache["capacity"], dtype=torch.bool)).to(storage_device)
+                if "complementary_info" in cache and cache["complementary_info"]:
+                    offline_replay_buffer.complementary_info = {k: v.to(storage_device) for k, v in cache["complementary_info"].items()}
+                    offline_replay_buffer.complementary_info_keys = list(cache["complementary_info"].keys())
+                    offline_replay_buffer.has_complementary_info = True
+                offline_replay_buffer.size = cache["size"]
+                offline_replay_buffer.position = cache["position"]
+                offline_replay_buffer.initialized = True
+                offline_replay_buffer.state_keys = list(cfg.policy.input_features.keys())
+                logging.info(f"✓ Loaded cached replay buffer ({offline_replay_buffer.size} transitions)")
+                return offline_replay_buffer
+        except Exception as e:
+            logging.warning(f"Failed to load cache: {e}. Rebuilding...")
+
+    logging.info("Convert to a offline replay buffer (this may take a few minutes...)")
     offline_replay_buffer = ReplayBuffer.from_lerobot_dataset(
         offline_dataset,
         device=device,
@@ -1051,6 +1129,28 @@ def initialize_offline_replay_buffer(
         optimize_memory=True,
         capacity=cfg.policy.offline_buffer_capacity,
     )
+
+    # Save cache for next time
+    if cache_path:
+        try:
+            cache_data = {
+                "num_frames": len(offline_dataset),
+                "capacity": offline_replay_buffer.capacity,
+                "size": offline_replay_buffer.size,
+                "position": offline_replay_buffer.position,
+                "states": {k: v.cpu() for k, v in offline_replay_buffer.states.items()},
+                "next_states": {k: v.cpu() for k, v in offline_replay_buffer.next_states.items()},
+                "actions": offline_replay_buffer.actions.cpu(),
+                "rewards": offline_replay_buffer.rewards.cpu(),
+                "dones": offline_replay_buffer.dones.cpu(),
+                "truncateds": offline_replay_buffer.truncateds.cpu(),
+                "complementary_info": {k: v.cpu() for k, v in offline_replay_buffer.complementary_info.items()} if offline_replay_buffer.has_complementary_info else {},
+            }
+            torch.save(cache_data, cache_path)
+            logging.info(f"✓ Saved replay buffer cache to {cache_path}")
+        except Exception as e:
+            logging.warning(f"Failed to save cache: {e}")
+
     return offline_replay_buffer
 
 
@@ -1134,7 +1234,7 @@ def check_nan_in_transition(
     return nan_detected
 
 
-def push_actor_policy_to_queue(parameters_queue: Queue, policy: nn.Module):
+def push_actor_policy_to_queue(parameters_queue: Queue, policy: nn.Module, training_stats: dict | None = None):
     logging.debug("[LEARNER] Pushing actor policy to the queue")
 
     # Create a dictionary to hold all the state dicts
@@ -1146,6 +1246,11 @@ def push_actor_policy_to_queue(parameters_queue: Queue, policy: nn.Module):
             policy.discrete_critic.state_dict(), device="cpu"
         )
         logging.debug("[LEARNER] Including discrete critic in state dict push")
+
+    # Add training stats (Q-values, losses) for actor rerun logging
+    if training_stats is not None:
+        state_dicts["training_stats"] = training_stats
+        logging.debug(f"[LEARNER] Including training stats: {training_stats}")
 
     state_bytes = state_to_bytes(state_dicts)
     parameters_queue.put(state_bytes)
@@ -1195,10 +1300,11 @@ def process_transitions(
         dataset_repo_id: Repository ID for dataset
         shutdown_event: Event to signal shutdown
     """
+    total_received = 0
     while not transition_queue.empty() and not shutdown_event.is_set():
         transition_list = transition_queue.get()
         transition_list = bytes_to_transitions(buffer=transition_list)
-        logging.info(f"[LEARNER] Received {len(transition_list)} transitions from actor")
+        total_received += len(transition_list)
 
         for transition in transition_list:
             transition = move_transition_to_device(transition=transition, device=device)
@@ -1219,6 +1325,9 @@ def process_transitions(
                 TeleopEvents.IS_INTERVENTION
             ):
                 offline_replay_buffer.add(**transition)
+
+    if total_received > 0:
+        logging.info(f"[LEARNER] Received {total_received} transitions from actor (buffer: {len(replay_buffer)})")
 
 
 def process_interaction_messages(
