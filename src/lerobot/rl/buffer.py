@@ -130,6 +130,11 @@ class ReplayBuffer:
             self.image_augmentation_function = base_function
         self.use_drq = use_drq
 
+        # Complementary info defaults (set properly in _initialize_storage)
+        self.has_complementary_info = False
+        self.complementary_info_keys = []
+        self.complementary_info = {}
+
     def _initialize_storage(
         self,
         state: dict[str, torch.Tensor],
@@ -230,16 +235,45 @@ class ReplayBuffer:
         self.position = (self.position + 1) % self.capacity
         self.size = min(self.size + 1, self.capacity)
 
-    def sample(self, batch_size: int) -> BatchTransition:
-        """Sample a random batch of transitions and collate them into batched tensors."""
+    def sample(self, batch_size: int, num_recent: int = 0) -> BatchTransition:
+        """Sample a random batch of transitions and collate them into batched tensors.
+        
+        Args:
+            batch_size: Total number of samples to return
+            num_recent: Number of most recent samples to always include (CER - Combined Experience Replay).
+                        If > 0, the batch will contain num_recent most recent samples plus 
+                        (batch_size - num_recent) random samples.
+        
+        Returns:
+            BatchTransition: Batched transitions
+        """
         if not self.initialized:
             raise RuntimeError("Cannot sample from an empty buffer. Add transitions first.")
 
         batch_size = min(batch_size, self.size)
         high = max(0, self.size - 1) if self.optimize_memory and self.size < self.capacity else self.size
 
-        # Random indices for sampling - create on the same device as storage
-        idx = torch.randint(low=0, high=high, size=(batch_size,), device=self.storage_device)
+        # CER: Always include most recent samples
+        num_recent = min(num_recent, batch_size, self.size)
+        num_random = batch_size - num_recent
+
+        if num_recent > 0:
+            # Get indices of most recent samples
+            recent_indices = torch.tensor(
+                [(self.position - 1 - i) % self.capacity for i in range(num_recent)],
+                device=self.storage_device,
+                dtype=torch.long
+            )
+            
+            if num_random > 0:
+                # Random indices for the rest of the batch
+                random_idx = torch.randint(low=0, high=high, size=(num_random,), device=self.storage_device)
+                idx = torch.cat([recent_indices, random_idx], dim=0)
+            else:
+                idx = recent_indices
+        else:
+            # Standard random sampling
+            idx = torch.randint(low=0, high=high, size=(batch_size,), device=self.storage_device)
 
         # Identify image keys that need augmentation
         image_keys = [k for k in self.states if k.startswith(OBS_IMAGE)] if self.use_drq else []
@@ -309,6 +343,7 @@ class ReplayBuffer:
         batch_size: int,
         async_prefetch: bool = True,
         queue_size: int = 2,
+        num_recent: int = 0,
     ):
         """
         Creates an infinite iterator that yields batches of transitions.
@@ -318,6 +353,7 @@ class ReplayBuffer:
             batch_size (int): Size of batches to sample
             async_prefetch (bool): Whether to use asynchronous prefetching with threads (default: True)
             queue_size (int): Number of batches to prefetch (default: 2)
+            num_recent (int): Number of most recent samples to always include (CER)
 
         Yields:
             BatchTransition: Batched transitions
@@ -325,15 +361,15 @@ class ReplayBuffer:
         while True:  # Create an infinite loop
             if async_prefetch:
                 # Get the standard iterator
-                iterator = self._get_async_iterator(queue_size=queue_size, batch_size=batch_size)
+                iterator = self._get_async_iterator(queue_size=queue_size, batch_size=batch_size, num_recent=num_recent)
             else:
-                iterator = self._get_naive_iterator(batch_size=batch_size, queue_size=queue_size)
+                iterator = self._get_naive_iterator(batch_size=batch_size, queue_size=queue_size, num_recent=num_recent)
 
             # Yield all items from the iterator
             with suppress(StopIteration):
                 yield from iterator
 
-    def _get_async_iterator(self, batch_size: int, queue_size: int = 2):
+    def _get_async_iterator(self, batch_size: int, queue_size: int = 2, num_recent: int = 0):
         """
         Create an iterator that continuously yields prefetched batches in a
         background thread. The design is intentionally simple and avoids busy
@@ -343,6 +379,7 @@ class ReplayBuffer:
             batch_size (int): Size of batches to sample.
             queue_size (int): Maximum number of prefetched batches to keep in
                 memory.
+            num_recent (int): Number of most recent samples to always include (CER).
 
         Yields:
             BatchTransition: A batch sampled from the replay buffer.
@@ -357,7 +394,7 @@ class ReplayBuffer:
             """Continuously put sampled batches into the queue until shutdown."""
             while not shutdown_event.is_set():
                 try:
-                    batch = self.sample(batch_size)
+                    batch = self.sample(batch_size, num_recent=num_recent)
                     # The timeout ensures the thread unblocks if the queue is full
                     # and the shutdown event gets set meanwhile.
                     data_queue.put(batch, block=True, timeout=0.5)
@@ -387,13 +424,14 @@ class ReplayBuffer:
             # Give the producer thread a bit of time to finish.
             producer_thread.join(timeout=1.0)
 
-    def _get_naive_iterator(self, batch_size: int, queue_size: int = 2):
+    def _get_naive_iterator(self, batch_size: int, queue_size: int = 2, num_recent: int = 0):
         """
         Creates a simple non-threaded iterator that yields batches.
 
         Args:
             batch_size (int): Size of batches to sample
             queue_size (int): Number of initial batches to prefetch
+            num_recent (int): Number of most recent samples to always include (CER)
 
         Yields:
             BatchTransition: Batch transitions
@@ -404,7 +442,7 @@ class ReplayBuffer:
 
         def enqueue(n):
             for _ in range(n):
-                data = self.sample(batch_size)
+                data = self.sample(batch_size, num_recent=num_recent)
                 queue.append(data)
 
         enqueue(queue_size)

@@ -535,8 +535,11 @@ def add_actor_information_and_train(
                 # Get Q-values for the first cer_num_recent samples (which are the most recent)
                 recent_obs = {k: v[:cer_num_recent] for k, v in observations.items()}
                 recent_actions = actions[:cer_num_recent]
-                recent_obs_features = observation_features[:cer_num_recent] if observation_features is not None else None
+                recent_obs_features = {k: v[:cer_num_recent] for k, v in observation_features.items()} if observation_features is not None else None
                 
+                # Switch to eval mode for diagnostic forward pass (required for BatchNorm with batch_size=1)
+                was_training = policy.training
+                policy.eval()
                 # Compute Q-values using critic ensemble
                 q_values = policy.critic_forward(
                     observations=recent_obs,
@@ -544,6 +547,8 @@ def add_actor_information_and_train(
                     observation_features=recent_obs_features,
                     use_target=False
                 )
+                if was_training:
+                    policy.train()
                 # q_values shape: [num_critics, num_recent]
                 recent_q_mean = q_values.mean().item()
                 recent_q_min = q_values.min(dim=0)[0].mean().item()  # Min across critics, mean across samples
