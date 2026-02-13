@@ -276,10 +276,15 @@ class KeyboardEndEffectorTeleop(KeyboardTeleop):
             elif key == "q":
                 terminate_episode = True
                 success = False
-            # Handle number keys 0-9 for graded rewards
-            elif key in "0123456789":
-                human_reward = int(key) / 10.0  # '0'->0.0, '1'->0.1, ..., '9'->0.9
-                logging.info(f"[HUMAN REWARD] +{human_reward:.1f} from key '{key}'")
+            # Handle number keys 0-9 for graded rewards, '-' for punishment
+            # pynput returns KeyCode objects for alphanumeric keys, check .char attribute
+            key_char = getattr(key, 'char', key) if hasattr(key, 'char') else str(key)
+            if key_char in "0123456789":
+                human_reward = int(key_char) / 10.0  # '0'->0.0, '1'->0.1, ..., '9'->0.9
+                logging.info(f"[HUMAN REWARD] +{human_reward:.1f} from key '{key_char}'")
+            elif key_char == "-":
+                human_reward = -0.5  # Punishment
+                logging.info(f"[HUMAN REWARD] {human_reward:.1f} (PUNISHMENT) from key '-'")
 
         return {
             TeleopEvents.IS_INTERVENTION: is_intervention,
