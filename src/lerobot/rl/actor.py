@@ -66,7 +66,7 @@ from lerobot.processor import TransitionKey
 from lerobot.rl.process import ProcessSignalHandler
 from lerobot.rl.queue import get_last_item_from_queue
 from lerobot.robots import so_follower  # noqa: F401
-from lerobot.teleoperators import gamepad, so_leader  # noqa: F401
+from lerobot.teleoperators import gamepad, keyboard, so_leader  # noqa: F401
 from lerobot.teleoperators.utils import TeleopEvents
 from lerobot.transport import services_pb2, services_pb2_grpc
 from lerobot.transport.utils import (
@@ -89,6 +89,7 @@ from lerobot.utils.utils import (
     get_safe_torch_device,
     init_logging,
 )
+from lerobot.utils.visualization_utils import init_rerun
 
 from .gym_manipulator import (
     create_transition,
@@ -118,6 +119,13 @@ def actor_cli(cfg: TrainRLServerPipelineConfig):
     # Initialize logging with explicit log file
     init_logging(log_file=log_file, display_pid=display_pid)
     logging.info(f"Actor logging initialized, writing to {log_file}")
+
+    # Initialize rerun for visualization
+    try:
+        init_rerun(session_name="rl_actor")
+        logging.info("Rerun visualization initialized")
+    except Exception as e:
+        logging.warning(f"Failed to initialize rerun: {e}. Continuing without visualization.")
 
     is_threaded = use_threads(cfg)
     shutdown_event = ProcessSignalHandler(is_threaded, display_pid=display_pid).shutdown_event
@@ -314,11 +322,18 @@ def act_with_policy(
         # It is either the action from the teleop device or the action from the policy
         executed_action = new_transition[TransitionKey.COMPLEMENTARY_DATA]["teleop_action"]
 
-        reward = new_transition[TransitionKey.REWARD]
+        reward = new_transition.get(TransitionKey.REWARD, 0.0)
+        # Ensure reward is a float
+        if hasattr(reward, 'item'):
+            reward = reward.item()
+        reward = float(reward) if reward is not None else 0.0
+        
         done = new_transition.get(TransitionKey.DONE, False)
         truncated = new_transition.get(TransitionKey.TRUNCATED, False)
 
-        sum_reward_episode += float(reward)
+        if reward != 0.0:
+            logging.info(f"[ACTOR] Step reward: {reward}")
+        sum_reward_episode += reward
         episode_total_steps += 1
 
         # Check for intervention from transition info
@@ -326,6 +341,34 @@ def act_with_policy(
         if intervention_info.get(TeleopEvents.IS_INTERVENTION, False):
             episode_intervention = True
             episode_intervention_steps += 1
+
+        # Log to rerun for visualization
+        try:
+            import rerun as rr
+
+            # Log camera images (every 5th step to reduce overhead)
+            if interaction_step % 5 == 0:
+                for k, v in new_transition[TransitionKey.OBSERVATION].items():
+                    if "image" in k and hasattr(v, 'cpu'):
+                        img = v.squeeze(0).cpu().numpy()
+                        # CHW -> HWC
+                        if img.ndim == 3 and img.shape[0] in (1, 3, 4):
+                            img = img.transpose(1, 2, 0)
+                        # Scale to 0-255 if float
+                        if img.dtype != 'uint8':
+                            img = (img * 255).clip(0, 255).astype('uint8') if img.max() <= 1.0 else img.astype('uint8')
+                        rr.log(f"actor/{k}", rr.Image(img))
+
+            # Log reward and episode metrics
+            rr.log("actor/step_reward", rr.Scalars(reward))
+            rr.log("actor/episode_reward", rr.Scalars(sum_reward_episode))
+
+            # Log reward classifier prediction if available
+            classifier_pred = intervention_info.get("reward_classifier_prediction", None)
+            if classifier_pred is not None:
+                rr.log("actor/reward_classifier_prediction", rr.Scalars(float(classifier_pred)))
+        except Exception:
+            pass  # Don't crash if rerun fails
 
         complementary_info = {
             "discrete_penalty": torch.tensor(

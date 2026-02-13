@@ -126,7 +126,8 @@ class ReplayBuffer:
 
         if image_augmentation_function is None:
             base_function = functools.partial(random_shift, pad=4)
-            self.image_augmentation_function = torch.compile(base_function)
+            # Don't use torch.compile - causes permission errors on some systems
+            self.image_augmentation_function = base_function
         self.use_drq = use_drq
 
     def _initialize_storage(

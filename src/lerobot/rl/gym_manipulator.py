@@ -203,15 +203,11 @@ class RobotEnv(gym.Env):
         self.observation_space = gym.spaces.Dict(observation_spaces)
 
         # Define the action space for joint positions along with setting an intervention flag.
-        action_dim = 3
+        # Use number of motors for joint control (no IK)
+        action_dim = len(self._joint_names)
         bounds = {}
         bounds["min"] = -np.ones(action_dim)
         bounds["max"] = np.ones(action_dim)
-
-        if self.use_gripper:
-            action_dim += 1
-            bounds["min"] = np.concatenate([bounds["min"], [0]])
-            bounds["max"] = np.concatenate([bounds["max"], [2]])
 
         self.action_space = gym.spaces.Box(
             low=bounds["min"],
@@ -252,8 +248,28 @@ class RobotEnv(gym.Env):
         return obs, {TeleopEvents.IS_INTERVENTION: False}
 
     def step(self, action) -> tuple[RobotObservation, float, bool, bool, dict[str, Any]]:
-        """Execute one environment step with given action."""
-        joint_targets_dict = {f"{key}.pos": action[i] for i, key in enumerate(self.robot.bus.motors.keys())}
+        """Execute one environment step with given action.
+        
+        Action is interpreted as delta from current position, scaled by action_scale.
+        action in [-1, 1] -> delta in [-action_scale, +action_scale] degrees
+        """
+        # Squeeze batch dimension if present (policy outputs [1, action_dim])
+        if hasattr(action, 'squeeze'):
+            action = action.squeeze(0)
+        if hasattr(action, 'cpu'):
+            action = action.cpu().numpy()
+        
+        # Scale factor for actions (degrees per unit action)
+        # With action in [-1, 1], this gives delta of [-10, +10] degrees
+        action_scale = 5.0
+        
+        # Get current joint positions and apply delta
+        current_positions = self._raw_joint_positions if hasattr(self, '_raw_joint_positions') else {}
+        joint_targets_dict = {}
+        for i, key in enumerate(self.robot.bus.motors.keys()):
+            current_pos = current_positions.get(f"{key}.pos", 0.0)
+            delta = float(action[i]) * action_scale
+            joint_targets_dict[f"{key}.pos"] = current_pos + delta
 
         self.robot.send_action(joint_targets_dict)
 
@@ -529,17 +545,27 @@ def step_env_and_process_transition(
         Processed transition with updated state.
     """
 
-    # Create action transition
+    # Create action transition - reset reward to 0 to prevent carrying over from previous step
     transition[TransitionKey.ACTION] = action
+    transition[TransitionKey.REWARD] = 0.0  # Start fresh each step!
     transition[TransitionKey.OBSERVATION] = (
         env.get_raw_joint_positions() if hasattr(env, "get_raw_joint_positions") else {}
     )
+    
     processed_action_transition = action_processor(transition)
     processed_action = processed_action_transition[TransitionKey.ACTION]
 
-    obs, reward, terminated, truncated, info = env.step(processed_action)
+    obs, env_reward, terminated, truncated, info = env.step(processed_action)
 
-    reward = reward + processed_action_transition[TransitionKey.REWARD]
+    action_reward = processed_action_transition.get(TransitionKey.REWARD, 0.0)
+    # Ensure action_reward is a float for proper comparison and addition
+    if hasattr(action_reward, 'item'):
+        action_reward = action_reward.item()
+    action_reward = float(action_reward) if action_reward is not None else 0.0
+    
+    reward = float(env_reward) + action_reward
+    if action_reward != 0.0:
+        logging.info(f"[step_env] Got human reward: {action_reward}")
     terminated = terminated or processed_action_transition[TransitionKey.DONE]
     truncated = truncated or processed_action_transition[TransitionKey.TRUNCATED]
     complementary_data = processed_action_transition[TransitionKey.COMPLEMENTARY_DATA].copy()

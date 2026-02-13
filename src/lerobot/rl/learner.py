@@ -70,7 +70,7 @@ from lerobot.rl.buffer import ReplayBuffer, concatenate_batch_transitions
 from lerobot.rl.process import ProcessSignalHandler
 from lerobot.rl.wandb_utils import WandBLogger
 from lerobot.robots import so_follower  # noqa: F401
-from lerobot.teleoperators import gamepad, so_leader  # noqa: F401
+from lerobot.teleoperators import gamepad, keyboard, so_leader  # noqa: F401
 from lerobot.teleoperators.utils import TeleopEvents
 from lerobot.transport import services_pb2_grpc
 from lerobot.transport.utils import (
@@ -149,6 +149,15 @@ def train(cfg: TrainRLServerPipelineConfig, job_name: str | None = None):
     init_logging(log_file=log_file, display_pid=display_pid)
     logging.info(f"Learner logging initialized, writing to {log_file}")
     logging.info(pformat(cfg.to_dict()))
+
+    # Initialize rerun for visualization
+    try:
+        from lerobot.utils.visualization_utils import init_rerun
+
+        init_rerun(session_name="rl_learner")
+        logging.info("Rerun visualization initialized")
+    except Exception as e:
+        logging.warning(f"Failed to initialize rerun: {e}. Continuing without visualization.")
 
     # Setup WandB logging if enabled
     if cfg.wandb.enable and cfg.wandb.project:
@@ -377,7 +386,16 @@ def add_actor_information_and_train(
         )
 
         # Wait until the replay buffer has enough samples to start training
-        if len(replay_buffer) < online_step_before_learning:
+        buffer_size = len(replay_buffer)
+        if buffer_size < online_step_before_learning:
+            # Log waiting status periodically
+            current_time = time.time()
+            if not hasattr(add_actor_information_and_train, '_last_buffer_log'):
+                add_actor_information_and_train._last_buffer_log = 0
+            if current_time - add_actor_information_and_train._last_buffer_log > 5.0:  # Log every 5 seconds
+                logging.info(f"[LEARNER] Waiting for data: {buffer_size}/{online_step_before_learning} samples (need {online_step_before_learning - buffer_size} more)")
+                add_actor_information_and_train._last_buffer_log = current_time
+            time.sleep(0.1)  # Small sleep to avoid busy loop when waiting
             continue
 
         if online_iterator is None:
@@ -559,6 +577,31 @@ def add_actor_information_and_train(
             if offline_replay_buffer is not None:
                 training_infos["offline_replay_buffer_size"] = len(offline_replay_buffer)
             training_infos["Optimization step"] = optimization_step
+
+            # Log losses to console for easy monitoring
+            loss_str = f"[LEARNER] Step {optimization_step}: "
+            loss_str += f"critic={training_infos.get('loss_critic', 0):.4f}, "
+            loss_str += f"actor={training_infos.get('loss_actor', 0):.4f}, "
+            loss_str += f"temp={training_infos.get('loss_temperature', 0):.4f}, "
+            loss_str += f"α={training_infos.get('temperature', 0):.4f}, "
+            loss_str += f"buffer={training_infos.get('replay_buffer_size', 0)}"
+            logging.info(loss_str)
+
+            # Log to rerun for visualization
+            try:
+                import rerun as rr
+
+                rr.log("learner/loss_critic", rr.Scalars(training_infos.get("loss_critic", 0)))
+                rr.log("learner/loss_actor", rr.Scalars(training_infos.get("loss_actor", 0)))
+                rr.log("learner/loss_temperature", rr.Scalars(training_infos.get("loss_temperature", 0)))
+                rr.log("learner/temperature", rr.Scalars(training_infos.get("temperature", 0)))
+                rr.log("learner/buffer_size", rr.Scalars(training_infos.get("replay_buffer_size", 0)))
+                if "critic_grad_norm" in training_infos:
+                    rr.log("learner/critic_grad_norm", rr.Scalars(training_infos["critic_grad_norm"]))
+                if "actor_grad_norm" in training_infos:
+                    rr.log("learner/actor_grad_norm", rr.Scalars(training_infos["actor_grad_norm"]))
+            except Exception:
+                pass  # Don't crash if rerun fails
 
             # Log training metrics
             if wandb_logger:
@@ -1120,6 +1163,17 @@ def process_interaction_message(
     if wandb_logger:
         wandb_logger.log_dict(d=message, mode="train", custom_step_key="Interaction step")
 
+    # Log episodic reward to rerun
+    try:
+        import rerun as rr
+
+        if "Episodic reward" in message:
+            rr.log("learner/episodic_reward", rr.Scalars(message["Episodic reward"]))
+        if "Intervention rate" in message:
+            rr.log("learner/intervention_rate", rr.Scalars(message["Intervention rate"]))
+    except Exception:
+        pass
+
     return message
 
 
@@ -1144,6 +1198,7 @@ def process_transitions(
     while not transition_queue.empty() and not shutdown_event.is_set():
         transition_list = transition_queue.get()
         transition_list = bytes_to_transitions(buffer=transition_list)
+        logging.info(f"[LEARNER] Received {len(transition_list)} transitions from actor")
 
         for transition in transition_list:
             transition = move_transition_to_device(transition=transition, device=device)
