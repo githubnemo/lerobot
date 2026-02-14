@@ -14,6 +14,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import logging
+import math
 from dataclasses import dataclass
 from typing import Any
 
@@ -21,11 +23,16 @@ import torch
 
 from lerobot.configs.types import PipelineFeatureType, PolicyFeature
 from lerobot.processor.pipeline import (
+    EnvTransition,
     ObservationProcessorStep,
+    ProcessorStep,
     ProcessorStepRegistry,
+    TransitionKey,
 )
 from lerobot.robots import Robot
 from lerobot.utils.constants import OBS_STATE
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -208,4 +215,89 @@ class MotorCurrentProcessorStep(ObservationProcessorStep):
                 features[PipelineFeatureType.OBSERVATION][OBS_STATE] = PolicyFeature(
                     type=original_feature.type, shape=new_shape
                 )
+        return features
+
+
+@dataclass
+@ProcessorStepRegistry.register("torque_penalty_processor")
+class TorquePenaltyProcessorStep(ProcessorStep):
+    """
+    Applies a sigmoid penalty to the reward based on total squared motor current.
+
+    Reads Present_Current from the robot's motor bus each step and computes:
+        x = Σ(I²) / divisor
+        penalty = scale * 100 / (1 + exp(-steepness * (x - midpoint)))
+
+    The penalty is subtracted from the transition reward. This discourages
+    high-torque motions (e.g. pushing against walls, gripping too hard).
+
+    With default params (steepness=0.9, midpoint=14, divisor=1000):
+        - Normal motion  (~10k Σ(I²)):  penalty ≈ scale * 2.7
+        - Hard grip      (~12k Σ(I²)):  penalty ≈ scale * 14
+        - Threshold      (~14k Σ(I²)):  penalty =  scale * 50
+        - Against wall  (~150k Σ(I²)):  penalty ≈ scale * 100
+
+    Attributes:
+        robot: Robot instance providing access to the hardware bus.
+        scale: Overall scale factor for the penalty (reward tradeoff).
+        steepness: Steepness of the sigmoid curve.
+        midpoint: Center of the sigmoid in units of Σ(I²)/divisor.
+        divisor: Divides the raw Σ(I²) to bring it into a reasonable range.
+    """
+
+    robot: Robot | None = None
+    scale: float = 0.01
+    steepness: float = 0.9
+    midpoint: float = 14.0
+    divisor: float = 1000.0
+
+    def __call__(self, transition: EnvTransition) -> EnvTransition:
+        new_transition = transition.copy()
+
+        if self.robot is None:
+            return new_transition
+
+        try:
+            current_dict = self.robot.bus.sync_read("Present_Current")  # type: ignore[attr-defined]
+            currents = [current_dict[name] for name in self.robot.bus.motors]  # type: ignore[attr-defined]
+            total_sq = sum(c ** 2 for c in currents)
+
+            x = total_sq / self.divisor
+            penalty = self.scale * 100.0 / (1.0 + math.exp(-self.steepness * (x - self.midpoint)))
+
+            current_reward = new_transition.get(TransitionKey.REWARD, 0.0)
+            if hasattr(current_reward, "item"):
+                current_reward = current_reward.item()
+            new_transition[TransitionKey.REWARD] = float(current_reward) - penalty
+
+            # Store torque metrics in info for logging (WandB, Rerun, console)
+            info = new_transition.get(TransitionKey.INFO, {})
+            info["torque_sq_sum"] = total_sq
+            info["torque_penalty"] = penalty
+            new_transition[TransitionKey.INFO] = info
+
+            if penalty > self.scale * 20:  # Log when penalty is significant
+                logger.info(
+                    f"[TorquePenalty] Σ(I²)={total_sq:.0f}  x={x:.1f}  "
+                    f"penalty={penalty:.4f}  reward: {current_reward:.4f} → {new_transition[TransitionKey.REWARD]:.4f}"
+                )
+        except Exception as e:
+            logger.debug(f"[TorquePenalty] Failed to read current: {e}")
+
+        return new_transition
+
+    def get_config(self) -> dict[str, Any]:
+        return {
+            "scale": self.scale,
+            "steepness": self.steepness,
+            "midpoint": self.midpoint,
+            "divisor": self.divisor,
+        }
+
+    def reset(self) -> None:
+        pass
+
+    def transform_features(
+        self, features: dict[PipelineFeatureType, dict[str, PolicyFeature]]
+    ) -> dict[PipelineFeatureType, dict[str, PolicyFeature]]:
         return features

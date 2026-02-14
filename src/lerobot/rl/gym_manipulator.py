@@ -77,7 +77,7 @@ from lerobot.utils.constants import ACTION, DONE, OBS_IMAGES, OBS_STATE, REWARD
 from lerobot.utils.robot_utils import precise_sleep
 from lerobot.utils.utils import log_say
 
-from .joint_observations_processor import JointVelocityProcessorStep, MotorCurrentProcessorStep
+from .joint_observations_processor import JointVelocityProcessorStep, MotorCurrentProcessorStep, TorquePenaltyProcessorStep
 
 logging.basicConfig(level=logging.INFO)
 
@@ -125,6 +125,8 @@ class RobotEnv(gym.Env):
     def __init__(
         self,
         robot,
+        fps: float = 10.0,
+        action_scale_per_s: float = 50.0,
         use_gripper: bool = False,
         display_cameras: bool = False,
         reset_pose: list[float] | None = None,
@@ -134,6 +136,10 @@ class RobotEnv(gym.Env):
 
         Args:
             robot: Robot interface for hardware communication.
+            fps: Control loop frequency (Hz). Used to compute per-step action_scale.
+            action_scale_per_s: Action scale in position-units per second. The per-step
+                scale is action_scale_per_s / fps. Policy outputs in [-1, 1] are
+                multiplied by this to get joint position deltas.
             use_gripper: Whether to include gripper in action space.
             display_cameras: Whether to show camera feeds during execution.
             reset_pose: Joint positions for environment reset.
@@ -142,7 +148,14 @@ class RobotEnv(gym.Env):
         super().__init__()
 
         self.robot = robot
+        self.fps = fps
+        self.action_scale = action_scale_per_s / fps
         self.display_cameras = display_cameras
+
+        logging.info(
+            f"RobotEnv: action_scale_per_s={action_scale_per_s}, fps={fps}, "
+            f"action_scale={self.action_scale:.2f} per step"
+        )
 
         # Connect to the robot if not already connected.
         if not self.robot.is_connected:
@@ -249,26 +262,23 @@ class RobotEnv(gym.Env):
 
     def step(self, action) -> tuple[RobotObservation, float, bool, bool, dict[str, Any]]:
         """Execute one environment step with given action.
-        
-        Action is interpreted as delta from current position, scaled by action_scale.
-        action in [-1, 1] -> delta in [-action_scale, +action_scale] degrees
+
+        Action is interpreted as delta from current position, scaled by self.action_scale.
+        action in [-1, 1] -> delta in [-action_scale, +action_scale] position-units.
+        action_scale = action_scale_per_s / fps (set at construction time).
         """
         # Squeeze batch dimension if present (policy outputs [1, action_dim])
         if hasattr(action, 'squeeze'):
             action = action.squeeze(0)
         if hasattr(action, 'cpu'):
             action = action.cpu().numpy()
-        
-        # Scale factor for actions (degrees per unit action)
-        # With action in [-1, 1], this gives delta of [-10, +10] degrees
-        action_scale = 5.0
-        
+
         # Get current joint positions and apply delta
         current_positions = self._raw_joint_positions if hasattr(self, '_raw_joint_positions') else {}
         joint_targets_dict = {}
         for i, key in enumerate(self.robot.bus.motors.keys()):
             current_pos = current_positions.get(f"{key}.pos", 0.0)
-            delta = float(action[i]) * action_scale
+            delta = float(action[i]) * self.action_scale
             joint_targets_dict[f"{key}.pos"] = current_pos + delta
 
         self.robot.send_action(joint_targets_dict)
@@ -361,6 +371,8 @@ def make_robot_env(cfg: HILSerlRobotEnvConfig) -> tuple[gym.Env, Any]:
 
     env = RobotEnv(
         robot=robot,
+        fps=cfg.fps,
+        action_scale_per_s=cfg.action_scale_per_s,
         use_gripper=use_gripper,
         display_cameras=display_cameras,
         reset_pose=reset_pose,
@@ -471,6 +483,18 @@ def make_processors(
                 success_threshold=cfg.processor.reward_classifier.success_threshold,
                 success_reward=cfg.processor.reward_classifier.success_reward,
                 terminate_on_success=terminate_on_success,
+            )
+        )
+
+    # Add torque penalty processor if configured
+    if cfg.processor.torque_penalty is not None:
+        env_pipeline_steps.append(
+            TorquePenaltyProcessorStep(
+                robot=env.robot,
+                scale=cfg.processor.torque_penalty.scale,
+                steepness=cfg.processor.torque_penalty.steepness,
+                midpoint=cfg.processor.torque_penalty.midpoint,
+                divisor=cfg.processor.torque_penalty.divisor,
             )
         )
 

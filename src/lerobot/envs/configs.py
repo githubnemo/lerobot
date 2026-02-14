@@ -218,6 +218,27 @@ class GripperConfig:
 
 
 @dataclass
+class TorquePenaltyConfig:
+    """Configuration for torque-based reward penalty.
+
+    Applies a sigmoid penalty based on the sum of squared motor currents:
+        x = Σ(I²) / 1000
+        penalty = scale * 100 / (1 + exp(-steepness * (x - midpoint)))
+
+    With defaults (steepness=0.9, midpoint=14):
+        - Normal motion  (~10k Σ(I²)):  penalty ≈ scale * 2.7
+        - Hard grip      (~12k Σ(I²)):  penalty ≈ scale * 14
+        - Midpoint       (~14k Σ(I²)):  penalty =  scale * 50
+        - Against wall  (~150k Σ(I²)):  penalty ≈ scale * 100
+    """
+
+    scale: float = 0.01
+    steepness: float = 0.9
+    midpoint: float = 14.0
+    divisor: float = 1000.0
+
+
+@dataclass
 class ResetConfig:
     """Configuration for environment reset behavior."""
 
@@ -238,6 +259,7 @@ class HILSerlProcessorConfig:
     reset: ResetConfig | None = None
     inverse_kinematics: InverseKinematicsConfig | None = None
     reward_classifier: RewardClassifierConfig | None = None
+    torque_penalty: TorquePenaltyConfig | None = None
     max_gripper_pos: float | None = 100.0
 
 
@@ -251,6 +273,13 @@ class HILSerlRobotEnvConfig(EnvConfig):
     processor: HILSerlProcessorConfig = field(default_factory=HILSerlProcessorConfig)
 
     name: str = "real_robot"
+
+    # Action scale in normalized-position-units per second.
+    # The per-step action_scale is computed as action_scale_per_s / fps.
+    # The policy outputs actions in [-1, 1] which are multiplied by action_scale
+    # to get the joint position delta applied each step.
+    # Default 50.0 gives action_scale=5.0 at 10 fps (backward-compatible).
+    action_scale_per_s: float = 50.0
 
     @property
     def gym_kwargs(self) -> dict:

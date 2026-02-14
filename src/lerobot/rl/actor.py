@@ -276,11 +276,15 @@ def act_with_policy(
 
     # NOTE: For the moment we will solely handle the case of a single environment
     sum_reward_episode = 0
-    list_transition_to_send_to_learner = []
     episode_intervention = False
+    # Training stats received from learner (for rerun logging)
+    latest_training_stats = {}
     # Add counters for intervention rate calculation
     episode_intervention_steps = 0
     episode_total_steps = 0
+    # Torque penalty tracking
+    episode_torque_penalty_sum = 0.0
+    episode_torque_sq_sum_total = 0.0
 
     policy_timer = TimerManager("Policy inference", log=False)
 
@@ -342,9 +346,18 @@ def act_with_policy(
             episode_intervention = True
             episode_intervention_steps += 1
 
+        # Track torque penalty metrics (if present)
+        step_torque_penalty = intervention_info.get("torque_penalty", 0.0)
+        step_torque_sq_sum = intervention_info.get("torque_sq_sum", 0.0)
+        episode_torque_penalty_sum += step_torque_penalty
+        episode_torque_sq_sum_total += step_torque_sq_sum
+
         # Log to rerun for visualization
         try:
             import rerun as rr
+
+            # Set time for proper graph updates
+            rr.set_time(sequence=("step", interaction_step))
 
             # Log camera images (every 5th step to reduce overhead)
             if interaction_step % 5 == 0:
@@ -359,16 +372,28 @@ def act_with_policy(
                             img = (img * 255).clip(0, 255).astype('uint8') if img.max() <= 1.0 else img.astype('uint8')
                         rr.log(f"actor/{k}", rr.Image(img))
 
-            # Log reward and episode metrics
-            rr.log("actor/step_reward", rr.Scalars(reward))
-            rr.log("actor/episode_reward", rr.Scalars(sum_reward_episode))
+            # Log reward metrics
+            rr.log("actor/rewards/step_reward", rr.Scalars(reward))
 
             # Log reward classifier prediction if available
             classifier_pred = intervention_info.get("reward_classifier_prediction", None)
             if classifier_pred is not None:
-                rr.log("actor/reward_classifier_prediction", rr.Scalars(float(classifier_pred)))
-        except Exception:
-            pass  # Don't crash if rerun fails
+                rr.log("actor/rewards/classifier_prediction", rr.Scalars(float(classifier_pred)))
+
+            # Log torque metrics per step
+            if step_torque_sq_sum > 0:
+                rr.log("actor/torque/sq_sum", rr.Scalars(step_torque_sq_sum))
+                rr.log("actor/torque/penalty", rr.Scalars(step_torque_penalty))
+
+            # Log policy action (mean of action tensor)
+            if action is not None:
+                action_mean = action.mean().item() if hasattr(action, 'mean') else float(action.mean())
+                action_std = action.std().item() if hasattr(action, 'std') else 0.0
+                rr.log("actor/policy/action_mean", rr.Scalars(action_mean))
+                rr.log("actor/policy/action_std", rr.Scalars(action_std))
+
+        except Exception as e:
+            logging.debug(f"Rerun logging failed: {e}")  # Log error for debugging
 
         complementary_info = {
             "discrete_penalty": torch.tensor(
@@ -376,16 +401,20 @@ def act_with_policy(
             ),
         }
         # Create transition for learner (convert to old format)
-        list_transition_to_send_to_learner.append(
-            Transition(
-                state=observation,
-                action=executed_action,
-                reward=reward,
-                next_state=next_observation,
-                done=done,
-                truncated=truncated,
-                complementary_info=complementary_info,
-            )
+        current_transition = Transition(
+            state=observation,
+            action=executed_action,
+            reward=reward,
+            next_state=next_observation,
+            done=done,
+            truncated=truncated,
+            complementary_info=complementary_info,
+        )
+        
+        # Per-step streaming: send transition immediately for CER support
+        push_transitions_to_transport_queue(
+            transitions=[current_transition],
+            transitions_queue=transitions_queue,
         )
 
         # Update transition for next iteration
@@ -394,14 +423,16 @@ def act_with_policy(
         if done or truncated:
             logging.info(f"[ACTOR] Global step {interaction_step}: Episode reward: {sum_reward_episode}")
 
-            update_policy_parameters(policy=policy, parameters_queue=parameters_queue, device=device)
+            # Log episode summary to rerun
+            try:
+                import rerun as rr
+                rr.set_time(sequence=("step", interaction_step))
+                rr.log("actor/rewards/episode_reward", rr.Scalars(sum_reward_episode))
+            except Exception:
+                pass
 
-            if len(list_transition_to_send_to_learner) > 0:
-                push_transitions_to_transport_queue(
-                    transitions=list_transition_to_send_to_learner,
-                    transitions_queue=transitions_queue,
-                )
-                list_transition_to_send_to_learner = []
+            # Update policy and get training stats
+            latest_training_stats = update_policy_parameters(policy=policy, parameters_queue=parameters_queue, device=device) or {}
 
             stats = get_frequency_stats(policy_timer)
             policy_timer.reset()
@@ -411,6 +442,15 @@ def act_with_policy(
             if episode_total_steps > 0:
                 intervention_rate = episode_intervention_steps / episode_total_steps
 
+            # Compute episode torque averages
+            episode_torque_metrics = {}
+            if episode_total_steps > 0 and episode_torque_sq_sum_total > 0:
+                episode_torque_metrics = {
+                    "Torque penalty (episode sum)": episode_torque_penalty_sum,
+                    "Torque penalty (episode avg)": episode_torque_penalty_sum / episode_total_steps,
+                    "Torque sq sum (episode avg)": episode_torque_sq_sum_total / episode_total_steps,
+                }
+
             # Send episodic reward to the learner
             interactions_queue.put(
                 python_object_to_bytes(
@@ -419,6 +459,7 @@ def act_with_policy(
                         "Interaction step": interaction_step,
                         "Episode intervention": int(episode_intervention),
                         "Intervention rate": intervention_rate,
+                        **episode_torque_metrics,
                         **stats,
                     }
                 )
@@ -429,6 +470,8 @@ def act_with_policy(
             episode_intervention = False
             episode_intervention_steps = 0
             episode_total_steps = 0
+            episode_torque_penalty_sum = 0.0
+            episode_torque_sq_sum_total = 0.0
 
             # Reset environment and processors
             obs, info = online_env.reset()
@@ -692,7 +735,12 @@ def interactions_stream(
 #  Policy functions
 
 
-def update_policy_parameters(policy: SACPolicy, parameters_queue: Queue, device):
+def update_policy_parameters(policy: SACPolicy, parameters_queue: Queue, device) -> dict | None:
+    """Update policy parameters from learner and return training stats.
+    
+    Returns:
+        dict | None: Training stats (Q-values, losses) if available, None otherwise
+    """
     bytes_state_dict = get_last_item_from_queue(parameters_queue, block=False)
     if bytes_state_dict is not None:
         logging.info("[ACTOR] Load new parameters from Learner.")
@@ -719,6 +767,14 @@ def update_policy_parameters(policy: SACPolicy, parameters_queue: Queue, device)
             )
             policy.discrete_critic.load_state_dict(discrete_critic_state_dict)
             logging.info("[ACTOR] Loaded discrete critic parameters from Learner.")
+
+        # Extract and return training stats (Q-values, losses) for rerun logging
+        training_stats = state_dicts.get("training_stats", None)
+        if training_stats is not None:
+            logging.debug(f"[ACTOR] Received training stats: {training_stats}")
+        return training_stats
+    
+    return None
 
 
 #  Utilities functions
