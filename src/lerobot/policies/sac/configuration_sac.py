@@ -143,6 +143,9 @@ class SACConfig(PreTrainedConfig):
     online_buffer_capacity: int = 100000
     # Capacity of the offline replay buffer
     offline_buffer_capacity: int = 100000
+    # Proportion of each training batch that comes from the offline/expert replay buffer.
+    # 0.0 = no expert data (all online), 1.0 = only expert data (all offline), 0.5 = 50/50 split (default).
+    offline_sampling_ratio: float = 0.5
     # Whether to use asynchronous prefetching for the buffers
     async_prefetch: bool = False
     # Number of steps before learning starts
@@ -169,6 +172,10 @@ class SACConfig(PreTrainedConfig):
     critic_target_update_weight: float = 0.005
     # Update-to-data ratio for the UTD algorithm (If you want enable utd_ratio, you need to set it to >1)
     utd_ratio: int = 1
+    # Combined Experience Replay (CER) - always include most recent samples in batch
+    use_cer: bool = False
+    # Number of most recent samples to include when using CER
+    cer_num_recent: int = 1
     # Hidden dimension size for the state encoder
     state_encoder_hidden_dim: int = 256
     # Dimension of the latent space

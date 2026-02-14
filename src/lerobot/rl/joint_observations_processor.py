@@ -263,7 +263,9 @@ class TorquePenaltyProcessorStep(ProcessorStep):
             total_sq = sum(c ** 2 for c in currents)
 
             x = total_sq / self.divisor
-            penalty = self.scale * 100.0 / (1.0 + math.exp(-self.steepness * (x - self.midpoint)))
+            # penalty = self.scale * 100.0 / (1.0 + math.exp(-self.steepness * (x - self.midpoint)))
+            # softplus penalty
+            penalty = self.scale * 100.0 * math.log(1.0 + math.exp(0.5 * (x - 10.0))) / 35.0
 
             current_reward = new_transition.get(TransitionKey.REWARD, 0.0)
             if hasattr(current_reward, "item"):

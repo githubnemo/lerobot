@@ -14,6 +14,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import logging
+import math
 import functools
 from collections.abc import Callable, Sequence
 from contextlib import suppress
@@ -461,6 +463,9 @@ class ReplayBuffer:
         use_drq: bool = True,
         storage_device: str = "cpu",
         optimize_memory: bool = False,
+        convert_to_delta: bool = False,
+        action_scale: float = 5.0,
+        delta_state_key: str = "observation.state",
     ) -> "ReplayBuffer":
         """
         Convert a LeRobotDataset into a ReplayBuffer.
@@ -470,22 +475,43 @@ class ReplayBuffer:
             device (str): The device for sampling tensors. Defaults to "cuda:0".
             state_keys (Sequence[str] | None): The list of keys that appear in `state` and `next_state`.
             capacity (int | None): Buffer capacity. If None, uses dataset length.
-            action_mask (Sequence[int] | None): Indices of action dimensions to keep.
             image_augmentation_function (Callable | None): Function for image augmentation.
                 If None, uses default random shift with pad=4.
             use_drq (bool): Whether to use DrQ image augmentation when sampling.
             storage_device (str): Device for storing tensor data. Using "cpu" saves GPU memory.
             optimize_memory (bool): If True, reduces memory usage by not duplicating state data.
+            convert_to_delta (bool): If True, convert absolute position actions to deltas
+                by computing (action - observation.state) / action_scale. If a delta
+                exceeds action_scale, the transition is automatically split into N
+                sub-transitions with interpolated proprioception (linear) and
+                zero-order-hold images.
+            action_scale (float): Per-step action scale (= action_scale_per_s / fps).
+                The RL environment multiplies policy output by this to get the
+                actual delta. Default 5.0.
+            delta_state_key (str): The observation key containing joint positions to
+                compute deltas against. Default "observation.state".
 
         Returns:
             ReplayBuffer: The replay buffer with dataset transitions.
         """
-        if capacity is None:
-            capacity = len(lerobot_dataset)
+        # Convert dataset to transitions first (interpolation may add extra frames).
+        list_transition = cls._lerobotdataset_to_transitions(
+            dataset=lerobot_dataset,
+            state_keys=state_keys,
+            convert_to_delta=convert_to_delta,
+            action_scale=action_scale,
+            delta_state_key=delta_state_key,
+        )
 
-        if capacity < len(lerobot_dataset):
+        num_transitions = len(list_transition)
+        if capacity is None:
+            capacity = num_transitions
+
+        if capacity < num_transitions:
             raise ValueError(
-                "The capacity of the ReplayBuffer must be greater than or equal to the length of the LeRobotDataset."
+                f"ReplayBuffer capacity ({capacity}) is smaller than the number of "
+                f"transitions ({num_transitions}). With delta interpolation the "
+                f"count may exceed the raw dataset length ({len(lerobot_dataset)})."
             )
 
         # Create replay buffer with image augmentation and DrQ settings
@@ -498,9 +524,6 @@ class ReplayBuffer:
             storage_device=storage_device,
             optimize_memory=optimize_memory,
         )
-
-        # Convert dataset to transitions
-        list_transition = cls._lerobotdataset_to_transitions(dataset=lerobot_dataset, state_keys=state_keys)
 
         # Initialize the buffer with the first transition to set up storage tensors
         if list_transition:
@@ -654,36 +677,39 @@ class ReplayBuffer:
     def _lerobotdataset_to_transitions(
         dataset: LeRobotDataset,
         state_keys: Sequence[str] | None = None,
+        convert_to_delta: bool = False,
+        action_scale: float = 5.0,
+        delta_state_key: str = "observation.state",
     ) -> list[Transition]:
         """
         Convert a LeRobotDataset into a list of RL (s, a, r, s', done) transitions.
 
-        Args:
-            dataset (LeRobotDataset):
-                The dataset to convert. Each item in the dataset is expected to have
-                at least the following keys:
-                {
-                    "action": ...
-                    "next.reward": ...
-                    "next.done": ...
-                    "episode_index": ...
-                }
-                plus whatever your 'state_keys' specify.
+        When ``convert_to_delta=True``, absolute-position actions are converted to
+        delta actions in [-1, 1] suitable for an RL policy that outputs deltas.
 
-            state_keys (Sequence[str] | None):
-                The dataset keys to include in 'state' and 'next_state'. Their names
-                will be kept as-is in the output transitions. E.g.
-                ["observation.state", "observation.environment_state"].
-                If None, you must handle or define default keys.
+        If a single-frame delta would exceed ``action_scale`` (i.e. would be clipped
+        outside [-1, 1]), the transition is automatically split into *N* sub-
+        transitions so that every sub-action stays within [-1, 1].  For the
+        interpolated sub-steps:
+        * **Images** are repeated (zero-order hold).
+        * **Proprioception** (``delta_state_key``) is linearly interpolated.
+        * **Reward** and **done** are assigned only to the *last* sub-step;
+          intermediate sub-steps get reward=0 and done=False.
+
+        Args:
+            dataset: The LeRobotDataset to convert.
+            state_keys: Keys to include in ``state`` / ``next_state``.
+            convert_to_delta: Enable absolute → delta conversion + interpolation.
+            action_scale: Per-step scale (= ``action_scale_per_s / fps``).
+            delta_state_key: Observation key with current joint positions.
 
         Returns:
-            transitions (List[Transition]):
-                A list of Transition dictionaries with the same length as `dataset`.
+            A list of :class:`Transition` dicts.
         """
         if state_keys is None:
             raise ValueError("State keys must be provided when converting LeRobotDataset to Transitions.")
 
-        transitions = []
+        transitions: list[Transition] = []
         num_frames = len(dataset)
 
         # Check if the dataset has "next.done" key
@@ -694,9 +720,16 @@ class ReplayBuffer:
         complementary_info_keys = [key for key in sample if key.startswith("complementary_info.")]
         has_complementary_info = len(complementary_info_keys) > 0
 
-        # If not, we need to infer it from episode boundaries
         if not has_done_key:
-            print("'next.done' key not found in dataset. Inferring from episode boundaries...")
+            logging.info("'next.done' key not found in dataset. Inferring from episode boundaries...")
+
+        # Identify which state keys are images (zero-order hold) vs numeric (interpolate)
+        _image_state_keys = {k for k in state_keys if "image" in k}
+        _numeric_state_keys = {k for k in state_keys if k not in _image_state_keys}
+
+        # Stats for the interpolation warning
+        total_interpolated_frames = 0
+        total_interpolated_transitions = 0
 
         for i in tqdm(range(num_frames)):
             current_sample = dataset[i]
@@ -704,20 +737,14 @@ class ReplayBuffer:
             # ----- 1) Current state -----
             current_state: dict[str, torch.Tensor] = {}
             for key in state_keys:
-                val = current_sample[key]
-                current_state[key] = val.unsqueeze(0)  # Add batch dimension
+                current_state[key] = current_sample[key].unsqueeze(0)
 
-            # ----- 2) Action -----
-            action = current_sample[ACTION].unsqueeze(0)  # Add batch dimension
+            # ----- 2) Reward and done -----
+            reward = float(current_sample[REWARD].item())
 
-            # ----- 3) Reward and done -----
-            reward = float(current_sample[REWARD].item())  # ensure float
-
-            # Determine done flag - use next.done if available, otherwise infer from episode boundaries
             if has_done_key:
-                done = bool(current_sample[DONE].item())  # ensure bool
+                done = bool(current_sample[DONE].item())
             else:
-                # If this is the last frame or if next frame is in a different episode, mark as done
                 done = False
                 if i == num_frames - 1:
                     done = True
@@ -726,50 +753,100 @@ class ReplayBuffer:
                     if next_sample["episode_index"] != current_sample["episode_index"]:
                         done = True
 
-            # TODO: (azouitine) Handle truncation (using the same value as done for now)
             truncated = done
 
-            # ----- 4) Next state -----
-            # If not done and the next sample is in the same episode, we pull the next sample's state.
-            # Otherwise (done=True or next sample crosses to a new episode), next_state = current_state.
-            next_state = current_state  # default
+            # ----- 3) Next state -----
+            next_state = current_state  # default (terminal)
             if not done and (i < num_frames - 1):
                 next_sample = dataset[i + 1]
                 if next_sample["episode_index"] == current_sample["episode_index"]:
-                    # Build next_state from the same keys
                     next_state_data: dict[str, torch.Tensor] = {}
                     for key in state_keys:
-                        val = next_sample[key]
-                        next_state_data[key] = val.unsqueeze(0)  # Add batch dimension
+                        next_state_data[key] = next_sample[key].unsqueeze(0)
                     next_state = next_state_data
 
-            # ----- 5) Complementary info (if available) -----
+            # ----- 4) Complementary info -----
             complementary_info = None
             if has_complementary_info:
                 complementary_info = {}
                 for key in complementary_info_keys:
-                    # Strip the "complementary_info." prefix to get the actual key
-                    clean_key = key[len("complementary_info.") :]
+                    clean_key = key[len("complementary_info."):]
                     val = current_sample[key]
-                    # Handle tensor and non-tensor values differently
                     if isinstance(val, torch.Tensor):
-                        complementary_info[clean_key] = val.unsqueeze(0)  # Add batch dimension
+                        complementary_info[clean_key] = val.unsqueeze(0)
                     else:
-                        # TODO: (azouitine) Check if it's necessary to convert to tensor
-                        # For non-tensor values, use directly
                         complementary_info[clean_key] = val
 
-            # ----- Construct the Transition -----
-            transition = Transition(
-                state=current_state,
-                action=action,
-                reward=reward,
-                next_state=next_state,
-                done=done,
-                truncated=truncated,
-                complementary_info=complementary_info,
+            # ----- 5) Action (with optional delta conversion + interpolation) -----
+            if not convert_to_delta:
+                action = current_sample[ACTION].unsqueeze(0)
+                transitions.append(Transition(
+                    state=current_state, action=action, reward=reward,
+                    next_state=next_state, done=done, truncated=truncated,
+                    complementary_info=complementary_info,
+                ))
+                continue
+
+            # --- Delta conversion ---
+            obs_state = current_sample[delta_state_key]        # [action_dim]
+            raw_delta = current_sample[ACTION] - obs_state     # [action_dim]
+            max_abs_delta = raw_delta.abs().max().item()
+
+            N = max(1, math.ceil(max_abs_delta / action_scale))
+
+            if N == 1:
+                # No interpolation needed – delta fits within [-1, 1]
+                scaled_action = (raw_delta / action_scale).unsqueeze(0)
+                transitions.append(Transition(
+                    state=current_state, action=scaled_action, reward=reward,
+                    next_state=next_state, done=done, truncated=truncated,
+                    complementary_info=complementary_info,
+                ))
+            else:
+                # --- Interpolation: split into N sub-transitions ---
+                total_interpolated_frames += 1
+                total_interpolated_transitions += N - 1  # extra transitions added
+
+                sub_action = (raw_delta / N / action_scale).unsqueeze(0)  # [1, dim], in [-1,1]
+
+                for k in range(N):
+                    alpha_start = k / N
+                    alpha_end = (k + 1) / N
+
+                    # Build interpolated sub-state
+                    sub_state: dict[str, torch.Tensor] = {}
+                    sub_next: dict[str, torch.Tensor] = {}
+                    for key in state_keys:
+                        if key in _image_state_keys:
+                            # Zero-order hold: repeat current image
+                            sub_state[key] = current_state[key]
+                            sub_next[key] = current_state[key] if k < N - 1 else next_state[key]
+                        else:
+                            # Linear interpolation for proprioception
+                            interp_start = (obs_state + alpha_start * raw_delta).unsqueeze(0)
+                            interp_end = (obs_state + alpha_end * raw_delta).unsqueeze(0)
+                            sub_state[key] = interp_start
+                            sub_next[key] = interp_end if k < N - 1 else next_state[key]
+
+                    is_last = (k == N - 1)
+                    transitions.append(Transition(
+                        state=sub_state,
+                        action=sub_action,
+                        reward=reward if is_last else 0.0,
+                        next_state=sub_next,
+                        done=done if is_last else False,
+                        truncated=truncated if is_last else False,
+                        complementary_info=complementary_info if is_last else None,
+                    ))
+
+        if convert_to_delta and total_interpolated_frames > 0:
+            logging.warning(
+                f"[ReplayBuffer] Delta interpolation: {total_interpolated_frames}/{num_frames} "
+                f"original frames ({100*total_interpolated_frames/num_frames:.1f}%) had deltas "
+                f"exceeding action_scale={action_scale:.2f} and were split into sub-transitions. "
+                f"{total_interpolated_transitions} extra transitions added "
+                f"(total: {len(transitions)} from {num_frames} original frames)."
             )
-            transitions.append(transition)
 
         return transitions
 

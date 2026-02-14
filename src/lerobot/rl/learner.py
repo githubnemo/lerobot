@@ -339,16 +339,28 @@ def add_actor_information_and_train(
     log_training_info(cfg=cfg, policy=policy)
 
     replay_buffer = initialize_replay_buffer(cfg, device, storage_device)
-    batch_size = cfg.batch_size
+    total_batch_size = cfg.batch_size
     offline_replay_buffer = None
 
-    if cfg.dataset is not None:
+    # Compute per-buffer batch sizes from offline_sampling_ratio
+    offline_sampling_ratio = cfg.policy.offline_sampling_ratio
+    if cfg.dataset is not None and offline_sampling_ratio > 0.0:
         offline_replay_buffer = initialize_offline_replay_buffer(
             cfg=cfg,
             device=device,
             storage_device=storage_device,
         )
-        batch_size: int = batch_size // 2  # We will sample from both replay buffer
+        offline_batch_size = int(total_batch_size * offline_sampling_ratio)
+        online_batch_size = total_batch_size - offline_batch_size
+        logging.info(
+            f"[LEARNER] Offline sampling ratio: {offline_sampling_ratio:.2f} "
+            f"(online_batch={online_batch_size}, offline_batch={offline_batch_size})"
+        )
+    else:
+        offline_batch_size = 0
+        online_batch_size = total_batch_size
+        if cfg.dataset is not None and offline_sampling_ratio == 0.0:
+            logging.info("[LEARNER] offline_sampling_ratio=0.0 — skipping offline/expert buffer")
 
     logging.info("Starting learner thread")
     interaction_message = None
@@ -404,29 +416,35 @@ def add_actor_information_and_train(
             time.sleep(0.1)  # Small sleep to avoid busy loop when waiting
             continue
 
-        if online_iterator is None:
+        if online_iterator is None and online_batch_size > 0:
             online_iterator = replay_buffer.get_iterator(
-                batch_size=batch_size, async_prefetch=async_prefetch, queue_size=2,
+                batch_size=online_batch_size, async_prefetch=async_prefetch, queue_size=2,
                 num_recent=cer_num_recent  # CER: always include most recent samples
             )
             if use_cer:
                 logging.info(f"[LEARNER] CER enabled: always including {cer_num_recent} most recent samples in each batch")
 
-        if offline_replay_buffer is not None and offline_iterator is None:
+        if offline_replay_buffer is not None and offline_iterator is None and offline_batch_size > 0:
             offline_iterator = offline_replay_buffer.get_iterator(
-                batch_size=batch_size, async_prefetch=async_prefetch, queue_size=2
+                batch_size=offline_batch_size, async_prefetch=async_prefetch, queue_size=2
             )
 
         time_for_one_optimization_step = time.time()
         for _ in range(utd_ratio - 1):
             # Sample from the iterators
-            batch = next(online_iterator)
+            if online_batch_size > 0:
+                batch = next(online_iterator)
+            else:
+                batch = None
 
-            if dataset_repo_id is not None:
+            if offline_batch_size > 0 and offline_iterator is not None:
                 batch_offline = next(offline_iterator)
-                batch = concatenate_batch_transitions(
-                    left_batch_transitions=batch, right_batch_transition=batch_offline
-                )
+                if batch is not None:
+                    batch = concatenate_batch_transitions(
+                        left_batch_transitions=batch, right_batch_transition=batch_offline
+                    )
+                else:
+                    batch = batch_offline
 
             actions = batch[ACTION]
             rewards = batch["reward"]
@@ -480,13 +498,19 @@ def add_actor_information_and_train(
             policy.update_target_networks()
 
         # Sample for the last update in the UTD ratio
-        batch = next(online_iterator)
+        if online_batch_size > 0:
+            batch = next(online_iterator)
+        else:
+            batch = None
 
-        if dataset_repo_id is not None:
+        if offline_batch_size > 0 and offline_iterator is not None:
             batch_offline = next(offline_iterator)
-            batch = concatenate_batch_transitions(
-                left_batch_transitions=batch, right_batch_transition=batch_offline
-            )
+            if batch is not None:
+                batch = concatenate_batch_transitions(
+                    left_batch_transitions=batch, right_batch_transition=batch_offline
+                )
+            else:
+                batch = batch_offline
 
         actions = batch[ACTION]
         rewards = batch["reward"]
@@ -630,7 +654,7 @@ def add_actor_information_and_train(
                 try:
                     with torch.no_grad():
                         # Sample a batch of expert transitions
-                        expert_batch = offline_replay_buffer.sample(min(batch_size, len(offline_replay_buffer)))
+                        expert_batch = offline_replay_buffer.sample(min(total_batch_size, len(offline_replay_buffer)))
                         expert_obs = expert_batch["state"]
                         expert_actions = expert_batch[ACTION].to(device)
 
@@ -1131,13 +1155,19 @@ def initialize_offline_replay_buffer(
             root=dataset_offline_path,
         )
 
+    # Compute per-step action_scale early so cache can validate against it.
+    env_fps = cfg.env.fps if cfg.env is not None else 10
+    action_scale_per_s = cfg.env.action_scale_per_s if (cfg.env is not None and hasattr(cfg.env, "action_scale_per_s")) else 50.0
+    action_scale = action_scale_per_s / env_fps
+
     # Try loading cached replay buffer for faster startup
     cache_path = os.path.join(cfg.dataset.root or "", ".replay_buffer_cache.pt") if cfg.dataset.root else None
     if cache_path and os.path.exists(cache_path):
         try:
             cache = torch.load(cache_path, weights_only=False)  # nosec B614
             expected_frames = len(offline_dataset)
-            if cache.get("num_frames") == expected_frames:
+            cached_scale = cache.get("action_scale")
+            if cache.get("num_frames") == expected_frames and cached_scale == action_scale:
                 logging.info(f"Loading cached replay buffer ({expected_frames} frames)")
                 offline_replay_buffer = ReplayBuffer(
                     capacity=cache["capacity"],
@@ -1168,6 +1198,11 @@ def initialize_offline_replay_buffer(
             logging.warning(f"Failed to load cache: {e}. Rebuilding...")
 
     logging.info("Convert to a offline replay buffer (this may take a few minutes...)")
+    logging.info(
+        f"Converting absolute position actions to deltas "
+        f"(action_scale_per_s={action_scale_per_s}, fps={env_fps}, "
+        f"action_scale={action_scale:.2f} per step)"
+    )
     offline_replay_buffer = ReplayBuffer.from_lerobot_dataset(
         offline_dataset,
         device=device,
@@ -1175,6 +1210,9 @@ def initialize_offline_replay_buffer(
         storage_device=storage_device,
         optimize_memory=True,
         capacity=cfg.policy.offline_buffer_capacity,
+        convert_to_delta=True,
+        action_scale=action_scale,
+        delta_state_key="observation.state",
     )
 
     # Save cache for next time
@@ -1182,6 +1220,7 @@ def initialize_offline_replay_buffer(
         try:
             cache_data = {
                 "num_frames": len(offline_dataset),
+                "action_scale": action_scale,
                 "capacity": offline_replay_buffer.capacity,
                 "size": offline_replay_buffer.size,
                 "position": offline_replay_buffer.position,

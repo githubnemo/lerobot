@@ -1,0 +1,56 @@
+{
+  "mode": "record",
+  "device": "cpu",
+  "dataset": {
+    "repo_id": "nemo/cube_touch_dataset",
+    "root": "./data/cube_touch_dataset",
+    "task": "touch_cube",
+    "num_episodes_to_record": 50,
+    "push_to_hub": false
+  },
+  "env": {
+    "robot": {
+      "type": "so101_follower",
+      "port": "/dev/ttyACM1",
+      "id": "shabby",
+      "cameras": {
+        "front": {
+          "type": "opencv",
+          "index_or_path": 0,
+          "height": 480,
+          "width": 640,
+          "fps": 30,
+          "rotation": "ROTATE_180"
+        }
+      },
+      "use_degrees": false
+    },
+    "teleop": {
+      "type": "so101_leader",
+      "port": "/dev/ttyACM0",
+      "id": "shabby"
+    },
+    "processor": {
+      "control_mode": "leader",
+      "observation": {
+        "add_joint_velocity_to_observation": false,
+        "add_current_to_observation": false,
+        "display_cameras": true
+      },
+      "image_preprocessing": {
+        "resize_size": [128, 128]
+      },
+      "gripper": {
+        "use_gripper": true,
+        "gripper_penalty": 0.0
+      },
+      "reset": {
+        "fixed_reset_joint_positions": [0.0, 0.0, 0.0, 0.0, 0.0, 25.0],
+        "reset_time_s": 5.0,
+        "control_time_s": 30.0,
+        "terminate_on_success": true
+      },
+      "reward_classifier": null
+    }
+  }
+}

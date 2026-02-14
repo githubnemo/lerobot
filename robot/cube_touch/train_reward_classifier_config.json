@@ -1,0 +1,74 @@
+{
+  "output_dir": "outputs/reward_classifier/cube_touch",
+  "job_name": "cube_touch_reward_classifier",
+  "resume": false,
+  "seed": 1000,
+  "num_workers": 4,
+  "batch_size": 32,
+  "steps": 5000,
+  "log_freq": 100,
+  "save_checkpoint": true,
+  "save_freq": 1000,
+  "wandb": {
+    "enable": false,
+    "project": "cube_touch_reward_classifier"
+  },
+  "dataset": {
+    "repo_id": "nemo/cube_touch_dataset",
+    "root": "./data/cube_touch_dataset",
+    "image_transforms": {
+      "enable": true,
+      "max_num_transforms": 4,
+      "random_order": false,
+      "tfs": {
+        "resize": {
+          "weight": 1.0,
+          "type": "Resize",
+          "kwargs": {"size": [128, 128]}
+        },
+        "brightness": {
+          "weight": 1.0,
+          "type": "ColorJitter",
+          "kwargs": {"brightness": [0.8, 1.2]}
+        },
+        "contrast": {
+          "weight": 1.0,
+          "type": "ColorJitter",
+          "kwargs": {"contrast": [0.8, 1.2]}
+        },
+        "sharpness": {
+          "weight": 1.0,
+          "type": "SharpnessJitter",
+          "kwargs": {"sharpness": [0.5, 1.5]}
+        }
+      }
+    }
+  },
+  "policy": {
+    "type": "reward_classifier",
+    "push_to_hub": false,
+    "device": "cuda",
+    "use_amp": true,
+    "model_name": "helper2424/resnet10",
+    "num_classes": 2,
+    "hidden_dim": 256,
+    "latent_dim": 256,
+    "dropout_rate": 0.1,
+    "learning_rate": 0.0003,
+    "weight_decay": 0.01,
+    "grad_clip_norm": 1.0,
+    "pos_weight": 0,
+    "num_cameras": 1,
+    "input_features": {
+      "observation.images.front": {
+        "type": "VISUAL",
+        "shape": [3, 128, 128]
+      }
+    },
+    "output_features": {},
+    "normalization_mapping": {
+      "VISUAL": "MEAN_STD"
+    }
+  }
+}
+
