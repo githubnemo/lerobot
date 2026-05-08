@@ -13,14 +13,15 @@ TASK_NAME="cube_out_of_box"
 
 # Defaults
 POLICY_TYPE="smolvla"
-NUM_STEPS=5000
-BATCH_SIZE=1
+NUM_STEPS=20000
+BATCH_SIZE=16
 RESUME=false
 WANDB=false
 DEVICE="cuda"
 LOG_FREQ=100
-EVAL_FREQ=500
+EVAL_FREQ=2000
 SAVE_FREQ=5000
+IMAGE_AUG=false
 
 # Pretrained model paths for fine-tuning (use --policy.path instead of --policy.type)
 # Set to "" to train from scratch with --policy.type instead
@@ -42,6 +43,8 @@ while [ "$#" -gt 0 ]; do
             shift; DEVICE="$1" ;;
         --from-scratch)
             SMOLVLA_PRETRAINED="" ;;
+        --image-aug)
+            IMAGE_AUG=true ;;
         *)
             echo "Usage: $0 [--policy-type act|smolvla] [--steps N] [--batch-size N] [--resume] [--wandb] [--device cuda|cpu] [--from-scratch]"
             exit 1 ;;
@@ -83,6 +86,31 @@ if [ ! -d "$DATASET_ROOT" ]; then
     exit 1
 fi
 
+# Handle existing output directory
+if [ -d "$OUTPUT_DIR" ] && ! $RESUME; then
+    echo "WARNING: Output directory already exists: $OUTPUT_DIR"
+    echo ""
+    echo "Options:"
+    echo "  [d] Delete and retrain from scratch"
+    echo "  [r] Resume from last checkpoint"
+    echo "  [q] Quit"
+    echo ""
+    read -p "Choose [d/r/q]: " choice
+    case "$choice" in
+        d|D)
+            echo "Deleting $OUTPUT_DIR ..."
+            rm -rf "$OUTPUT_DIR"
+            ;;
+        r|R)
+            RESUME=true
+            ;;
+        *)
+            echo "Exiting."
+            exit 0
+            ;;
+    esac
+fi
+
 if $RESUME; then
     CHECKPOINT_PATH="$OUTPUT_DIR/checkpoints/last/pretrained_model/train_config.json"
     if [ ! -f "$CHECKPOINT_PATH" ]; then
@@ -115,13 +143,14 @@ else
         --job_name="${TASK_NAME}_il_${POLICY_TYPE}" \
         --policy.device="$DEVICE" \
         --policy.n_action_steps=10 \
+        --policy.use_amp=true \
         --policy.push_to_hub=false \
         --steps="$NUM_STEPS" \
         --batch_size="$BATCH_SIZE" \
         --log_freq="$LOG_FREQ" \
         --eval_freq="$EVAL_FREQ" \
         --save_freq="$SAVE_FREQ" \
-        --dataset.image_transforms.enable=true \
+        --dataset.image_transforms.enable=$IMAGE_AUG \
         --wandb.enable="$WANDB" \
         --wandb.project="${TASK_NAME}_il"
 fi

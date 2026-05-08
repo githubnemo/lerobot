@@ -8,6 +8,9 @@ export HF_HOME="/home/nemo/.cache/pysandbox-lerobot/huggingface"
 export DISPLAY=:0.0
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+# Run from repo root so relative paths resolve correctly
+REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+cd "$REPO_ROOT"
 TASK_NAME="cube_out_of_box"
 
 # Defaults (must match 1.1_train_il.sh)
@@ -18,6 +21,10 @@ EPISODE_TIME_S=30
 RESET_TIME_S=5
 FPS=10
 DISPLAY_DATA=true
+ROBOT_PORT="/dev/ttyACM1"
+USE_LEADER=false
+LEADER_PORT="/dev/ttyACM0"
+N_ACTION_STEPS=5
 
 while [ "$#" -gt 0 ]; do
     case $1 in
@@ -31,8 +38,16 @@ while [ "$#" -gt 0 ]; do
             shift; EPISODE_TIME_S="$1" ;;
         --fps)
             shift; FPS="$1" ;;
+        --robot-port)
+            shift; ROBOT_PORT="$1" ;;
+        --leader-port)
+            shift; LEADER_PORT="$1"; USE_LEADER=true ;;
+        --use-leader)
+            USE_LEADER=true ;;
+        --n-action-steps)
+            shift; N_ACTION_STEPS="$1" ;;
         *)
-            echo "Usage: $0 [--policy-path PATH] [--policy-type act|smolvla] [--num-episodes N] [--episode-time S] [--fps N]"
+            echo "Usage: $0 [--policy-path PATH] [--policy-type act|smolvla] [--num-episodes N] [--episode-time S] [--fps N] [--robot-port PORT] [--leader-port PORT] [--n-action-steps N]"
             exit 1 ;;
     esac
     shift
@@ -76,14 +91,18 @@ echo ""
 # Clean previous eval dataset if exists
 rm -rf "$EVAL_DATASET_ROOT" 2>/dev/null || true
 
+if $USE_LEADER; then
+    TELEOP_ARGS="--teleop.type=so101_leader --teleop.port=$LEADER_PORT --teleop.id=shabby"
+else
+    TELEOP_ARGS="--teleop.type=keyboard"
+fi
+
 lerobot-record \
     --robot.type=so101_follower \
-    --robot.port=/dev/ttyACM1 \
+    --robot.port="$ROBOT_PORT" \
     --robot.id=shabby \
     --robot.cameras='{front: {type: opencv, index_or_path: 0, width: 640, height: 480, fps: 30, rotation: ROTATE_180}}' \
-    --teleop.type=so101_leader \
-    --teleop.port=/dev/ttyACM0 \
-    --teleop.id=shabby \
+    $TELEOP_ARGS \
     --dataset.repo_id="hubnemo/eval_${TASK_NAME}_il" \
     --dataset.root="$EVAL_DATASET_ROOT" \
     --dataset.single_task="take cube out of box" \
@@ -94,7 +113,7 @@ lerobot-record \
     --display_data="$DISPLAY_DATA" \
     --play_sounds=false \
     --policy.path="$POLICY_PATH" \
-    --policy.n_action_steps=10
+    --policy.n_action_steps=$N_ACTION_STEPS
 
 echo ""
 echo "=============================================="

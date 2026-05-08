@@ -42,6 +42,8 @@ from lerobot.cameras.opencv import OpenCVCameraConfig
 from lerobot.cameras.configs import Cv2Rotation
 from lerobot.utils.robot_utils import precise_sleep
 
+from safety import SafetyLayer
+
 # --- Configuration ---
 CONFIG = {
     "port": "/dev/ttyACM0",
@@ -59,16 +61,22 @@ CONFIG = {
     "img_size": (64, 64),
     "use_camera": False,
     "use_joints": True,
-    "seed": 42,
+    "seed": 420,
     "use_bf16": True,
-    "pos_reward_weight": 1.0,
-    "torque_penalty_weight": 1.0, # 0.0 means off
+    "pos_reward_weight": 0.0,
+    "torque_penalty_weight": 100.0, # 0.0 means off
     "use_simple_torque": True, # True: sum(I^2), False: sigmoid(sum(I^2))
-    "policy_delay": 4, # Update policy every N steps
+    "policy_delay": 2, # Update policy every N steps
     "use_bn": False, # Use Batch Norm (XQC style) - broken right now.
+    "use_ln": True, # Use Layer Norm (SimBa/BRO style) - stable combo with WeightNorm
     "use_wn": True, # Use Weight Norm projection (XQC style)
     "use_reward_norm": False, # Use reward normalization - kind of broken right now.
+    "use_wandb": True, # Use Weights & Biases
+    "use_analysis": True, # Run post-training analysis (heatmaps, UMAP)
     "device": "cuda", # "cuda" or "cpu"
+    "safety_max_delta_deg": 5.0, # Max position change per step (degrees) — proactive
+    "safety_threshold_mA": 150.0, # Current below which RL has full authority
+    "safety_limit_mA": 400.0, # Current at which RL authority drops to zero
     "runs_dir": "robot/runs",
 }
 
@@ -93,6 +101,7 @@ TORQUE_PENALTY_WEIGHT = CONFIG["torque_penalty_weight"]
 USE_SIMPLE_TORQUE = CONFIG["use_simple_torque"]
 POLICY_DELAY = CONFIG["policy_delay"]
 USE_BN = CONFIG["use_bn"]
+USE_LN = CONFIG["use_ln"]
 USE_WN = CONFIG["use_wn"]
 SEED = CONFIG["seed"]
 USE_BF16 = CONFIG["use_bf16"]
@@ -114,7 +123,7 @@ class RunLogger:
             json.dump(config, f, indent=4)
 
         # Init wandb
-        self.use_wandb = HAS_WANDB
+        self.use_wandb = HAS_WANDB and USE_WANDB
         if self.use_wandb:
             try:
                 wandb.init(project="minimal-rl", name=run_name, config=config,
@@ -195,25 +204,42 @@ class RunLogger:
         kl_ji = 0.5 * ((var_j / var_i).sum() + (diff**2 / var_i).sum() - d + np.log(var_i / var_j).sum())
         return max(0.5 * (kl_ij + kl_ji), 0.0)
 
-    def _plot_umap_panels(self, embedding, states, std, timestamps, title_prefix, filename, sizes=None):
-        """Shared 3-panel UMAP scatter plot."""
-        fig, axes = plt.subplots(1, 3, figsize=(20, 6))
+    def _plot_umap_panels(self, embedding, states, std, timestamps, ep_ids, ep_steps, title_prefix, filename, sizes=None):
+        """Shared 6-panel UMAP scatter plot."""
+        fig, axes = plt.subplots(2, 3, figsize=(20, 12))
+        axes = axes.flatten()
         fig.suptitle(title_prefix, fontsize=14, y=1.02)
         s = sizes if sizes is not None else 8
 
+        # 1. Timestep (Total)
         sc0 = axes[0].scatter(embedding[:, 0], embedding[:, 1], c=timestamps, cmap="viridis", s=s, alpha=0.7)
-        axes[0].set_title("Colored by timestep")
-        plt.colorbar(sc0, ax=axes[0], label="Avg step" if sizes is not None else "Step")
+        axes[0].set_title("Total Timestep")
+        plt.colorbar(sc0, ax=axes[0], label="Step")
 
+        # 2. Episode ID
+        sc1 = axes[1].scatter(embedding[:, 0], embedding[:, 1], c=ep_ids, cmap="tab20", s=s, alpha=0.7)
+        axes[1].set_title("Episode ID")
+        plt.colorbar(sc1, ax=axes[1], label="Ep")
+
+        # 3. Timestep in Episode
+        sc2 = axes[2].scatter(embedding[:, 0], embedding[:, 1], c=ep_steps, cmap="plasma", s=s, alpha=0.7)
+        axes[2].set_title("Timestep in Episode")
+        plt.colorbar(sc2, ax=axes[2], label="Ep Step")
+
+        # 4. Policy Entropy
         entropy = np.sum(np.log(std + 1e-8), axis=1)
-        sc1 = axes[1].scatter(embedding[:, 0], embedding[:, 1], c=entropy, cmap="coolwarm", s=s, alpha=0.7)
-        axes[1].set_title("Colored by policy entropy")
-        plt.colorbar(sc1, ax=axes[1], label="Σ log(σ)")
+        sc3 = axes[3].scatter(embedding[:, 0], embedding[:, 1], c=entropy, cmap="coolwarm", s=s, alpha=0.7)
+        axes[3].set_title("Policy Entropy")
+        plt.colorbar(sc3, ax=axes[3], label="Σ log(σ)")
 
+        # 5. Distance to Home
         dist_home = np.linalg.norm(states, axis=1)
-        sc2 = axes[2].scatter(embedding[:, 0], embedding[:, 1], c=dist_home, cmap="magma", s=s, alpha=0.7)
-        axes[2].set_title("Colored by dist-to-home")
-        plt.colorbar(sc2, ax=axes[2], label="||q - q_home||")
+        sc4 = axes[4].scatter(embedding[:, 0], embedding[:, 1], c=dist_home, cmap="magma", s=s, alpha=0.7)
+        axes[4].set_title("Dist-to-home")
+        plt.colorbar(sc4, ax=axes[4], label="||q - q_home||")
+
+        # 6. Empty or just repeat one for now
+        axes[5].axis("off")
 
         plt.tight_layout()
         path = self.run_dir / filename
@@ -239,7 +265,7 @@ class RunLogger:
             print(f"  UMAP failed: {e}")
             return None
 
-    def plot_umap_knn_density(self, states, mu, std, timestamps, episode_ends,
+    def plot_umap_knn_density(self, states, mu, std, timestamps, ep_ids, ep_steps, episode_ends,
                               k=30, filename="umap_knn_density.jpg"):
         """k-NN + analytical transition density UMAP.
         Uses Euclidean k-NN for candidate neighbors, then evaluates the
@@ -262,6 +288,8 @@ class RunLogger:
             mu = mu[idx]
             std = std[idx]
             timestamps = timestamps[idx]
+            ep_ids = ep_ids[idx]
+            ep_steps = ep_steps[idx]
             n = max_pts
 
         k_actual = min(k, n - 1)
@@ -324,10 +352,10 @@ class RunLogger:
             if embedding is None:
                 return
 
-        self._plot_umap_panels(embedding, states, std, timestamps,
+        self._plot_umap_panels(embedding, states, std, timestamps, ep_ids, ep_steps,
                                f"UMAP k-NN + analytical density (k={k_actual})", filename)
 
-    def plot_umap_full_density(self, states, mu, std, timestamps,
+    def plot_umap_full_density(self, states, mu, std, timestamps, ep_ids, ep_steps,
                                filename="umap_full_density.jpg"):
         """Full pairwise UMAP using analytical transition density (not KL)."""
         if not HAS_UMAP:
@@ -346,6 +374,8 @@ class RunLogger:
             mu = mu[idx]
             std = std[idx]
             timestamps = timestamps[idx]
+            ep_ids = ep_ids[idx]
+            ep_steps = ep_steps[idx]
             n = max_pts
 
         stds_safe = np.maximum(std, 1e-6)
@@ -376,10 +406,10 @@ class RunLogger:
         if embedding is None:
             return
 
-        self._plot_umap_panels(embedding, states, std, timestamps,
+        self._plot_umap_panels(embedding, states, std, timestamps, ep_ids, ep_steps,
                                "UMAP full analytical density", filename)
 
-    def plot_umap_full_kl(self, states, mu, std, timestamps,
+    def plot_umap_full_kl(self, states, mu, std, timestamps, ep_ids, ep_steps,
                           filename="umap_full_kl.jpg"):
         """Full pairwise UMAP using symmetrized KL divergence between policy distributions."""
         if not HAS_UMAP:
@@ -399,6 +429,8 @@ class RunLogger:
             mu = mu[idx]
             std = std[idx]
             timestamps = timestamps[idx]
+            ep_ids = ep_ids[idx]
+            ep_steps = ep_steps[idx]
             n = max_pts
 
         print(f"  Computing {n}x{n} pairwise KL distances...")
@@ -413,7 +445,7 @@ class RunLogger:
         if embedding is None:
             return
 
-        self._plot_umap_panels(embedding, states, std, timestamps,
+        self._plot_umap_panels(embedding, states, std, timestamps, ep_ids, ep_steps,
                                "UMAP full pairwise KL", filename)
 
 class RunningMeanStd(nn.Module):
@@ -461,33 +493,42 @@ def weight_normalize_(module):
                     continue
                 m.weight.data = F.normalize(m.weight.data, dim=1)
 
-def make_mlp(in_dim, out_dim, hidden_dim=256, use_bn=False):
-    """Utility to build MLP with optional BatchNorm (XQC style: Linear -> BN -> ReLU)."""
+def make_mlp(in_dim, out_dim, hidden_dim=256, use_bn=False, use_ln=False):
+    """Utility to build MLP with optional BatchNorm (XQC) or LayerNorm (SimBa/BRO).
+    Order: Linear -> Norm -> ReLU.  LayerNorm is safer than BatchNorm for RL
+    (no train/eval mismatch, no target-net desync).
+    """
     layers = []
-    # If using BN, XQC usually starts with a BN on raw input
+    # If using BN, XQC starts with a BN on raw input (per-feature normalization).
+    # LN on raw input is less standard; we skip it.
     if use_bn:
         layers.append(nn.BatchNorm1d(in_dim))
-    
+
     # Layer 1
     layers.append(nn.Linear(in_dim, hidden_dim))
     if use_bn:
         layers.append(nn.BatchNorm1d(hidden_dim))
+    elif use_ln:
+        layers.append(nn.LayerNorm(hidden_dim))
     layers.append(nn.ReLU())
-    
+
     # Layer 2
     layers.append(nn.Linear(hidden_dim, hidden_dim))
     if use_bn:
         layers.append(nn.BatchNorm1d(hidden_dim))
+    elif use_ln:
+        layers.append(nn.LayerNorm(hidden_dim))
     layers.append(nn.ReLU())
-    
+
     return nn.Sequential(*layers)
 
 class TinyEncoder(nn.Module):
-    def __init__(self, state_dim, img_shape=(3, 64, 64), use_camera=False, use_joints=True, use_bn=False):
+    def __init__(self, state_dim, img_shape=(3, 64, 64), use_camera=False, use_joints=True, use_bn=False, use_ln=False):
         super().__init__()
         self.use_camera = use_camera
         self.use_joints = use_joints
         self.use_bn = use_bn
+        self.use_ln = use_ln
         if self.use_camera:
             self.cnn = nn.Sequential(
                 nn.Conv2d(3, 16, 3, stride=2, padding=1), nn.ReLU(),
@@ -507,7 +548,7 @@ class TinyEncoder(nn.Module):
 
         self.fc = nn.Sequential(
             nn.Linear(in_dim, 256),
-            nn.BatchNorm1d(256) if use_bn else nn.LayerNorm(256),
+            nn.BatchNorm1d(256) if use_bn else (nn.LayerNorm(256) if use_ln else nn.Identity()),
             nn.ReLU()
         )
         self.out_dim = 256
@@ -527,9 +568,9 @@ class TinyEncoder(nn.Module):
         return self.fc(x)
 
 class Actor(nn.Module):
-    def __init__(self, input_dim, action_dim, use_bn=False):
+    def __init__(self, input_dim, action_dim, use_bn=False, use_ln=False):
         super().__init__()
-        self.net = make_mlp(input_dim, 256, use_bn=use_bn)
+        self.net = make_mlp(input_dim, 256, use_bn=use_bn, use_ln=use_ln)
         self.mu = nn.Linear(256, action_dim)
         self.log_std = nn.Linear(256, action_dim)
 
@@ -549,12 +590,12 @@ class Actor(nn.Module):
         return action, log_prob.sum(dim=-1, keepdim=True)
 
 class Critic(nn.Module):
-    def __init__(self, input_dim, action_dim, use_bn=False):
+    def __init__(self, input_dim, action_dim, use_bn=False, use_ln=False):
         super().__init__()
-        self.q1_net = make_mlp(input_dim + action_dim, 256, use_bn=use_bn)
+        self.q1_net = make_mlp(input_dim + action_dim, 256, use_bn=use_bn, use_ln=use_ln)
         self.q1_head = nn.Linear(256, 1)
         
-        self.q2_net = make_mlp(input_dim + action_dim, 256, use_bn=use_bn)
+        self.q2_net = make_mlp(input_dim + action_dim, 256, use_bn=use_bn, use_ln=use_ln)
         self.q2_head = nn.Linear(256, 1)
 
     def forward(self, x, a):
@@ -666,17 +707,33 @@ def run_umap_analysis(encoder, actor, replay_buffer, q_home, motor_names_pos, de
     all_q_raw = []
     all_img = []
     episode_ends = []
+    ep_ids = []
+    ep_steps = []
+    
+    curr_ep_id = 0
+    curr_ep_step = 0
+    
     for idx, (img, q, a, r, ni, nq, done) in enumerate(replay_buffer):
         all_q.append(q)
         all_q_raw.append(q.numpy().flatten() * 100.0)
         if img is not None:
             all_img.append(img)
+        
+        ep_ids.append(curr_ep_id)
+        ep_steps.append(curr_ep_step)
+        
         if done:
             episode_ends.append(idx)
+            curr_ep_id += 1
+            curr_ep_step = 0
+        else:
+            curr_ep_step += 1
 
     timestamps = np.arange(len(all_q))
     all_q_raw = np.array(all_q_raw) - q_home
     episode_ends = np.array(episode_ends)
+    ep_ids = np.array(ep_ids)
+    ep_steps = np.array(ep_steps)
 
     # Batch forward pass to get policy (mu, std) for every state
     batch_sz = 256
@@ -698,20 +755,20 @@ def run_umap_analysis(encoder, actor, replay_buffer, q_home, motor_names_pos, de
 
     # 1. k-NN + analytical transition density (fast, best quality)
     print("UMAP 1/4: k-NN + analytical density (fast)...")
-    logger.plot_umap_knn_density(all_q_raw, all_mu, all_std, timestamps, episode_ends)
+    logger.plot_umap_knn_density(all_q_raw, all_mu, all_std, timestamps, ep_ids, ep_steps, episode_ends)
 
     # 2. Full pairwise analytical density (slow, for comparison)
     print("UMAP 2/4: Full pairwise analytical density (slow)...")
-    logger.plot_umap_full_density(all_q_raw, all_mu, all_std, timestamps)
+    logger.plot_umap_full_density(all_q_raw, all_mu, all_std, timestamps, ep_ids, ep_steps)
 
     # 3. Full pairwise symmetrized KL (slow, behavioral distance)
     print("UMAP 3/4: Full pairwise KL divergence (slow)...")
-    logger.plot_umap_full_kl(all_q_raw, all_mu, all_std, timestamps)
+    logger.plot_umap_full_kl(all_q_raw, all_mu, all_std, timestamps, ep_ids, ep_steps)
 
     # 4. k-NN + analytical density with larger k (comparison)
     print("UMAP 4/4: k-NN + analytical density k=50 (fast)...")
-    logger.plot_umap_knn_density(all_q_raw, all_mu, all_std, timestamps, episode_ends,
-                                 k=50, filename="umap_knn_density_k50.png")
+    logger.plot_umap_knn_density(all_q_raw, all_mu, all_std, timestamps, ep_ids, ep_steps, episode_ends,
+                                 k=50, filename="umap_knn_density_k50.jpg")
 
 def main():
     parser = argparse.ArgumentParser()
@@ -727,8 +784,14 @@ def main():
     parser.add_argument("--use-sigmoid-torque", action="store_true", help="Use sigmoid instead of simple squared torque")
     parser.add_argument("--policy-delay", type=int, default=CONFIG["policy_delay"], help="Update policy every N steps")
     parser.add_argument("--bn", action="store_true", default=CONFIG["use_bn"], help="Use Batch Norm (XQC style)")
+    parser.add_argument("--no-ln", action="store_true", help="Disable Layer Norm (SimBa/BRO style)")
     parser.add_argument("--wn", action="store_true", default=CONFIG["use_wn"], help="Use Weight Norm projection (XQC style)")
     parser.add_argument("--reward-norm", action="store_true", default=CONFIG["use_reward_norm"], help="Enable reward normalization")
+    parser.add_argument("--no-wandb", action="store_true", help="Disable Weights & Biases")
+    parser.add_argument("--no-analysis", action="store_true", help="Disable post-training analysis")
+    parser.add_argument("--safety-max-delta", type=float, default=CONFIG["safety_max_delta_deg"], help="Max degrees per step (safety)")
+    parser.add_argument("--safety-threshold", type=float, default=CONFIG["safety_threshold_mA"], help="Current (mA) below which full authority")
+    parser.add_argument("--safety-limit", type=float, default=CONFIG["safety_limit_mA"], help="Current (mA) at which authority=0")
     args = parser.parse_args()
 
     # Override config with args
@@ -741,6 +804,8 @@ def main():
     CONFIG["torque_penalty_weight"] = args.torque_weight
     CONFIG["policy_delay"] = args.policy_delay
     CONFIG["use_bn"] = args.bn
+    if args.no_ln:
+        CONFIG["use_ln"] = False
     CONFIG["use_wn"] = args.wn
     CONFIG["use_reward_norm"] = args.reward_norm
     if args.no_joints:
@@ -749,6 +814,13 @@ def main():
         CONFIG["use_bf16"] = False
     if args.use_sigmoid_torque:
         CONFIG["use_simple_torque"] = False
+    if args.no_wandb:
+        CONFIG["use_wandb"] = False
+    if args.no_analysis:
+        CONFIG["use_analysis"] = False
+    CONFIG["safety_max_delta_deg"] = args.safety_max_delta
+    CONFIG["safety_threshold_mA"] = args.safety_threshold
+    CONFIG["safety_limit_mA"] = args.safety_limit
 
     # 0. Set Seed
     random.seed(CONFIG["seed"])
@@ -760,7 +832,7 @@ def main():
     torch.backends.cudnn.benchmark = False
 
     # Mapping for easier access in code
-    global PORT, ROBOT_ID, FPS, LR, BATCH_SIZE, BUFFER_SIZE, GAMMA, TAU, ALPHA_INIT, UTD_RATIO, WARMUP_STEPS, MAX_EPISODE_STEPS, IMG_SIZE, USE_CAMERA, USE_JOINTS, POS_REWARD_WEIGHT, TORQUE_PENALTY_WEIGHT, USE_SIMPLE_TORQUE, POLICY_DELAY, USE_BN, USE_WN, USE_REWARD_NORM, SEED, USE_BF16, RUNS_DIR
+    global PORT, ROBOT_ID, FPS, LR, BATCH_SIZE, BUFFER_SIZE, GAMMA, TAU, ALPHA_INIT, UTD_RATIO, WARMUP_STEPS, MAX_EPISODE_STEPS, IMG_SIZE, USE_CAMERA, USE_JOINTS, POS_REWARD_WEIGHT, TORQUE_PENALTY_WEIGHT, USE_SIMPLE_TORQUE, POLICY_DELAY, USE_BN, USE_LN, USE_WN, USE_REWARD_NORM, USE_WANDB, USE_ANALYSIS, SEED, USE_BF16, RUNS_DIR
     PORT = CONFIG["port"]
     ROBOT_ID = CONFIG["robot_id"]
     FPS = CONFIG["fps"]
@@ -781,8 +853,11 @@ def main():
     USE_SIMPLE_TORQUE = CONFIG["use_simple_torque"]
     POLICY_DELAY = CONFIG["policy_delay"]
     USE_BN = CONFIG["use_bn"]
+    USE_LN = CONFIG["use_ln"]
     USE_WN = CONFIG["use_wn"]
     USE_REWARD_NORM = CONFIG["use_reward_norm"]
+    USE_WANDB = CONFIG["use_wandb"]
+    USE_ANALYSIS = CONFIG["use_analysis"]
     SEED = CONFIG["seed"]
     USE_BF16 = CONFIG["use_bf16"]
     RUNS_DIR = Path(CONFIG["runs_dir"])
@@ -820,11 +895,22 @@ def main():
     q_home = np.array([0.0, 0.0, 0.0, 0.0, 0.0, 25.0])
     print(f"Target home position: {dict(zip(motor_names, q_home))}")
 
+    # Safety Layer
+    safety = SafetyLayer(
+        robot.bus, motor_names,
+        max_delta_deg=CONFIG["safety_max_delta_deg"],
+        current_threshold_mA=CONFIG["safety_threshold_mA"],
+        current_limit_mA=CONFIG["safety_limit_mA"],
+    )
+    print(f"Safety: max_delta={CONFIG['safety_max_delta_deg']}° "
+          f"threshold={CONFIG['safety_threshold_mA']}mA "
+          f"limit={CONFIG['safety_limit_mA']}mA")
+
     # 2. Init Models
-    encoder = TinyEncoder(state_dim=action_dim, use_camera=USE_CAMERA, use_joints=USE_JOINTS, use_bn=USE_BN).to(device)
-    actor = Actor(encoder.out_dim, action_dim, use_bn=USE_BN).to(device)
-    critic = Critic(encoder.out_dim, action_dim, use_bn=USE_BN).to(device)
-    critic_target = Critic(encoder.out_dim, action_dim, use_bn=USE_BN).to(device)
+    encoder = TinyEncoder(state_dim=action_dim, use_camera=USE_CAMERA, use_joints=USE_JOINTS, use_bn=USE_BN, use_ln=USE_LN).to(device)
+    actor = Actor(encoder.out_dim, action_dim, use_bn=USE_BN, use_ln=USE_LN).to(device)
+    critic = Critic(encoder.out_dim, action_dim, use_bn=USE_BN, use_ln=USE_LN).to(device)
+    critic_target = Critic(encoder.out_dim, action_dim, use_bn=USE_BN, use_ln=USE_LN).to(device)
     critic_target.load_state_dict(critic.state_dict())
     critic_target.eval()
 
@@ -869,22 +955,20 @@ def main():
                 encoder.eval(); actor.eval(); critic.eval()
                 with torch.no_grad():
                     feat = encoder(img, q_torch)
-                    if total_steps < WARMUP_STEPS:
-                        action_torch = torch.empty(1, action_dim).uniform_(-1, 1).to(device)
-                    else:
-                        action_torch, _ = actor.sample(feat)
+                    #if total_steps < WARMUP_STEPS:
+                    #    action_torch = torch.empty(1, action_dim).uniform_(-1, 1).to(device)
+                    #else:
+                    action_torch, _ = actor.sample(feat)
                 
                 # Act
                 action_np = action_torch.cpu().numpy()[0]
-                # Map -1..1 to delta actions around current pos
                 curr_q_vals = np.array([obs_dict[k] for k in motor_names_pos])
-                # Small delta: each action step moves max 5 degrees
                 target_q_vals = curr_q_vals + action_np * 5.0
-                # Clamp target to home +/- 45 deg or some safety range
                 target_q_vals = np.clip(target_q_vals, q_home - 45, q_home + 45)
                 
-                robot_action = {name: float(val) for name, val in zip(motor_names_pos, target_q_vals)}
-                robot.send_action(robot_action)
+                # Safety filter: clamp step + attenuate by current
+                q_safe, safety_info = safety(target_q_vals, q_home=q_home)
+                robot.send_action({name: float(val) for name, val in zip(motor_names_pos, q_safe)})
                 
                 # Wait for next step and get next obs
                 precise_sleep(max(1.0/FPS - (time.perf_counter() - t_start), 0))
@@ -895,13 +979,10 @@ def main():
                 loss_q_val, loss_a_val, mean_q_val = 0, 0, 0
                 alpha_val = log_alpha.exp().item()
                 
-                # Read Torque first for reward and logging
-                try:
-                    current_dict = robot.bus.sync_read("Present_Current")
-                    currents = [current_dict.get(name.removesuffix(".pos"), 0) for name in motor_names_pos]
-                    torque_sq_sum = sum(c ** 2 for c in currents) / 1000.0
-                except:
-                    torque_sq_sum = 0
+                # Torque from safety layer (already read, no extra bus call)
+                currents = safety_info["currents"]
+                torque_sq_sum = float(np.sum(currents ** 2)) / 1000.0
+                safety_attenuation = float(safety_info["attenuation"].mean())
 
                 # Reward: distance to home (punish moving away)
                 current_q = np.array([next_obs_dict[k] for k in motor_names_pos])
@@ -1047,6 +1128,7 @@ def main():
                     "q_val": float(mean_q_val),
                     "hz": float(actual_hz),
                     "alpha": float(alpha_val),
+                    "safety_atten": float(safety_attenuation),
                 }
                 if TORQUE_PENALTY_WEIGHT > 0:
                     step_metrics["torque_penalty"] = float(torque_penalty)
@@ -1056,7 +1138,7 @@ def main():
                 if total_steps % 10 == 0:
                     print(f"Ep: {episode_num:3d} | Step: {episode_steps:3d}/{MAX_EPISODE_STEPS} | "
                           f"Rew: {reward:6.2f} (P:{POS_REWARD_WEIGHT*reward_pos:5.1f} T:-{TORQUE_PENALTY_WEIGHT*torque_penalty:4.1f}) | "
-                          f"Q: {mean_q_val:6.2f} | T: {torque_sq_sum:4.1f}k | Hz: {actual_hz:4.1f} | A: {alpha_val:.3f}")
+                          f"Q: {mean_q_val:6.2f} | T: {torque_sq_sum:4.1f}k | Hz: {actual_hz:4.1f} | A: {alpha_val:.3f} | S: {safety_attenuation:.0%}")
                 
                 if done:
                     avg_rew = episode_reward / episode_steps
@@ -1067,8 +1149,9 @@ def main():
         print("\nStopping RL loop.")
     finally:
         logger.plot()
-        run_post_analysis(encoder, actor, critic, q_home, motor_names_pos, device, last_img_cache, logger)
-        run_umap_analysis(encoder, actor, replay_buffer, q_home, motor_names_pos, device, logger)
+        if USE_ANALYSIS:
+            run_post_analysis(encoder, actor, critic, q_home, motor_names_pos, device, last_img_cache, logger)
+            run_umap_analysis(encoder, actor, replay_buffer, q_home, motor_names_pos, device, logger)
         logger.finish()
         if USE_CAMERA:
             try:

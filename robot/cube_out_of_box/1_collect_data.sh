@@ -8,7 +8,29 @@ export HF_HOME="/home/nemo/.cache/pysandbox-lerobot/huggingface"
 export DISPLAY=:0.0
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+cd "$REPO_ROOT"
 DATASET_ROOT="./data/cube_out_of_box_dataset"
+
+# Defaults
+NUM_EPISODES=20
+ROBOT_PORT="/dev/ttyACM1"
+LEADER_PORT="/dev/ttyACM0"
+
+while [ "$#" -gt 0 ]; do
+    case $1 in
+        --num-episodes)
+            shift; NUM_EPISODES="$1" ;;
+        --robot-port)
+            shift; ROBOT_PORT="$1" ;;
+        --leader-port)
+            shift; LEADER_PORT="$1" ;;
+        *)
+            echo "Usage: $0 [--num-episodes N] [--robot-port PORT] [--leader-port PORT]"
+            exit 1 ;;
+    esac
+    shift
+done
 
 echo "=============================================="
 echo "    CUBE OUT OF BOX - DATA COLLECTION"
@@ -86,16 +108,16 @@ echo ""
 # Cameras are passed as a YAML/JSON string
 python -m lerobot.scripts.lerobot_record \
     --robot.type=so101_follower \
-    --robot.port=/dev/ttyACM1 \
+    --robot.port="$ROBOT_PORT" \
     --robot.id=shabby \
     --robot.cameras='{front: {type: opencv, index_or_path: 0, width: 640, height: 480, fps: 30, rotation: ROTATE_180}}' \
     --teleop.type=so101_leader \
-    --teleop.port=/dev/ttyACM0 \
+    --teleop.port="$LEADER_PORT" \
     --teleop.id=shabby \
     --dataset.repo_id=hubnemo/cube_out_of_box_dataset \
     --dataset.root="$DATASET_ROOT" \
     --dataset.single_task="take cube out of box" \
-    --dataset.num_episodes=20 \
+    --dataset.num_episodes="$NUM_EPISODES" \
     --dataset.fps=10 \
     --dataset.vcodec=h264 \
     --dataset.reset_time_s=5 \

@@ -1226,6 +1226,8 @@ class SerialMotorsBus(MotorsBusBase):
 
         ids_values = self._get_ids_values_dict(values)
         models = [self._id_to_model(id_) for id_ in ids_values]
+        if not models:
+            return  # No motors to write to (can happen at shutdown with empty action)
         if self._has_different_ctrl_tables:
             assert_same_address(self.model_ctrl_table, models, data_name)
 
