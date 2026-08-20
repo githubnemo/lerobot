@@ -1,0 +1,125 @@
+{
+  "upstream_repository": "https://github.com/mimic-video/mimic-video",
+  "upstream_commit": "e3355dbc93132b576c02f920a59b4fc18a4f5906",
+  "license": "Apache-2.0",
+  "entries": [
+    {
+      "upstream_path": "model/cosmos_predict2/models/text2image_dit.py",
+      "vendored_path": "src/lerobot/policies/vam/_vendor/cosmos_predict2/models/text2image_dit.py",
+      "upstream_sha256": "f7eab2ded2aaf91482c4c0d47effa48e5129ad5e951ab4f63d51d35abaaf9072",
+      "vendored_sha256": "8c2316850456cc4698dc5f3202f01a63bc5160fca4b3f311778c0472e8c938ba",
+      "modifications": [
+        "relative imports",
+        "lazy Transformer Engine loading at model construction; official TE RMSNorm and fused rotary retained for minimal_a2a",
+        "TE API compatibility: import apply_rotary_pos_emb from attention.rope with legacy attention fallback; DotProductAttention remains from attention"
+      ]
+    },
+    {
+      "upstream_path": "model/cosmos_predict2/models/video2world_dit.py",
+      "vendored_path": "src/lerobot/policies/vam/_vendor/cosmos_predict2/models/video2world_dit.py",
+      "upstream_sha256": "9e9fe28b5d7d5ee62865af807b3281c4aa4bfa173536e821a25eb7d93ddd91aa",
+      "vendored_sha256": "60b2c24457126f82bd8bef92eb16c7a65c7e8d4d60e9fa5c85ccde7ee46ae3c9",
+      "modifications": [
+        "relative imports"
+      ]
+    },
+    {
+      "upstream_path": "model/cosmos_predict2/module/a2a_cp.py",
+      "vendored_path": "src/lerobot/policies/vam/_vendor/cosmos_predict2/module/a2a_cp.py",
+      "upstream_sha256": "6e2281a85f057e8fd48e50ee499b5597d69d7185646e9cab00464b8bfc38b5a7",
+      "vendored_sha256": "f280ea1c2abf026d4699d8f3530682d26ef8b471cfdead5da528a1125eba4f0f",
+      "modifications": [
+        "relative attention import"
+      ]
+    },
+    {
+      "upstream_path": "model/cosmos_predict2/module/attention.py",
+      "vendored_path": "src/lerobot/policies/vam/_vendor/cosmos_predict2/module/attention.py",
+      "upstream_sha256": "86dd7ed695bd5f64789b3ed3b6c46f8ad1382820030d47bdd49c82adf4de91d2",
+      "vendored_sha256": "86dd7ed695bd5f64789b3ed3b6c46f8ad1382820030d47bdd49c82adf4de91d2",
+      "modifications": []
+    },
+    {
+      "upstream_path": "model/cosmos_predict2/networks/model_weights_stats.py",
+      "vendored_path": "src/lerobot/policies/vam/_vendor/cosmos_predict2/networks/model_weights_stats.py",
+      "upstream_sha256": "b7295540f2606e4dad04681b6aa33bc4935214948192755a6b117e73a0c48b2b",
+      "vendored_sha256": "b7295540f2606e4dad04681b6aa33bc4935214948192755a6b117e73a0c48b2b",
+      "modifications": []
+    },
+    {
+      "upstream_path": "model/cosmos_predict2/networks/selective_activation_checkpoint.py",
+      "vendored_path": "src/lerobot/policies/vam/_vendor/cosmos_predict2/networks/selective_activation_checkpoint.py",
+      "upstream_sha256": "0aa5c99df99a7809a84e668291f507a2856a90d8b37ca6a014de3f45d4785ee8",
+      "vendored_sha256": "0aa5c99df99a7809a84e668291f507a2856a90d8b37ca6a014de3f45d4785ee8",
+      "modifications": []
+    },
+    {
+      "upstream_path": "model/cosmos_predict2/tokenizers/tokenizer.py",
+      "vendored_path": "src/lerobot/policies/vam/_vendor/cosmos_predict2/tokenizers/tokenizer.py",
+      "upstream_sha256": "52ec9ba845420a0f052eba81ffea5e60d67bf7828be7f54be6f7ab4d8c5ccd5a",
+      "vendored_sha256": "0e22b126163dfcb2eba9e400a8595bbf85502df0885ba818109e220e92ed0077",
+      "modifications": [
+        "relative imports",
+        "explicit device/dtype constructor arguments"
+      ]
+    },
+    {
+      "upstream_path": "model/cosmos_predict2/tokenizers/interface.py",
+      "vendored_path": "src/lerobot/policies/vam/_vendor/cosmos_predict2/tokenizers/interface.py",
+      "upstream_sha256": "4406f1b0c14deaa734251bdb6cdbd836327b1ea65ac7195b76e967469e60f1fa",
+      "vendored_sha256": "4406f1b0c14deaa734251bdb6cdbd836327b1ea65ac7195b76e967469e60f1fa",
+      "modifications": []
+    },
+    {
+      "upstream_path": "model/cosmos_predict2/utils/context_parallel.py",
+      "vendored_path": "src/lerobot/policies/vam/_vendor/cosmos_predict2/utils/context_parallel.py",
+      "upstream_sha256": "893a1e2bf5bd4c3c86cbccd3c4c2ee301e6ed4c36f04e05e9c28db209d90a6cb",
+      "vendored_sha256": "d6bbec38f2cff386bd251154abb241dc591cd41d15c597cd1d103c5d9e344c92",
+      "modifications": [
+        "use torch.distributed directly instead of imaginaire distributed helper"
+      ]
+    },
+    {
+      "upstream_path": "model/cosmos_predict2/module/denoiser_scaling.py",
+      "vendored_path": "src/lerobot/policies/vam/_vendor/cosmos_predict2/module/denoiser_scaling.py",
+      "upstream_sha256": "8d46e93faf47d4ba4705e7c7c8864a45ebc5bc2114e9c26565149db38067d59b",
+      "vendored_sha256": "8d46e93faf47d4ba4705e7c7c8864a45ebc5bc2114e9c26565149db38067d59b",
+      "modifications": []
+    },
+    {
+      "upstream_path": "model/LICENSE",
+      "vendored_path": "src/lerobot/policies/vam/_vendor/cosmos_predict2/LICENSE",
+      "upstream_sha256": "7382b1cf711e7a7c7af9816e0e07b49b91e7149b7c6d347225f98800fcb1f1c2",
+      "vendored_sha256": "7382b1cf711e7a7c7af9816e0e07b49b91e7149b7c6d347225f98800fcb1f1c2",
+      "modifications": []
+    },
+    {
+      "upstream_path": "model/ATTRIBUTIONS.md",
+      "vendored_path": "src/lerobot/policies/vam/_vendor/cosmos_predict2/ATTRIBUTIONS.md",
+      "upstream_sha256": "25eda910f92104d055c213446342d6dae1e69f1190d01b46d3e9129d709dcdfb",
+      "vendored_sha256": "25eda910f92104d055c213446342d6dae1e69f1190d01b46d3e9129d709dcdfb",
+      "modifications": []
+    },
+    {
+      "upstream_path": "model/cosmos_predict2/models/world2action_dit.py",
+      "vendored_path": "src/lerobot/policies/vam/_vendor/cosmos_predict2/models/world2action_dit.py",
+      "upstream_sha256": "d4f0df77fa3924c350360380c6357ddd7a7583104644a7dfc8e523de2030453d",
+      "vendored_sha256": "0a252cddc951a228a5236d0ea68df0d915abff56727037346e909b212d1e358c",
+      "modifications": [
+        "relative imports through the existing Cosmos compatibility seam",
+        "lazy Transformer Engine loading; official TE RMSNorm retained for model construction",
+        "documented removal of imaginaire framework imports; torch SDPA selected at runtime",
+        "TE API compatibility: import apply_rotary_pos_emb from attention.rope with legacy attention fallback; DotProductAttention remains from attention",
+        "torch SDPA helper returns [B,S,H,D] for the common Attention contract; wrapper performs head flattening",
+        "wrapper slices native [B,31,6] state-token prefix to [B,30,6]; already-sliced injected output remains explicitly supported"
+      ]
+    },
+    {
+      "upstream_path": "model/cosmos_predict2/schedulers/beta_scheduler.py",
+      "vendored_path": "src/lerobot/policies/vam/_vendor/cosmos_predict2/schedulers/beta_scheduler.py",
+      "upstream_sha256": "364062d7afb81915b4a5c3be7284e5413491a19e5905b3ceb1f986d0d9477b9a",
+      "vendored_sha256": "364062d7afb81915b4a5c3be7284e5413491a19e5905b3ceb1f986d0d9477b9a",
+      "modifications": []
+    }
+  ]
+}

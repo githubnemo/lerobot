@@ -17,6 +17,13 @@ default_language_version:
 
 exclude: "tests/artifacts/.*\\.safetensors$"
 
+# src/lerobot/policies/vam/_vendor/ is vendored NVIDIA Cosmos-Predict2 source kept
+# byte-comparable to upstream (mimic-video @ e3355db). Its intentionally misspelled
+# upstream identifiers and its 1.2 MB ATTRIBUTIONS.md license file must not be
+# "fixed", reformatted, or size-rejected, so the cosmetic and analysis hooks below
+# exclude it individually (a global exclude would also skip security-relevant hooks
+# like gitleaks, which should still scan vendored code).
+
 repos:
   ##### Meta #####
   - repo: meta
@@ -30,6 +37,7 @@ repos:
     hooks:
       - id: check-added-large-files
         args: ['--maxkb=1024']
+        exclude: ^src/lerobot/policies/vam/_vendor/
       - id: debug-statements
       - id: check-merge-conflict
       - id: check-case-conflict
@@ -50,6 +58,7 @@ repos:
     hooks:
       - id: typos
         args: [--force-exclude]
+        exclude: ^src/lerobot/policies/vam/_vendor/
 
   - repo: https://github.com/asottile/pyupgrade
     rev: v3.21.0
@@ -71,7 +80,7 @@ repos:
         # docs/source/api/ holds the generated API reference. Its `[[autodoc]]` blocks restrict output
         # to an indented `- member` list, which prettier reads as a lazy paragraph continuation and
         # joins onto one line — silently turning a member list into part of the directive.
-        exclude: ^(src/lerobot/templates/.*\.md|docs/source/api/.*\.mdx)$
+        exclude: ^(src/lerobot/templates/.*\.md|docs/source/api/.*\.mdx|src/lerobot/policies/vam/_vendor/.*)$
 
   ##### Security #####
   - repo: https://github.com/gitleaks/gitleaks
@@ -90,6 +99,7 @@ repos:
     - id: bandit
       args: ["-c", "pyproject.toml"]
       additional_dependencies: ["bandit[toml]"]
+      exclude: ^src/lerobot/policies/vam/_vendor/
 
   # TODO(Steven): Uncomment when ready to use
   ##### Static Analysis & Typing #####
@@ -98,7 +108,7 @@ repos:
     hooks:
       - id: mypy
         args: [--config-file=pyproject.toml]
-        exclude: ^(examples|benchmarks|tests)/
+        exclude: ^(examples|benchmarks|tests)/|^src/lerobot/policies/vam/_vendor/
 
   ##### Docstring Checks #####
   # - repo: https://github.com/akaihola/darglint2

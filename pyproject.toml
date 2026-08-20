@@ -337,6 +337,11 @@ all = [
     "lerobot[peft]",
     # "lerobot[unitree_g1]", TODO: Unitree requires specific installation instructions for unitree_sdk2
 ]
+video-vam = [
+    "nvidia-cuda-cccl-cu12>=12.9.27",
+    "nvidia-cuda-nvcc-cu12>=12.9.86",
+    "transformer-engine[core-cu12,pytorch]>=2.18.0",
+]
 
 [project.scripts]
 lerobot-calibrate="lerobot.scripts.lerobot_calibrate:main"
@@ -383,7 +388,13 @@ where = ["src"]
 [tool.ruff]
 target-version = "py312"
 line-length = 110
-exclude = ["tests/artifacts/**/*.safetensors", "*_pb2.py", "*_pb2_grpc.py"]
+exclude = [
+    "tests/artifacts/**/*.safetensors",
+    "*_pb2.py",
+    "*_pb2_grpc.py",
+    # Exact/upstream Cosmos source; _compat.py remains LeRobot-owned.
+    "src/lerobot/policies/vam/_vendor/cosmos_predict2/**",
+]
 
 [tool.ruff.lint]
 # E, W: pycodestyle errors and warnings
