@@ -26,6 +26,12 @@ from lerobot.utils.constants import OBS_STATE
 from lerobot.utils.import_utils import require_package
 
 from .configuration_fastwam import FastWAMConfig
+from .fastwam_lora import FASTWAM_VIDEO_LORA_TARGETS, inject_lora
+from .text_context import (
+    TextContextProvenance,
+    format_task_prompts,
+    load_text_context_artifact,
+)
 from .wan import (
     ActionDiT,
     FastWAM,
@@ -35,6 +41,22 @@ from .wan import (
     load_pretrained_wan_text_encoder,
     load_pretrained_wan_vae,
 )
+
+
+def _lora_checkpoint_key_aliases(model_state_dict: dict[str, Tensor], model: Any) -> dict[str, str]:
+    """Map legacy unwrapped video projection keys to LoRA base-layer keys."""
+    config = getattr(model, "config", None)
+    if getattr(config, "lora_rank", 0) <= 0:
+        return {}
+
+    aliases = {}
+    for target in FASTWAM_VIDEO_LORA_TARGETS:
+        for parameter_name in ("weight", "bias"):
+            source_key = f"model.{target}.{parameter_name}"
+            target_key = f"model.{target}.base_layer.{parameter_name}"
+            if target_key in model_state_dict:
+                aliases[source_key] = target_key
+    return aliases
 
 
 class FastWAMPolicy(PreTrainedPolicy):
@@ -76,18 +98,32 @@ class FastWAMPolicy(PreTrainedPolicy):
         config.validate_features()
         self.config = config
         self.dataset_stats = dataset_stats
-        self.model = self._build_core_model(config)
-        if config.freeze_video_expert and getattr(self.model, "video_expert", None) is not None:
-            # Freeze the ~5B Wan video expert; get_optim_params filters on requires_grad,
-            # so its params drop out of the optimizer (and DDP skips them).
-            self.model.video_expert.requires_grad_(False)
-            # The transformer blocks are re-parented onto the MoTLayers (single FSDP owner), so
-            # `video_expert.requires_grad_` no longer reaches them — freeze them via the layers.
-            mot = getattr(self.model, "mot", None)
-            if mot is not None and getattr(mot, "layers", None) is not None:
-                for layer in mot.layers:
-                    if "video" in layer.blocks:
-                        layer.blocks["video"].requires_grad_(False)
+        preloaded_text_context = None
+        if config.text_context_path:
+            preloaded_text_context = load_text_context_artifact(
+                config.text_context_path,
+                expected_provenance=_expected_text_context_provenance(config),
+            )
+            dataset_meta = kwargs.get("dataset_meta")
+            if dataset_meta is not None:
+                tasks = _dataset_task_strings(dataset_meta)
+                if tasks:
+                    preloaded_text_context.validate_prompts(
+                        format_task_prompts(tasks, config.prompt_template)
+                    )
+        self._preloaded_text_context = preloaded_text_context
+        try:
+            self.model = self._build_core_model(config)
+        finally:
+            self._preloaded_text_context = None
+        self.lora_target_modules: tuple[str, ...] = ()
+        if config.lora_rank > 0:
+            # Freeze the video base before wrapping its projections. Injection then
+            # restores requires_grad only on the new fp32 adapter tensors.
+            self._freeze_video_expert()
+            self.lora_target_modules = inject_lora(self.model, rank=config.lora_rank, alpha=config.lora_alpha)
+        elif config.freeze_video_expert:
+            self._freeze_video_expert()
         self.reset()
 
     @classmethod
@@ -106,18 +142,18 @@ class FastWAMPolicy(PreTrainedPolicy):
         from safetensors import safe_open
 
         model_state_dict = model.state_dict()
+        lora_aliases = _lora_checkpoint_key_aliases(model_state_dict, model)
         mismatched = []
         with safe_open(model_file, framework="pt") as f:
             checkpoint_keys = list(f.keys())
             for key in checkpoint_keys:
-                if key in model_state_dict and tuple(model_state_dict[key].shape) != tuple(
+                target_key = lora_aliases.get(key, key)
+                if target_key in model_state_dict and tuple(model_state_dict[target_key].shape) != tuple(
                     f.get_slice(key).get_shape()
                 ):
-                    mismatched.append(key)
+                    mismatched.append(target_key)
 
-        if not mismatched:
-            return super()._load_as_safetensor(model, model_file, map_location, strict)
-        if strict:
+        if mismatched and strict:
             raise RuntimeError(
                 f"FastWAM: {len(mismatched)} checkpoint tensors have a shape mismatch under "
                 f"strict=True: {mismatched}"
@@ -125,18 +161,38 @@ class FastWAMPolicy(PreTrainedPolicy):
 
         from safetensors.torch import load_file
 
-        logging.warning(
-            "FastWAM cross-embodiment load: reinitializing %d shape-mismatched tensor(s), keeping "
-            "every compatible weight: %s",
-            len(mismatched),
-            mismatched,
-        )
+        if mismatched:
+            logging.warning(
+                "FastWAM cross-embodiment load: reinitializing %d shape-mismatched tensor(s), keeping "
+                "every compatible weight: %s",
+                len(mismatched),
+                mismatched,
+            )
+
+        # Always materialize the checkpoint on CPU. Loading the ~6B-parameter state dict directly
+        # on CUDA duplicates the already assembled model and exhausts a 24 GB card before the first
+        # training step. The core is constructed in bf16 on CPU, populated here, and moved once.
         state_dict = load_file(model_file, device="cpu")
-        for key in mismatched:
-            state_dict.pop(key, None)
-        model.load_state_dict(state_dict, strict=False)
-        if map_location and map_location != "cpu":
-            model.to(map_location)
+        for source_key, target_key in lora_aliases.items():
+            if source_key in state_dict:
+                if target_key not in state_dict:
+                    state_dict[target_key] = state_dict[source_key]
+                del state_dict[source_key]
+        if mismatched:
+            for key in mismatched:
+                state_dict.pop(key, None)
+        missing_keys, unexpected_keys = model.load_state_dict(
+            state_dict, strict=not bool(mismatched) and strict
+        )
+        del state_dict
+        if missing_keys:
+            logging.info("Missing key(s) when loading FastWAM model: %s", missing_keys)
+        if unexpected_keys:
+            logging.info("Unexpected key(s) when loading FastWAM model: %s", unexpected_keys)
+
+        target_device = torch.device(map_location)
+        if target_device.type != "cpu":
+            model.to(target_device)
         return model
 
     def get_optim_params(self) -> list[Tensor]:
@@ -150,6 +206,18 @@ class FastWAMPolicy(PreTrainedPolicy):
         if proprio_encoder is not None:
             params.extend(list(proprio_encoder.parameters()))
         return [p for p in params if p.requires_grad]
+
+    def _freeze_video_expert(self) -> None:
+        """Freeze the video expert, including blocks re-parented into MoT layers."""
+        video_expert = getattr(self.model, "video_expert", None)
+        if video_expert is None:
+            raise RuntimeError("FastWAM LoRA requires a video expert")
+        video_expert.requires_grad_(False)
+        mot = getattr(self.model, "mot", None)
+        if mot is not None and getattr(mot, "layers", None) is not None:
+            for layer in mot.layers:
+                if "video" in layer.blocks:
+                    layer.blocks["video"].requires_grad_(False)
 
     def reset(self) -> None:
         self._action_queue: deque[Tensor] = deque([], maxlen=self.config.n_action_steps)
@@ -170,14 +238,18 @@ class FastWAMPolicy(PreTrainedPolicy):
         sample = dict(batch)
         if "video" not in sample:
             sample["video"] = _stack_video_from_images(batch, self.config)
-        if "context" not in sample or "context_mask" not in sample:
+        has_context = "context" in sample
+        has_context_mask = "context_mask" in sample
+        if has_context != has_context_mask:
+            raise KeyError("FastWAM batches must provide both `context` and `context_mask`.")
+        if not has_context:
             prompt = _prompt_from_batch(batch=batch, config=self.config)
             if prompt is None:
-                raise KeyError(
-                    "FastWAM training requires a `task`/`prompt` to encode text context, "
-                    "or precomputed `context`/`context_mask` in the batch."
-                )
-            sample["context"], sample["context_mask"] = self.model.encode_prompt(prompt)
+                raise KeyError("FastWAM training requires a `task`/`prompt` or cached context tensors.")
+            if getattr(self.model, "text_context_artifact", None) is not None:
+                sample["context"], sample["context_mask"] = self.model.encode_cached_prompt(prompt)
+            else:
+                sample["context"], sample["context_mask"] = self.model.encode_prompt(prompt)
         if self.config.proprio_dim is not None and "proprio" not in sample:
             state = sample.get(OBS_STATE)
             if state is not None:
@@ -219,6 +291,14 @@ class FastWAMPolicy(PreTrainedPolicy):
 
         self.eval()
         infer_kwargs = _batch_to_infer_kwargs(batch=batch, config=self.config)
+        if (
+            getattr(self.model, "text_context_artifact", None) is not None
+            and infer_kwargs["prompt"] is not None
+        ):
+            infer_kwargs["context"], infer_kwargs["context_mask"] = self.model.encode_cached_prompt(
+                infer_kwargs["prompt"]
+            )
+            infer_kwargs["prompt"] = None
         batch_size = _infer_kwargs_batch_size(infer_kwargs)
         if batch_size == 1:
             action = _action_from_model_output(self.model.infer_action(**infer_kwargs))
@@ -256,16 +336,24 @@ class FastWAMPolicy(PreTrainedPolicy):
         — see `FastWAM.__init__`. The tokenizer comes from `google/umt5-xxl`.
         """
         dtype = _dtype_from_name(config.torch_dtype)
-        device = config.device
-        video_expert = WanVideoDiT(**config.video_dit_config).to(device=device, dtype=dtype)
-        action_expert = ActionDiT(**config.action_dit_config).to(device=device, dtype=dtype)
+        # Build the complete core on CPU so neither model construction nor checkpoint loading
+        # needs a second copy of the 6B-parameter state on the 24 GB training GPU.
+        construction_device = "cpu"
+        text_context_artifact = getattr(self, "_preloaded_text_context", None)
+        if text_context_artifact is None and config.text_context_path:
+            text_context_artifact = load_text_context_artifact(
+                config.text_context_path,
+                expected_provenance=_expected_text_context_provenance(config),
+            )
+        video_expert = WanVideoDiT(**config.video_dit_config).to(device=construction_device, dtype=dtype)
+        action_expert = ActionDiT(**config.action_dit_config).to(device=construction_device, dtype=dtype)
         mot = MoT(
             mixtures={"video": video_expert, "action": action_expert},
             mot_checkpoint_mixed_attn=config.mot_checkpoint_mixed_attn,
         )
         text_encoder = (
             load_pretrained_wan_text_encoder(
-                model_id=config.text_encoder_model_id, torch_dtype=dtype, device=device
+                model_id=config.text_encoder_model_id, torch_dtype=dtype, device=construction_device
             )
             if config.load_text_encoder
             else None
@@ -274,14 +362,19 @@ class FastWAMPolicy(PreTrainedPolicy):
             video_expert=video_expert,
             action_expert=action_expert,
             mot=mot,
-            vae=load_pretrained_wan_vae(torch_dtype=dtype, device=device),
+            vae=load_pretrained_wan_vae(torch_dtype=dtype, device=construction_device),
             text_encoder=text_encoder,
-            tokenizer=build_wan_tokenizer(
-                model_id=config.tokenizer_model_id, tokenizer_max_len=config.tokenizer_max_len
+            tokenizer=(
+                build_wan_tokenizer(
+                    model_id=config.tokenizer_model_id, tokenizer_max_len=config.tokenizer_max_len
+                )
+                if config.load_text_encoder
+                else None
             ),
+            text_context_artifact=text_context_artifact,
             text_dim=int(config.video_dit_config["text_dim"]),
             proprio_dim=config.proprio_dim,
-            device=device,
+            device=construction_device,
             torch_dtype=dtype,
             video_train_shift=float(config.video_scheduler["train_shift"]),
             video_infer_shift=float(config.video_scheduler["infer_shift"]),
@@ -292,6 +385,29 @@ class FastWAMPolicy(PreTrainedPolicy):
             loss_lambda_video=float(config.loss["lambda_video"]),
             loss_lambda_action=float(config.loss["lambda_action"]),
         )
+
+
+def _expected_text_context_provenance(config: FastWAMConfig) -> TextContextProvenance:
+    return TextContextProvenance(
+        model_id=config.model_id,
+        tokenizer_model_id=config.tokenizer_model_id,
+        text_encoder_model_id=config.text_encoder_model_id,
+        dtype=config.torch_dtype,
+        prompt_template=config.prompt_template,
+        tokenizer_max_len=config.tokenizer_max_len,
+        context_len=config.context_len,
+        context_dim=int(config.video_dit_config["text_dim"]),
+    )
+
+
+def _dataset_task_strings(dataset_meta: Any) -> list[str]:
+    tasks = getattr(dataset_meta, "tasks", None)
+    if tasks is None:
+        return []
+    try:
+        return [str(task) for task in tasks.index.tolist()]
+    except AttributeError:
+        return [str(task) for task in tasks]
 
 
 def _scalar(value: Any) -> Any:

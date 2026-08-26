@@ -54,6 +54,45 @@ FastWAM expects a LeRobot dataset with:
 
 The default visual setup is one image feature named `observation.images.image` with shape `(3, 224, 448)`. If the dataset uses two cameras, configure `policy.input_features` so their heights match `224` and their widths sum to `448`.
 
+## Precomputed UMT5 context (24 GB GPUs)
+
+Text can be precomputed before constructing the policy. The artifact is a
+`safetensors` file with a required JSON sidecar containing the formatted-prompt
+mapping, model/tokenizer IDs, dtype, prompt template, tensor shapes, and hashes.
+The loader validates this provenance and fails on missing prompts or mismatched
+configuration instead of silently falling back to a different encoder.
+
+```bash
+.venv/bin/python scripts/video_vam/precompute_fastwam_text.py \\
+  --dataset-root /path/to/dataset \\
+  --repo-id your-org/your-dataset \\
+  --episodes 0:32 \\
+  --output /path/to/fastwam-text.safetensors \\
+  --dtype bfloat16 --device cuda
+```
+
+Use the artifact with `policy.text_context_path` and
+`policy.load_text_encoder=false`. In this mode the tokenizer and UMT5 encoder are
+not constructed by FastWAM; each batch's formatted `task` string performs a
+validated lookup of `[B, context_len, text_dim]` context and `[B, context_len]`
+mask tensors. Omitting `text_context_path` preserves the online encoding default.
+
+For the native 224x448 baseline with `num_video_frames=33` and
+`action_video_freq_ratio=4`, training sees `[B, 3, 9, 224, 448]` VAE inputs and
+`[B, 48, 3, 14, 28]` latents. With patch size `[1,2,2]`, the video and action
+experts process 294 and 32 tokens respectively; cached text is `[B,128,4096]`
+before the optional proprioception token. On a 24 GB RTX 4090, use the already
+supported `bfloat16`, frozen video expert, `loss.lambda_video=0`, and gradient
+checkpointing settings. Meta-device parameter accounting for the native configs is 4,999,787,712 video
+parameters (9.31 GiB in BF16), 1,020,883,974 action parameters (1.90 GiB), and
+704,688,668 VAE parameters (1.31 GiB). With the video expert frozen, BF16 model
+weights plus FP32 AdamW state for the action expert are about 20.1 GiB; its
+BF16 gradients add about 1.9 GiB before activations and CUDA workspace, so a 24 GiB
+RTX 4090 is theoretically close rather than guaranteed; checkpointing and batch
+size 1 are required safe choices. This removes the 5,680,910,336-parameter UMT5 encoder (about 10.58 GiB in
+BF16) from the training process, and no quantization or CPU VAE offload is
+implicitly enabled.
+
 ## Usage
 
 Create a new FastWAM policy with:
@@ -113,6 +152,10 @@ lerobot-rollout \
 ### Action Chunking
 
 `policy.action_horizon` controls the number of future actions supervised during training and predicted during inference. `policy.n_action_steps` controls how many actions are consumed before the policy predicts a fresh chunk. `policy.n_action_steps` must be less than or equal to `policy.action_horizon`.
+
+### Video-Expert LoRA
+
+Set `policy.lora_rank` above zero to freeze the video-expert base weights and train exact self-attention, cross-attention, and FFN adapters while keeping the full action expert trainable. The cube-out-of-box co-training runner uses `action_horizon=32`: FastWAM's eight-transition video divisor requires a divisible horizon, while the frozen physical-action RMSE protocol scores only the first 30 predicted actions.
 
 ### Wan Components
 

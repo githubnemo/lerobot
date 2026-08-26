@@ -149,7 +149,7 @@ def _manifest_value(manifest: CacheManifest | str | Path) -> CacheManifest:
 
 
 def _manifest_entries_for_split(
-    manifest: CacheManifest, split: VAMSplit
+    manifest: CacheManifest, split: VAMSplit, *, allow_partial: bool = False
 ) -> tuple[tuple[CacheManifestEntry, ...], tuple[CacheManifestEntry, ...]]:
     dataset = manifest.payload["dataset"]
     if dataset["repo_id"] != split.dataset_repo_id or dataset["revision"] != split.dataset_revision:
@@ -164,8 +164,10 @@ def _manifest_entries_for_split(
     if uncovered:
         raise VAMSplitError(f"manifest contains episodes not covered by split: {uncovered}")
     missing = sorted(covered - manifest_episodes)
-    if missing:
+    if missing and not allow_partial:
         raise VAMSplitError(f"split references episodes absent from manifest: {missing}")
+    if allow_partial and not manifest_episodes <= covered:
+        raise VAMSplitError(f"manifest contains episodes not covered by split: {uncovered}")
     train = tuple(entry for entry in manifest.entries if entry.episode_index in split.train_episodes)
     val = tuple(entry for entry in manifest.entries if entry.episode_index in split.val_episodes)
     expected_probe_ids = [entry.sample_id for entry in val]
@@ -181,7 +183,7 @@ def _manifest_entries_for_split(
 
 
 def _validate_payload(
-    payload: Mapping[str, Any], manifest: CacheManifest
+    payload: Mapping[str, Any], manifest: CacheManifest, *, allow_partial: bool = False
 ) -> tuple[dict[str, Any], tuple[ValidationProbe, ...]]:
     if not isinstance(payload, Mapping):
         raise VAMSplitError("split must contain a JSON object")
@@ -219,11 +221,16 @@ def _validate_payload(
         raise VAMSplitError("validation_probe.entries sample_id values must be unique")
     normalized = json.loads(json.dumps(payload))
     split = VAMSplit(Path("<memory>"), normalized, probes)
-    _manifest_entries_for_split(manifest, split)
+    _manifest_entries_for_split(manifest, split, allow_partial=allow_partial)
     return normalized, probes
 
 
-def load_vam_split(path: str | Path, manifest: CacheManifest | str | Path) -> VAMSplit:
+def load_vam_split(
+    path: str | Path,
+    manifest: CacheManifest | str | Path,
+    *,
+    allow_partial: bool = False,
+) -> VAMSplit:
     """Load and validate a strict split against the cache manifest it will serve."""
     path = Path(path).expanduser().resolve()
     manifest_value = _manifest_value(manifest)
@@ -233,7 +240,7 @@ def load_vam_split(path: str | Path, manifest: CacheManifest | str | Path) -> VA
         payload = json.loads(path.read_text())
     except (OSError, json.JSONDecodeError) as exc:
         raise VAMSplitError(f"Could not read VAM split {path}: {exc}") from exc
-    normalized, probes = _validate_payload(payload, manifest_value)
+    normalized, probes = _validate_payload(payload, manifest_value, allow_partial=allow_partial)
     return VAMSplit(path, normalized, probes)
 
 

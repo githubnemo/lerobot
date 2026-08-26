@@ -652,11 +652,13 @@ class World2ActionDecoder(nn.Module):
         context: torch.Tensor,
         *,
         obs_dropout: float,
+        detach_context: bool = True,
     ) -> torch.Tensor:
         model_dtype = self._model_dtype(action_input.dtype)
         state = state.to(dtype=model_dtype)
         action_input = action_input.to(dtype=model_dtype)
-        context = context.detach()
+        if detach_context:
+            context = context.detach()
         time = time.to(device=action_input.device, dtype=model_dtype)
         if time.ndim == 1:
             time = time[:, None]
@@ -716,6 +718,7 @@ class World2ActionDecoder(nn.Module):
         action_is_pad: torch.Tensor | None = None,
         action_mask: torch.Tensor | None = None,
         obs_dropout: float | None = None,
+        detach_context: bool = True,
     ) -> torch.Tensor:
         # The unmasked branch below intentionally remains ordinary MSE.
         if action_is_pad is not None and action_mask is not None:
@@ -754,6 +757,7 @@ class World2ActionDecoder(nn.Module):
             self._context_time(context_timestep, batch_size, device),
             context,
             obs_dropout=float(dropout),
+            detach_context=detach_context,
         )
         prediction_float = prediction.float()
         target_float = target.float()

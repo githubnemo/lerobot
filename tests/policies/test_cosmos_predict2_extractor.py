@@ -14,8 +14,10 @@ from lerobot.policies.vam.cosmos_predict2_extractor import (
     CosmosPredict2Extractor,
     CosmosPredict2ExtractorConfig,
     _backbone_autocast_context,
+    _CompileFriendlyRMSNorm,
     arch_invariant_rand,
     load_checkpoint_strict,
+    make_compile_friendly_backbone,
 )
 from lerobot.policies.vam.download_cosmos_checkpoints import build_plan
 
@@ -122,6 +124,7 @@ def test_extract_contract_layout_and_metadata():
     assert output.layer == 20
     assert output.provenance.upstream_commit == "e3355dbc93132b576c02f920a59b4fc18a4f5906"
     assert output.provenance.backend == "minimal_a2a"
+    assert output.provenance.vae_input_mode == "observed_prefix"
     assert output.provenance.checkpoint_ignored_metadata_keys == ()
     assert output.provenance.checkpoint_ignored_metadata_count == 0
     assert not output.hidden_grid.requires_grad
@@ -129,11 +132,12 @@ def test_extract_contract_layout_and_metadata():
 
     tokenizer = extractor.tokenizer
     backbone = extractor.backbone
-    assert tokenizer.seen_shape == (1, 3, 61, 480, 640)
+    assert tokenizer.seen_shape == (1, 3, 5, 480, 640)
     assert backbone.seen["x_B_C_T_H_W"].shape == (1, 16, 16, 60, 80)
     assert backbone.seen["x_B_C_T_H_W"][:, :, :2].eq(0.25).all()
     assert backbone.seen["condition_video_input_mask_B_C_T_H_W"][:, :, :2].eq(1).all()
     assert backbone.seen["condition_video_input_mask_B_C_T_H_W"][:, :, 2:].eq(0).all()
+    assert backbone.seen["use_cuda_graphs"] is False
     timesteps = backbone.seen["timesteps_B_T"]
     assert timesteps.shape == (1, 16)
     assert torch.allclose(timesteps[:, :2], torch.full((1, 2), 0.0001 / 1.0001))
@@ -141,10 +145,57 @@ def test_extract_contract_layout_and_metadata():
     assert backbone.grad_enabled is False
 
 
+def test_legacy_padded_vae_restores_full_pixel_input():
+    config = CosmosPredict2ExtractorConfig(
+        checkpoint_path="/not-loaded/backbone.pt",
+        tokenizer_path="/not-loaded/tokenizer.pth",
+        device="cpu",
+        dtype=torch.float32,
+        vae_input_mode="legacy_padded_vae",
+    )
+    extractor = CosmosPredict2Extractor(config, backbone=FakeBackbone(), tokenizer=FakeTokenizer())
+    output = extractor.extract(torch.zeros(1, 3, 5, 480, 640), torch.zeros(1, 512, 1024))
+
+    assert extractor.tokenizer.seen_shape == (1, 3, 61, 480, 640)
+    assert output.provenance.vae_input_mode == "legacy_padded_vae"
+
+
+def test_invalid_vae_input_mode_is_rejected():
+    with pytest.raises(ValueError, match="vae_input_mode"):
+        CosmosPredict2ExtractorConfig(
+            checkpoint_path="/not-loaded/backbone.pt",
+            tokenizer_path="/not-loaded/tokenizer.pth",
+            vae_input_mode="padded_until_the_end",
+        )
+
+
 def test_parameters_are_frozen():
     extractor = make_extractor()
     assert all(not parameter.requires_grad for parameter in extractor.backbone.parameters())
     assert all(not parameter.requires_grad for parameter in extractor.tokenizer.parameters())
+
+
+def test_attention_backend_is_recorded_without_changing_injected_contract():
+    config = CosmosPredict2ExtractorConfig(
+        checkpoint_path="/not-loaded/backbone.pt",
+        tokenizer_path="/not-loaded/tokenizer.pth",
+        device="cpu",
+        dtype=torch.float32,
+        attention_backend="torch",
+    )
+    extractor = CosmosPredict2Extractor(config, backbone=FakeBackbone(), tokenizer=FakeTokenizer())
+    output = extractor.extract(torch.zeros(1, 3, 5, 480, 640), torch.zeros(1, 512, 1024))
+    assert output.provenance.backend == "minimal_a2a"
+    assert output.provenance.attention_backend == "torch"
+
+
+def test_attention_backend_rejects_unvendored_name():
+    with pytest.raises(ValueError, match="attention_backend"):
+        CosmosPredict2ExtractorConfig(
+            checkpoint_path="/not-loaded/backbone.pt",
+            tokenizer_path="/not-loaded/tokenizer.pth",
+            attention_backend="flash_attn_no_cp",
+        )
 
 
 def test_invalid_shapes_and_ranges():
@@ -338,3 +389,61 @@ def test_per_call_noise_seed_is_deterministic_and_recorded():
     assert not torch.equal(first_input, third_input)
     with pytest.raises(ValueError, match="noise_seed"):
         extractor.extract(images, prompt, noise_seed=2**32 - 1)
+
+
+class _FakeTransformerEngineRMSNorm(nn.Module):
+    def __init__(self, dim: int) -> None:
+        super().__init__()
+        self.normalized_shape = (dim,)
+        self.eps = 1e-6
+        self.weight = nn.Parameter(torch.arange(dim, dtype=torch.float32) + 1.0)
+
+
+_FakeTransformerEngineRMSNorm.__module__ = "transformer_engine.pytorch.module.rmsnorm"
+_FakeTransformerEngineRMSNorm.__name__ = "RMSNorm"
+
+
+class _FakeAttentionWithTransformerEngineNorm(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.q_norm = _FakeTransformerEngineRMSNorm(8)
+        self._rotary_pos_emb = lambda tensor, freqs, **kwargs: tensor
+
+
+class _FakeCompileBackbone(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.attn = _FakeAttentionWithTransformerEngineNorm()
+        self.t_embedding_norm = _FakeTransformerEngineRMSNorm(8)
+
+
+def test_compile_friendly_backbone_replaces_te_norms_and_rotary_preserving_weights():
+    backbone = _FakeCompileBackbone()
+    expected_weights = {
+        name: child.weight.detach().clone()
+        for name, child in backbone.named_modules()
+        if isinstance(child, _FakeTransformerEngineRMSNorm)
+    }
+
+    stats = make_compile_friendly_backbone(backbone)
+
+    assert stats == {"rmsnorm_replacements": 2, "rotary_replacements": 1}
+    assert isinstance(backbone.attn.q_norm, _CompileFriendlyRMSNorm)
+    assert isinstance(backbone.t_embedding_norm, _CompileFriendlyRMSNorm)
+    assert torch.equal(backbone.attn.q_norm.weight, expected_weights["attn.q_norm"])
+    assert torch.equal(backbone.t_embedding_norm.weight, expected_weights["t_embedding_norm"])
+    assert backbone.attn._rotary_pos_emb.__name__ == "_pure_torch_rotary_pos_emb"
+
+
+def test_compile_friendly_rmsnorm_returns_parameter_dtype():
+    norm = _CompileFriendlyRMSNorm(8, eps=1e-6, dtype=torch.bfloat16)
+    output = norm(torch.randn(2, 8, dtype=torch.float32))
+    assert output.dtype == torch.bfloat16
+
+
+def test_compile_friendly_rmsnorm_matches_torch_reference():
+    norm = _CompileFriendlyRMSNorm(8, eps=1e-6, dtype=torch.float32)
+    input_tensor = torch.randn(2, 8)
+    expected = torch.rms_norm(input_tensor, [8], norm.weight, norm.eps)
+
+    assert torch.equal(norm(input_tensor), expected)

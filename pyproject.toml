@@ -509,6 +509,7 @@ default.extend-ignore-identifiers-re = [
     "ROBOTIS",
     "OT_VALUE",
     "VanderBilt",
+    "SuSIE",
     "seperated_timestep",
 ]
 

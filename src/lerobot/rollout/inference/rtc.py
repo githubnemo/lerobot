@@ -27,6 +27,8 @@ import logging
 import math
 import time
 import traceback
+from collections import deque
+from copy import deepcopy
 from threading import Event, Lock, Thread
 from typing import Any
 
@@ -80,6 +82,47 @@ def supports_rtc_inference(policy: PreTrainedPolicy) -> bool:
     return True
 
 
+def _clone_observation(obs: dict[str, Any]) -> dict[str, Any]:
+    """Snapshot one control-rate observation so later hardware updates cannot mutate it."""
+    return {
+        key: value.detach().clone() if isinstance(value, torch.Tensor) else deepcopy(value)
+        for key, value in obs.items()
+    }
+
+
+def _prepare_image_history(
+    history: tuple[dict[str, Any], ...],
+    *,
+    hw_features: dict,
+    device: torch.device,
+    task: str,
+    robot_type: str,
+) -> dict[str, torch.Tensor]:
+    """Convert exact control-rate camera snapshots to [B,C,T,H,W] policy tensors."""
+    prepared_frames = []
+    for obs in history:
+        frame = build_dataset_frame(hw_features, obs, prefix="observation")
+        prepared_frames.append(prepare_observation_for_inference(frame, device, task, robot_type))
+
+    image_history: dict[str, torch.Tensor] = {}
+    first = prepared_frames[0]
+    for key, value in first.items():
+        if not key.startswith("observation.images.") or not isinstance(value, torch.Tensor):
+            continue
+        if value.ndim != 4:
+            raise ValueError(f"Expected prepared image [B,C,H,W] for {key}, got {tuple(value.shape)}")
+        frames = []
+        for frame in prepared_frames:
+            candidate = frame.get(key)
+            if not isinstance(candidate, torch.Tensor) or candidate.shape != value.shape:
+                raise ValueError(f"Control-rate history has inconsistent image tensor for {key}")
+            frames.append(candidate)
+        image_history[f"{key}.history"] = torch.stack(frames, dim=2)
+    if not image_history:
+        raise ValueError("observation_history_size > 1 requires at least one image feature")
+    return image_history
+
+
 def _normalize_prev_actions_length(prev_actions: torch.Tensor, target_steps: int) -> torch.Tensor:
     """Pad or truncate RTC prefix actions to a fixed length for stable compiled inference."""
     if prev_actions.ndim != 2:
@@ -122,6 +165,7 @@ class RTCInferenceEngine(InferenceEngine):
         use_torch_compile: bool = False,
         compile_warmup_inferences: int = 2,
         rtc_queue_threshold: int = 30,
+        observation_history_size: int = 1,
         shutdown_event: Event | None = None,
     ) -> None:
         super().__init__(task=task)
@@ -136,6 +180,11 @@ class RTCInferenceEngine(InferenceEngine):
         self._use_torch_compile = use_torch_compile
         self._compile_warmup_inferences = compile_warmup_inferences
         self._rtc_queue_threshold = rtc_queue_threshold
+        if observation_history_size <= 0:
+            raise ValueError("observation_history_size must be positive")
+        self._observation_history_size = observation_history_size
+        self._observation_history: deque[dict[str, Any]] = deque(maxlen=observation_history_size)
+        self._observation_frame_index = -1
 
         self._action_queue: ActionQueue | None = None
         self._obs_holder: dict[str, Any] = {}
@@ -210,8 +259,12 @@ class RTCInferenceEngine(InferenceEngine):
     def start(self) -> None:
         """Launch the RTC background thread."""
         self._action_queue = ActionQueue(self._rtc_config)
+        self._observation_history.clear()
+        self._observation_frame_index = -1
         self._obs_holder = {
             "obs": None,
+            "history": None,
+            "history_frame_index": None,
             "robot_type": self._robot.robot_type,
         }
         self._shutdown_event.clear()
@@ -265,6 +318,10 @@ class RTCInferenceEngine(InferenceEngine):
             if self._action_queue is not None:
                 self._action_queue.clear()
             self._obs_holder["obs"] = None
+            self._obs_holder["history"] = None
+            self._obs_holder["history_frame_index"] = None
+            self._observation_history.clear()
+            self._observation_frame_index = -1
             self._reset_epoch += 1
         # The queue is empty, so a pending task change has nothing stale to blend against.
         self._discard_task_change()
@@ -291,9 +348,27 @@ class RTCInferenceEngine(InferenceEngine):
         return action
 
     def notify_observation(self, obs: dict) -> None:
-        """Publish the latest observation for the RTC thread to consume."""
+        """Publish one policy-rate observation and optionally snapshot visual history."""
+        if self._observation_history_size == 1:
+            with self._obs_lock:
+                self._obs_holder["obs"] = obs
+            return
+
+        snapshot = _clone_observation(obs)
         with self._obs_lock:
-            self._obs_holder["obs"] = obs
+            self._observation_frame_index += 1
+            self._observation_history.append(snapshot)
+            self._obs_holder["obs"] = snapshot
+            self._obs_holder["history"] = (
+                tuple(self._observation_history)
+                if len(self._observation_history) == self._observation_history_size
+                else None
+            )
+            self._obs_holder["history_frame_index"] = (
+                self._observation_frame_index
+                if len(self._observation_history) == self._observation_history_size
+                else None
+            )
 
     # ------------------------------------------------------------------
     # Text queries
@@ -347,8 +422,14 @@ class RTCInferenceEngine(InferenceEngine):
                 queue = self._action_queue
                 with self._obs_lock:
                     obs = self._obs_holder.get("obs")
+                    observation_history = self._obs_holder.get("history")
+                    history_frame_index = self._obs_holder.get("history_frame_index")
                     epoch_before = self._reset_epoch
-                if queue is None or obs is None:
+                if (
+                    queue is None
+                    or obs is None
+                    or (self._observation_history_size > 1 and observation_history is None)
+                ):
                     time.sleep(_RTC_IDLE_SLEEP_S)
                     continue
 
@@ -363,6 +444,8 @@ class RTCInferenceEngine(InferenceEngine):
                     # a reset that landed during the query.
                     with self._obs_lock:
                         obs = self._obs_holder.get("obs")
+                        observation_history = self._obs_holder.get("history")
+                        history_frame_index = self._obs_holder.get("history_frame_index")
                         epoch_before = self._reset_epoch
                     if obs is None:  # a reset mid-query dropped the observation
                         continue
@@ -392,6 +475,25 @@ class RTCInferenceEngine(InferenceEngine):
                         obs_batch["task"] = [task]
 
                         preprocessed = self._preprocessor(obs_batch)
+                        if self._observation_history_size > 1:
+                            if observation_history is None:
+                                raise AssertionError("full observation history unexpectedly missing")
+                            if history_frame_index is None:
+                                raise AssertionError(
+                                    "full observation history frame index unexpectedly missing"
+                                )
+                            preprocessed["observation.history_frame_index"] = torch.tensor(
+                                [history_frame_index], device=policy_device, dtype=torch.long
+                            )
+                            preprocessed.update(
+                                _prepare_image_history(
+                                    observation_history,
+                                    hw_features=self._hw_features,
+                                    device=policy_device,
+                                    task=task,
+                                    robot_type=self._robot.robot_type,
+                                )
+                            )
 
                         if prev_actions is not None and self._relative_step is not None:
                             # Rebase against the raw cached state so the leftover tail stays in

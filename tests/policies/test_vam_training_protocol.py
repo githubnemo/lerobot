@@ -99,6 +99,7 @@ def test_stride_enumerates_episode_local_frames_and_filters_without_rephasing(mo
 def test_split_round_trip_probe_and_mismatch_errors(tmp_path):
     manifest_path = _manifest(tmp_path)
     manifest = load_cache_manifest(manifest_path)
+    assert manifest.vae_input_mode == "legacy_padded_vae"
     split_path = create_vam_split(
         manifest,
         tmp_path / "split.json",

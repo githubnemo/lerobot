@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import sys
 import time
+import traceback
 from pathlib import Path
 from typing import Any
 
@@ -139,6 +140,7 @@ def main(argv: list[str] | None = None) -> int:
 if __name__ == "__main__":
     try:
         raise SystemExit(main())
-    except Exception as exc:  # noqa: BLE001 - concise smoke CLI failure
+    except Exception as exc:  # noqa: BLE001 - preserve complete smoke traceback
         print(f"ERROR: {type(exc).__name__}: {exc}", file=sys.stderr)
+        traceback.print_exc()
         raise SystemExit(2) from exc

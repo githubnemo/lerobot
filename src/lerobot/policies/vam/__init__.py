@@ -1,5 +1,11 @@
 """Video-action model foundations for LeRobot."""
 
+from .context_transform import (
+    CONTEXT_TRANSFORMS,
+    apply_context_transform,
+    context_transform_metadata,
+    context_transform_spec,
+)
 from .cosmos_cache_dataset import (
     CacheDatasetItem,
     CacheManifest,
@@ -32,6 +38,10 @@ __all__ = [
     "CosmosFeatureCacheDataset",
     "CosmosFeatureCacheManifestError",
     "load_cache_manifest",
+    "CONTEXT_TRANSFORMS",
+    "apply_context_transform",
+    "context_transform_metadata",
+    "context_transform_spec",
     "ActionStateNormalizer",
     "NormalizationArtifact",
     "ParameterCountReport",

@@ -52,7 +52,11 @@ policy = SmolVLAPolicy.from_pretrained("lerobot/smolvla_base")
 
 """
 
+import hashlib
+import inspect
+import logging
 import math
+import sys
 from collections import deque
 from typing import TypedDict, Unpack
 
@@ -76,7 +80,7 @@ from ..utils import (
     populate_queues,
 )
 from .configuration_smolvla import SmolVLAConfig
-from .smolvlm_with_expert import SmolVLMWithExpertModel
+from .smolvlm_with_expert import SmolVLMWithExpertModel, _reinitialize_module
 
 
 class ActionSelectKwargs(TypedDict, total=False):
@@ -144,6 +148,96 @@ class SmolVLAPolicy(PreTrainedPolicy):
 
     config_class = SmolVLAConfig
     name = "smolvla"
+
+    @staticmethod
+    def _state_digest(state: dict[str, Tensor]) -> str:
+        digest = hashlib.sha256()
+        for name in sorted(state):
+            value = state[name].detach().to(device="cpu").contiguous()
+            digest.update(name.encode("utf-8"))
+            digest.update(str(value.dtype).encode("utf-8"))
+            digest.update(repr(tuple(value.shape)).encode("utf-8"))
+            digest.update(value.view(torch.uint8).numpy().tobytes())
+        return digest.hexdigest()
+
+    def apply_vision_randomization(self, seed: int) -> dict[str, object]:
+        """Randomize only the loaded SmolVLM vision tower using a deterministic seed.
+
+        This method is deliberately called by ``lerobot_train`` after ``make_policy``. The
+        load-time path stays inert so evaluation/checkpoint loads never mutate weights.
+        """
+        if not isinstance(seed, int):
+            raise TypeError(f"SmolVLA vision randomization seed must be an int, got {seed!r}.")
+
+        vision_model = self.model.vlm_with_expert.get_vlm_model().vision_model
+        target_name = next(
+            (name for name, module in self.model.named_modules() if module is vision_model),
+            None,
+        )
+        if target_name is None:
+            raise RuntimeError("Could not locate SmolVLA vision_model in the policy module tree.")
+
+        before_policy = {
+            name: value.detach().cpu().clone() for name, value in self.model.state_dict().items()
+        }
+        target_keys = {
+            name for name in before_policy if name == target_name or name.startswith(f"{target_name}.")
+        }
+        if not target_keys:
+            raise RuntimeError(f"Vision target {target_name!r} has no state tensors.")
+        before_target = {name: before_policy[name] for name in sorted(target_keys)}
+        before_sha256 = self._state_digest(before_target)
+
+        _reinitialize_module(vision_model, seed)
+        # SmolVLA's normal recipe freezes the vision encoder and keeps it in eval mode.
+        self.model.vlm_with_expert.set_requires_grad()
+
+        after_policy = {name: value.detach().cpu() for name, value in self.model.state_dict().items()}
+        after_target = {name: after_policy[name] for name in sorted(target_keys)}
+        after_sha256 = self._state_digest(after_target)
+        changed_tensor_count = sum(
+            not torch.equal(before_target[name], after_target[name]) for name in target_keys
+        )
+        if before_sha256 == after_sha256 or changed_tensor_count == 0:
+            raise AssertionError(
+                "SmolVLA vision randomization did not change any target tensor; refusing to train."
+            )
+
+        untouched = [
+            name
+            for name, value in before_policy.items()
+            if name not in target_keys and not torch.equal(value, after_policy[name])
+        ]
+        if untouched:
+            raise AssertionError(
+                "SmolVLA vision randomization changed non-vision tensors: " + ", ".join(untouched[:8])
+            )
+
+        target_fqn = f"{type(vision_model).__module__}.{type(vision_model).__qualname__}"
+        source_file = inspect.getsourcefile(type(self)) or "<unknown>"
+        metadata: dict[str, object] = {
+            "sys_executable": sys.executable,
+            "lerobot_source_file": source_file,
+            "target_module_fqn": target_fqn,
+            "target_module_path": target_name,
+            "seed": seed,
+            "before_sha256": before_sha256,
+            "after_sha256": after_sha256,
+            "changed_tensor_count": changed_tensor_count,
+        }
+        logging.info(
+            "SmolVLA vision randomization provenance: %s",
+            " ".join(f"{key}={value}" for key, value in metadata.items()),
+        )
+
+        self.config.vision_randomization_applied = True
+        self.config.vision_randomization_seed = seed
+        self.config.vision_randomization_target_fqn = target_fqn
+        self.config.vision_randomization_source_file = source_file
+        self.config.vision_randomization_before_sha256 = before_sha256
+        self.config.vision_randomization_after_sha256 = after_sha256
+        self.config.vision_randomization_changed_tensor_count = changed_tensor_count
+        return metadata
 
     def supports_rtc(self) -> bool:
         return True

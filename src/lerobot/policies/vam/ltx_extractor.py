@@ -13,8 +13,11 @@ relative depth.
 from __future__ import annotations
 
 import hashlib
-from collections.abc import Callable
-from contextlib import nullcontext
+import os
+import sys
+import time
+from collections.abc import Callable, MutableMapping
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -71,6 +74,9 @@ class LTXExtractorConfig:
     fps: float = 10.0
     offload_mode: str = "cpu"
     quantization: str = "fp8-cast"
+    persistent_transformer: bool = True
+    explicit_prefix_execution: bool = True
+    vae_compile_mode: str | None = None
     checkpoint_sha256: str | None = None
     video_vae_sha256: str | None = None
     source_commit: str = "400fd31054597515f47125691032c04b1c3ee24e"
@@ -99,6 +105,8 @@ class LTXExtractorConfig:
             raise ValueError("offload_mode must be one of 'none', 'cpu', or 'disk'")
         if self.quantization not in {"none", "fp8-cast"}:
             raise ValueError("quantization must be 'none' or 'fp8-cast'")
+        if self.vae_compile_mode not in {None, "default", "reduce-overhead", "max-autotune"}:
+            raise ValueError("vae_compile_mode must be None, 'default', 'reduce-overhead', or 'max-autotune'")
 
 
 @dataclass(frozen=True, slots=True)
@@ -131,6 +139,7 @@ class LTXProvenance:
     dtype: str
     quantization: str
     offload_mode: str
+    vae_compile_mode: str | None
     token_geometry: tuple[int, int, int]
     target_frame_count: int
     conditioning_latent_frames: int
@@ -164,6 +173,7 @@ class LTXProvenance:
             "dtype": self.dtype,
             "quantization": self.quantization,
             "offload_mode": self.offload_mode,
+            "vae_compile_mode": self.vae_compile_mode,
             "token_geometry": list(self.token_geometry),
             "target_frame_count": self.target_frame_count,
             "conditioning_latent_frames": self.conditioning_latent_frames,
@@ -181,6 +191,19 @@ class LTXExtraction:
     sigma: torch.Tensor
     grid_shape: tuple[int, int, int]
     layer: int
+    provenance: LTXProvenance
+
+
+@dataclass(frozen=True, slots=True)
+class LTXMultiLayerExtraction:
+    """Detached hidden representations captured in one transformer prefix pass."""
+
+    hidden_grids: dict[int, torch.Tensor]
+    tokens_by_layer: dict[int, torch.Tensor]
+    sigma: torch.Tensor
+    grid_shape: tuple[int, int, int]
+    tapped_layers: tuple[int, ...]
+    deepest_layer: int
     provenance: LTXProvenance
 
 
@@ -263,13 +286,166 @@ def _autocast(device: torch.device, dtype: torch.dtype):
     return nullcontext()
 
 
+@contextmanager
+def _timed_stage(
+    device: torch.device,
+    timings: MutableMapping[str, float] | None,
+    name: str,
+):
+    if timings is None:
+        yield
+        return
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+    started = time.perf_counter()
+    try:
+        yield
+    finally:
+        if device.type == "cuda":
+            torch.cuda.synchronize(device)
+        timings[name] = time.perf_counter() - started
+
+
+def _add_official_source_paths() -> Path | None:
+    """Make the pinned official source closure importable without installing it."""
+
+    roots: list[Path] = []
+    configured = os.environ.get("LTX_SOURCE_ROOT")
+    if configured:
+        roots.append(Path(configured).expanduser())
+    roots.append(Path.home() / ".cache" / "video-vam" / "ltx-2-src")
+    for root in roots:
+        package_paths = [
+            root / "packages" / package / "src" for package in ("ltx-core", "ltx-pipelines", "ltx-kernels")
+        ]
+        existing = [path for path in package_paths if path.is_dir()]
+        if len(existing) >= 2:
+            for path in reversed(existing):
+                if str(path) not in sys.path:
+                    sys.path.insert(0, str(path))
+            return root
+    return None
+
+
+class _LTXEarlyExitError(Exception):
+    """Internal control flow carrying the selected pre-projection hidden state."""
+
+    def __init__(self, value: torch.Tensor) -> None:
+        super().__init__("LTX transformer stopped at selected hidden layer")
+        self.value = value
+
+
+class _DirectLTXStage:
+    """Small official-loader stage that avoids optional media pipeline imports."""
+
+    def __init__(self, builder: Any, device: torch.device, dtype: torch.dtype) -> None:
+        self._builder = builder
+        self._device = device
+        self._dtype = dtype
+
+    @contextmanager
+    def _transformer_ctx(self):
+        from ltx_core.model.transformer import X0Model
+
+        model = self._builder.build(device=self._device, dtype=self._dtype).eval()
+        wrapped = X0Model(model).eval()
+        try:
+            yield wrapped
+        finally:
+            teardown = getattr(model, "teardown", None)
+            if teardown is not None:
+                teardown()
+            dispose = getattr(model, "dispose", None)
+            if dispose is not None:
+                dispose()
+            del wrapped, model
+            if self._device.type == "cuda":
+                torch.cuda.empty_cache()
+
+
 class _OfficialLTXRunner:
     """Call the official LTX transformer and capture one block's video stream."""
 
-    def __init__(self, stage: Any, device: torch.device, dtype: torch.dtype) -> None:
+    def __init__(
+        self,
+        stage: Any,
+        device: torch.device,
+        dtype: torch.dtype,
+        *,
+        early_exit: bool = True,
+        persistent: bool = False,
+        explicit_prefix: bool = True,
+    ) -> None:
         self.stage = stage
         self.device = device
         self.dtype = dtype
+        self.early_exit = early_exit
+        self.persistent = persistent
+        self.explicit_prefix = explicit_prefix
+        self._transformer_context: Any | None = None
+        self._transformer_model: Any | None = None
+        self.last_profile: dict[str, Any] = {}
+
+    def open(self) -> float:
+        """Build the official transformer once for repeated extraction calls."""
+        if self._transformer_model is not None:
+            return 0.0
+        started = time.perf_counter()
+        context = self.stage._transformer_ctx()
+        try:
+            model = context.__enter__()
+        except BaseException:
+            context.__exit__(*sys.exc_info())
+            raise
+        self._transformer_context = context
+        self._transformer_model = model
+        elapsed = time.perf_counter() - started
+        self.last_profile["model_load_seconds"] = elapsed
+        return elapsed
+
+    def close(self) -> None:
+        """Release a persistent official transformer context."""
+        context = self._transformer_context
+        self._transformer_context = None
+        self._transformer_model = None
+        if context is not None:
+            context.__exit__(None, None, None)
+
+    @staticmethod
+    def _explicit_prefix_components(velocity_model: Any, layer_index: int) -> tuple[Any, Any] | None:
+        """Return the official model/block list when prefix execution is structurally safe."""
+
+        model = getattr(velocity_model, "_model", velocity_model)
+        blocks = getattr(velocity_model, "_blocks", None)
+        if blocks is None:
+            blocks = getattr(model, "transformer_blocks", None)
+        required = ("video_args_preprocessor", "block_input_processor", "num_blocks")
+        if blocks is None or any(not hasattr(model, name) for name in required):
+            return None
+        if layer_index >= len(blocks):
+            return None
+        return model, blocks
+
+    @staticmethod
+    def _run_explicit_prefix(model: Any, blocks: Any, modality: Any, layer_index: int) -> torch.Tensor:
+        """Execute the official eager preprocessing and blocks ``0..layer_index`` only."""
+
+        from ltx_core.guidance.perturbations import BatchedPerturbationConfig, PerturbationType
+
+        video = model.video_args_preprocessor.prepare(modality, None)
+        perturbations = BatchedPerturbationConfig.empty(
+            video.x.shape[0], model.num_blocks, video.x.device, video.x.dtype
+        )
+        for block_idx in range(layer_index + 1):
+            video = model.block_input_processor(
+                video,
+                perturbations,
+                block_idx,
+                self_attn_type=PerturbationType.SKIP_VIDEO_SELF_ATTN,
+                cross_attn_type=PerturbationType.SKIP_A2V_CROSS_ATTN,
+            )
+            video, _audio = blocks[block_idx](video=video, audio=None)
+        return video.x.detach()
 
     def __call__(
         self,
@@ -294,29 +470,225 @@ class _OfficialLTXRunner:
             context=prompt_embedding,
         )
         captured: list[torch.Tensor] = []
+        transfer_times: list[dict[str, float | int]] = []
+        execution_path = "official_full_forward"
 
         def capture(_module: nn.Module, _inputs: tuple[Any, ...], output: Any) -> None:
             video_output = output[0] if isinstance(output, tuple) else output
             value = getattr(video_output, "x", video_output)
-            if isinstance(value, torch.Tensor):
-                captured.append(value.detach())
+            if not isinstance(value, torch.Tensor):
+                return
+            detached = value.detach()
+            captured.append(detached)
+            if self.early_exit:
+                raise _LTXEarlyExitError(detached)
 
-        with self.stage._transformer_ctx() as x0_model:  # official lifecycle also handles CPU offload
-            velocity_model = x0_model.velocity_model
-            blocks = getattr(velocity_model, "_blocks", None)
-            if blocks is None:
-                blocks = getattr(velocity_model, "transformer_blocks", None)
-            if blocks is None:
-                raise LTXBackendError("Could not locate official LTX transformer blocks for hidden capture")
-            hook = blocks[layer_index].register_forward_hook(capture)
-            try:
-                with _autocast(self.device, self.dtype):
-                    velocity_model(video=modality, audio=None, perturbations=None)
-            finally:
-                hook.remove()
+        transformer_context = (
+            nullcontext(self._transformer_model)
+            if self._transformer_model is not None
+            else self.stage._transformer_ctx()
+        )
+        if self.persistent:
+            self.open()
+            transformer_context = nullcontext(self._transformer_model)
+        try:
+            with transformer_context as x0_model:  # official lifecycle also handles CPU offload
+                velocity_model = x0_model.velocity_model
+                blocks = getattr(velocity_model, "_blocks", None)
+                if blocks is None:
+                    blocks = getattr(velocity_model, "transformer_blocks", None)
+                if blocks is None:
+                    raise LTXBackendError(
+                        "Could not locate official LTX transformer blocks for hidden capture"
+                    )
+                provider = getattr(velocity_model, "_provider", None)
+                original_get = getattr(provider, "get", None)
+                if original_get is not None:
+
+                    def timed_get(index: int) -> Any:
+                        started = time.perf_counter()
+                        result = original_get(index)
+                        transfer_times.append({"block": index, "seconds": time.perf_counter() - started})
+                        return result
+
+                    provider.get = timed_get
+                try:
+                    prefix = (
+                        self._explicit_prefix_components(velocity_model, layer_index)
+                        if self.early_exit and self.explicit_prefix
+                        else None
+                    )
+                    if prefix is not None:
+                        execution_path = "explicit_prefix"
+                        model, prefix_blocks = prefix
+                        with _autocast(self.device, self.dtype):
+                            captured.append(
+                                self._run_explicit_prefix(model, prefix_blocks, modality, layer_index)
+                            )
+                    else:
+                        execution_path = (
+                            "hook_exception_fallback" if self.early_exit else "official_full_forward"
+                        )
+                        hook = blocks[layer_index].register_forward_hook(capture)
+                        try:
+                            try:
+                                with _autocast(self.device, self.dtype):
+                                    velocity_model(video=modality, audio=None, perturbations=None)
+                            except _LTXEarlyExitError:
+                                pass
+                        finally:
+                            hook.remove()
+                finally:
+                    if original_get is not None:
+                        provider.get = original_get
+        finally:
+            model_load_seconds = self.last_profile.get("model_load_seconds")
+            self.last_profile = {
+                "offload_block_get_seconds": transfer_times,
+                "blocks_loaded": [int(item["block"]) for item in transfer_times],
+                "early_exit": self.early_exit,
+                "execution_path": execution_path,
+                "selected_layer": layer_index,
+            }
+            if model_load_seconds is not None:
+                self.last_profile["model_load_seconds"] = model_load_seconds
         if len(captured) != 1:
             raise LTXBackendError(f"Expected one hidden capture at layer {layer_index}, got {len(captured)}")
         return captured[0]
+
+    def extract_layers(
+        self,
+        *,
+        latent: torch.Tensor,
+        prompt_embedding: torch.Tensor,
+        sigma: torch.Tensor,
+        denoise_mask: torch.Tensor,
+        positions: torch.Tensor,
+        layer_indices: tuple[int, ...],
+    ) -> dict[int, torch.Tensor]:
+        """Capture several block outputs while executing one prefix through the deepest block."""
+
+        try:
+            from ltx_core.model.transformer.modality import Modality
+        except ImportError as exc:  # pragma: no cover - exercised only in optional runtime
+            raise LTXBackendError("The official ltx-core package is not installed") from exc
+
+        if not layer_indices or tuple(sorted(set(layer_indices))) != layer_indices:
+            raise ValueError("layer_indices must be a non-empty, sorted tuple of unique block indices")
+        deepest = layer_indices[-1]
+        modality = Modality(
+            latent=latent,
+            sigma=sigma,
+            timesteps=denoise_mask * sigma[:, None],
+            positions=positions,
+            context=prompt_embedding,
+        )
+        captured: dict[int, torch.Tensor] = {}
+        transfer_times: list[dict[str, float | int]] = []
+        execution_path = "official_full_forward_multi_hook"
+
+        def capture(layer: int, *, stop: bool) -> Callable[[nn.Module, tuple[Any, ...], Any], None]:
+            def hook(_module: nn.Module, _inputs: tuple[Any, ...], output: Any) -> None:
+                video_output = output[0] if isinstance(output, tuple) else output
+                value = getattr(video_output, "x", video_output)
+                if not isinstance(value, torch.Tensor):
+                    return
+                detached = value.detach()
+                if layer in captured:
+                    raise LTXBackendError(f"LTX block {layer} produced more than one hidden capture")
+                captured[layer] = detached
+                if stop:
+                    raise _LTXEarlyExitError(detached)
+
+            return hook
+
+        transformer_context = (
+            nullcontext(self._transformer_model)
+            if self._transformer_model is not None
+            else self.stage._transformer_ctx()
+        )
+        if self.persistent:
+            self.open()
+            transformer_context = nullcontext(self._transformer_model)
+        try:
+            with transformer_context as x0_model:
+                velocity_model = x0_model.velocity_model
+                blocks = getattr(velocity_model, "_blocks", None)
+                if blocks is None:
+                    blocks = getattr(velocity_model, "transformer_blocks", None)
+                if blocks is None:
+                    raise LTXBackendError(
+                        "Could not locate official LTX transformer blocks for hidden capture"
+                    )
+                provider = getattr(velocity_model, "_provider", None)
+                original_get = getattr(provider, "get", None)
+                if original_get is not None:
+
+                    def timed_get(index: int) -> Any:
+                        started = time.perf_counter()
+                        result = original_get(index)
+                        transfer_times.append({"block": index, "seconds": time.perf_counter() - started})
+                        return result
+
+                    provider.get = timed_get
+                hooks: list[Any] = []
+                try:
+                    prefix = (
+                        self._explicit_prefix_components(velocity_model, deepest)
+                        if self.early_exit and self.explicit_prefix
+                        else None
+                    )
+                    if prefix is not None:
+                        execution_path = "explicit_prefix_multi_hook"
+                        model, prefix_blocks = prefix
+                        hooks = [
+                            prefix_blocks[layer].register_forward_hook(capture(layer, stop=False))
+                            for layer in layer_indices
+                        ]
+                        with _autocast(self.device, self.dtype):
+                            self._run_explicit_prefix(model, prefix_blocks, modality, deepest)
+                    else:
+                        execution_path = (
+                            "hook_exception_fallback_multi"
+                            if self.early_exit
+                            else "official_full_forward_multi_hook"
+                        )
+                        hooks = [
+                            blocks[layer].register_forward_hook(
+                                capture(layer, stop=self.early_exit and layer == deepest)
+                            )
+                            for layer in layer_indices
+                        ]
+                        try:
+                            with _autocast(self.device, self.dtype):
+                                velocity_model(video=modality, audio=None, perturbations=None)
+                        except _LTXEarlyExitError:
+                            pass
+                finally:
+                    for hook in hooks:
+                        hook.remove()
+                    if original_get is not None:
+                        provider.get = original_get
+        finally:
+            model_load_seconds = self.last_profile.get("model_load_seconds")
+            self.last_profile = {
+                "offload_block_get_seconds": transfer_times,
+                "blocks_loaded": [int(item["block"]) for item in transfer_times],
+                "early_exit": self.early_exit,
+                "execution_path": execution_path,
+                "selected_layers": list(layer_indices),
+                "deepest_layer": deepest,
+                "one_forward_pass": True,
+            }
+            if model_load_seconds is not None:
+                self.last_profile["model_load_seconds"] = model_load_seconds
+        missing = set(layer_indices) - set(captured)
+        extra = set(captured) - set(layer_indices)
+        if missing or extra:
+            raise LTXBackendError(
+                f"Multi-layer hidden capture mismatch: missing={sorted(missing)}, extra={sorted(extra)}"
+            )
+        return {layer: captured[layer] for layer in layer_indices}
 
 
 class LTXExtractor:
@@ -348,6 +720,10 @@ class LTXExtractor:
         self.latent_encoder = latent_encoder
         _freeze_module(self.backbone)
         _freeze_module(self.latent_encoder)
+        if hasattr(self.backbone, "persistent"):
+            self.backbone.persistent = config.persistent_transformer
+        if hasattr(self.backbone, "explicit_prefix"):
+            self.backbone.explicit_prefix = config.explicit_prefix_execution
         self.checkpoint_sha256, self.checkpoint_size_bytes = _file_metadata(
             config.checkpoint_path, config.checkpoint_sha256
         )
@@ -362,14 +738,18 @@ class LTXExtractor:
             raise FileNotFoundError(f"LTX transformer checkpoint not found: {self.config.checkpoint_path}")
         if not self.config.video_vae_path.is_file():
             raise FileNotFoundError(f"LTX video VAE checkpoint not found: {self.config.video_vae_path}")
+        source_root = _add_official_source_paths()
         try:
+            from ltx_core.block_streaming.builder import DISK_CPU_SLOTS, StreamingModelBuilder
+            from ltx_core.loader.fuse_loras import bf16_fuse_rule
+            from ltx_core.loader.registry import ModelRegistry
             from ltx_core.loader.single_gpu_model_builder import SingleGPUModelBuilder
+            from ltx_core.model.transformer import LTXV_MODEL_COMFY_RENAMING_MAP, LTXModelConfigurator
             from ltx_core.model.video_vae import VAE_ENCODER_COMFY_KEYS_FILTER, VideoEncoderConfigurator
-            from ltx_pipelines.utils.blocks import DiffusionStage
-            from ltx_pipelines.utils.types import OffloadMode
         except (ImportError, OSError) as exc:
             raise LTXBackendError(
-                "Install the official LTX-2 ltx-core and ltx-pipelines packages before real extraction"
+                "The official LTX-2 source closure is unavailable; install ltx-core/ltx-pipelines "
+                f"or set LTX_SOURCE_ROOT (checked {source_root or 'no local source root'})"
             ) from exc
 
         quantization = None
@@ -380,23 +760,64 @@ class LTXExtractor:
                 quantization = build_policy(str(self.config.checkpoint_path))
             except (ImportError, OSError, RuntimeError) as exc:
                 raise LTXBackendError("LTX fp8-cast quantization is unavailable on this runtime") from exc
-        try:
-            stage = DiffusionStage.from_checkpoint(
-                str(self.config.checkpoint_path),
-                dtype=self.dtype,
-                device=self.device,
-                quantization=quantization,
-                offload_mode=OffloadMode(self.config.offload_mode),
+        registry = ModelRegistry(cache_models=True, cache_weights=False)
+        fuse_rule = quantization.fuse_rule if quantization is not None else bf16_fuse_rule
+        if self.config.offload_mode == "none":
+            transformer_builder = SingleGPUModelBuilder(
+                model_path=str(self.config.checkpoint_path),
+                model_class_configurator=quantization.model_configurator
+                if quantization is not None and quantization.model_configurator is not None
+                else LTXModelConfigurator,
+                model_sd_ops=LTXV_MODEL_COMFY_RENAMING_MAP,
+                registry=registry,
+                fuse_rule=fuse_rule,
             )
+        else:
+            transformer_builder = StreamingModelBuilder(
+                model_path=str(self.config.checkpoint_path),
+                model_class_configurator=quantization.model_configurator
+                if quantization is not None and quantization.model_configurator is not None
+                else LTXModelConfigurator,
+                model_sd_ops=LTXV_MODEL_COMFY_RENAMING_MAP,
+                registry=registry,
+                fuse_rule=fuse_rule,
+                blocks_attr="transformer_blocks",
+                blocks_prefix="transformer_blocks",
+                cpu_slots_count=DISK_CPU_SLOTS if self.config.offload_mode == "disk" else None,
+            )
+        stage = _DirectLTXStage(transformer_builder, self.device, self.dtype)
+        try:
             encoder_builder = SingleGPUModelBuilder(
                 model_path=str(self.config.video_vae_path),
                 model_class_configurator=VideoEncoderConfigurator,
                 model_sd_ops=VAE_ENCODER_COMFY_KEYS_FILTER,
             )
             encoder = encoder_builder.build(device=self.device, dtype=self.dtype).eval()
+            if self.config.vae_compile_mode is not None:
+                compile_mode = (
+                    None if self.config.vae_compile_mode == "default" else self.config.vae_compile_mode
+                )
+                encoder = torch.compile(encoder, mode=compile_mode, fullgraph=False, dynamic=False)
         except Exception as exc:  # noqa: BLE001
             raise LTXBackendError(f"Could not build the official LTX components: {exc}") from exc
         return _OfficialLTXRunner(stage, self.device, self.dtype), encoder
+
+    def open_transformer(self) -> float:
+        """Open a persistent official transformer and return model-load seconds."""
+        opener = getattr(self.backbone, "open", None)
+        return float(opener()) if opener is not None else 0.0
+
+    def close(self) -> None:
+        """Release any persistent official transformer resources."""
+        closer = getattr(self.backbone, "close", None)
+        if closer is not None:
+            closer()
+
+    def __enter__(self) -> LTXExtractor:
+        return self
+
+    def __exit__(self, _exc_type: Any, _exc: Any, _traceback: Any) -> None:
+        self.close()
 
     def _preprocess_images(self, images: torch.Tensor) -> torch.Tensor:
         if not isinstance(images, torch.Tensor):
@@ -516,6 +937,29 @@ class LTXExtractor:
             layer_index=self.config.hidden_layer,
         )
 
+    def _run_backbone_layers(
+        self,
+        tokens: torch.Tensor,
+        prompt_embedding: torch.Tensor,
+        sigma: torch.Tensor,
+        denoise_mask: torch.Tensor,
+        positions: torch.Tensor,
+        layer_indices: tuple[int, ...],
+    ) -> dict[int, torch.Tensor]:
+        extractor = getattr(self.backbone, "extract_layers", None)
+        if extractor is None:
+            raise LTXBackendError(
+                "Multi-layer extraction requires a backbone with an extract_layers one-pass API"
+            )
+        return extractor(
+            latent=tokens,
+            prompt_embedding=prompt_embedding,
+            sigma=sigma,
+            denoise_mask=denoise_mask,
+            positions=positions,
+            layer_indices=layer_indices,
+        )
+
     def extract(
         self,
         images: torch.Tensor,
@@ -523,13 +967,15 @@ class LTXExtractor:
         *,
         prompt: str | None = None,
         noise_seed: int | None = None,
+        timings: MutableMapping[str, float] | None = None,
     ) -> LTXExtraction:
         """Run one frozen sigma=1 forward with an optional causal prompt encoder."""
 
         seed = self.config.seed if noise_seed is None else noise_seed
         if type(seed) is not int or seed < 0 or seed >= 2**32 - 1:
             raise ValueError("noise_seed must be an integer in [0, 2**32 - 2]")
-        images = self._preprocess_images(images)
+        with _timed_stage(self.device, timings, "input_preprocessing_h2d"):
+            images = self._preprocess_images(images)
         prompt_source = "embedding"
         if prompt_embedding is None:
             if prompt is None or self.prompt_encoder is None:
@@ -548,16 +994,28 @@ class LTXExtractor:
             )
         if not torch.is_floating_point(prompt_embedding) or not torch.isfinite(prompt_embedding).all().item():
             raise TypeError("prompt_embedding must be finite floating point")
-        prompt_embedding = prompt_embedding.to(device=self.device, dtype=self.dtype)
-        conditional, padded = self._encode_conditional_latents(images)
-        tokens, denoise_mask, positions, sigma = self._prepare_latent_state(conditional, seed)
-        with torch.no_grad(), _autocast(self.device, self.dtype):
+        with _timed_stage(self.device, timings, "prompt_context_prep"):
+            prompt_embedding = prompt_embedding.to(device=self.device, dtype=self.dtype)
+        with _timed_stage(self.device, timings, "vae_encode"):
+            conditional, padded = self._encode_conditional_latents(images)
+        with _timed_stage(self.device, timings, "noise_full_latent_assembly"):
+            tokens, denoise_mask, positions, sigma = self._prepare_latent_state(conditional, seed)
+        with (
+            _timed_stage(self.device, timings, "transformer_compute_to_hidden"),
+            torch.no_grad(),
+            _autocast(self.device, self.dtype),
+        ):
             hidden = self._run_backbone(tokens, prompt_embedding, sigma, denoise_mask, positions)
         if not isinstance(hidden, torch.Tensor):
             raise TypeError("LTX backbone hidden state must be a tensor")
         expected_tokens = (
             expected_batch * self.config.state_t * self.config.latent_height * self.config.latent_width
         )
+        feature_started = None
+        if timings is not None:
+            if self.device.type == "cuda":
+                torch.cuda.synchronize(self.device)
+            feature_started = time.perf_counter()
         if hidden.ndim == 3:
             expected = (expected_batch, expected_tokens // expected_batch, self.config.hidden_dim)
             if tuple(hidden.shape) != expected:
@@ -590,6 +1048,10 @@ class LTXExtractor:
             raise ValueError("LTX hidden state must contain only finite values")
         hidden_grid = hidden_grid.detach().contiguous()
         tokens_out = tokens_out.detach().contiguous()
+        if feature_started is not None:
+            if self.device.type == "cuda":
+                torch.cuda.synchronize(self.device)
+            timings["feature_flatten_projection_reduction"] = time.perf_counter() - feature_started
         checkpoint_identity = str(self.config.checkpoint_path)
         provenance = LTXProvenance(
             backbone=LTX_BACKBONE_NAME,
@@ -624,6 +1086,7 @@ class LTXExtractor:
             dtype=str(self.dtype).removeprefix("torch."),
             quantization=self.config.quantization,
             offload_mode=self.config.offload_mode,
+            vae_compile_mode=self.config.vae_compile_mode,
             token_geometry=(self.config.state_t, self.config.latent_height, self.config.latent_width),
             target_frame_count=self.config.target_frame_count,
             conditioning_latent_frames=self.config.latent_conditional_frames,
@@ -635,6 +1098,170 @@ class LTXExtractor:
             sigma=sigma,
             grid_shape=(self.config.state_t, self.config.latent_height, self.config.latent_width),
             layer=self.config.hidden_layer,
+            provenance=provenance,
+        )
+
+    def extract_layers(
+        self,
+        images: torch.Tensor,
+        prompt_embedding: torch.Tensor | None = None,
+        *,
+        layer_indices: tuple[int, ...],
+        prompt: str | None = None,
+        noise_seed: int | None = None,
+        timings: MutableMapping[str, float] | None = None,
+    ) -> LTXMultiLayerExtraction:
+        """Capture several LTX depths in one forward pass through the deepest tapped block."""
+
+        if (
+            not layer_indices
+            or any(type(layer) is not int or layer < 0 or layer >= LTX_NUM_BLOCKS for layer in layer_indices)
+            or tuple(sorted(set(layer_indices))) != layer_indices
+        ):
+            raise ValueError(
+                f"layer_indices must be a non-empty sorted tuple of unique values in [0, {LTX_NUM_BLOCKS})"
+            )
+        seed = self.config.seed if noise_seed is None else noise_seed
+        if type(seed) is not int or seed < 0 or seed >= 2**32 - 1:
+            raise ValueError("noise_seed must be an integer in [0, 2**32 - 2]")
+        with _timed_stage(self.device, timings, "input_preprocessing_h2d"):
+            images = self._preprocess_images(images)
+        prompt_source = "embedding"
+        if prompt_embedding is None:
+            if prompt is None or self.prompt_encoder is None:
+                raise ValueError("Provide prompt_embedding or both prompt and prompt_encoder")
+            prompt_embedding = self.prompt_encoder(prompt)
+            prompt_source = "prompt_encoder"
+        if not isinstance(prompt_embedding, torch.Tensor) or prompt_embedding.ndim != 3:
+            raise TypeError("prompt_embedding must have shape [B, sequence, 4096]")
+        expected_batch = images.shape[0]
+        if (
+            prompt_embedding.shape[0] != expected_batch
+            or prompt_embedding.shape[-1] != self.config.prompt_width
+        ):
+            raise ValueError(
+                f"prompt_embedding must have shape [B, sequence, {self.config.prompt_width}], got {tuple(prompt_embedding.shape)}"
+            )
+        if not torch.is_floating_point(prompt_embedding) or not torch.isfinite(prompt_embedding).all().item():
+            raise TypeError("prompt_embedding must be finite floating point")
+        with _timed_stage(self.device, timings, "prompt_context_prep"):
+            prompt_embedding = prompt_embedding.to(device=self.device, dtype=self.dtype)
+        with _timed_stage(self.device, timings, "vae_encode"):
+            conditional, padded = self._encode_conditional_latents(images)
+        with _timed_stage(self.device, timings, "noise_full_latent_assembly"):
+            tokens, denoise_mask, positions, sigma = self._prepare_latent_state(conditional, seed)
+        with (
+            _timed_stage(self.device, timings, "transformer_compute_to_deepest_hidden"),
+            torch.no_grad(),
+            _autocast(self.device, self.dtype),
+        ):
+            hidden_by_layer = self._run_backbone_layers(
+                tokens,
+                prompt_embedding,
+                sigma,
+                denoise_mask,
+                positions,
+                layer_indices,
+            )
+        if set(hidden_by_layer) != set(layer_indices):
+            raise LTXBackendError(
+                "LTX multi-layer backbone did not return exactly the requested hidden layers"
+            )
+        expected_tokens = self.config.state_t * self.config.latent_height * self.config.latent_width
+        tokens_by_layer: dict[int, torch.Tensor] = {}
+        hidden_grids: dict[int, torch.Tensor] = {}
+        for layer in layer_indices:
+            hidden = hidden_by_layer[layer]
+            if not isinstance(hidden, torch.Tensor):
+                raise TypeError(f"LTX backbone hidden state at layer {layer} must be a tensor")
+            if hidden.ndim == 3:
+                expected = (expected_batch, expected_tokens, self.config.hidden_dim)
+                if tuple(hidden.shape) != expected:
+                    raise ValueError(
+                        f"LTX layer {layer} hidden tokens must have shape {expected}, got {tuple(hidden.shape)}"
+                    )
+                layer_tokens = hidden
+                hidden_grid = hidden.reshape(
+                    expected_batch,
+                    self.config.state_t,
+                    self.config.latent_height,
+                    self.config.latent_width,
+                    self.config.hidden_dim,
+                )
+            elif hidden.ndim == 5:
+                expected = (
+                    expected_batch,
+                    self.config.state_t,
+                    self.config.latent_height,
+                    self.config.latent_width,
+                    self.config.hidden_dim,
+                )
+                if tuple(hidden.shape) != expected:
+                    raise ValueError(
+                        f"LTX layer {layer} hidden grid must have shape {expected}, got {tuple(hidden.shape)}"
+                    )
+                hidden_grid = hidden
+                layer_tokens = hidden.reshape(expected_batch, -1, self.config.hidden_dim)
+            else:
+                raise ValueError(
+                    f"LTX hidden state at layer {layer} must be rank 3 or 5, got rank {hidden.ndim}"
+                )
+            if hidden.dtype != self.dtype:
+                raise TypeError(
+                    f"LTX hidden state at layer {layer} must have dtype {self.dtype}, got {hidden.dtype}"
+                )
+            if not torch.isfinite(hidden).all().item():
+                raise ValueError(f"LTX hidden state at layer {layer} must contain only finite values")
+            hidden_grids[layer] = hidden_grid.detach().contiguous()
+            tokens_by_layer[layer] = layer_tokens.detach().contiguous()
+        deepest = layer_indices[-1]
+        deepest_tokens = tokens_by_layer[deepest]
+        provenance = LTXProvenance(
+            backbone=LTX_BACKBONE_NAME,
+            repository=LTX_BACKBONE_REPOSITORY,
+            source_commit=self.config.source_commit,
+            model_revision=self.config.model_revision,
+            checkpoint_path=str(self.config.checkpoint_path),
+            checkpoint_sha256=self.checkpoint_sha256,
+            checkpoint_size_bytes=self.checkpoint_size_bytes,
+            video_vae_path=str(self.config.video_vae_path),
+            video_vae_sha256=self.video_vae_sha256,
+            video_vae_size_bytes=self.video_vae_size_bytes,
+            hidden_layer=deepest,
+            num_blocks=LTX_NUM_BLOCKS,
+            layer_fraction=deepest / LTX_NUM_BLOCKS,
+            high_noise_sigma=self.config.high_noise_sigma,
+            noise_parameterization="normalized_rectified_flow_sigma",
+            schedule="LTX-2.5 distilled sigma schedule; extraction at sigma=1.0",
+            noise_seed=seed,
+            input_shape=tuple(images.shape),
+            padded_input_shape=tuple(padded.shape),
+            latent_shape=(
+                images.shape[0],
+                self.config.latent_channels,
+                self.config.state_t,
+                self.config.latent_height,
+                self.config.latent_width,
+            ),
+            token_shape=tuple(deepest_tokens.shape),
+            token_count=deepest_tokens.shape[1],
+            hidden_width=self.config.hidden_dim,
+            dtype=str(self.dtype).removeprefix("torch."),
+            quantization=self.config.quantization,
+            offload_mode=self.config.offload_mode,
+            vae_compile_mode=self.config.vae_compile_mode,
+            token_geometry=(self.config.state_t, self.config.latent_height, self.config.latent_width),
+            target_frame_count=self.config.target_frame_count,
+            conditioning_latent_frames=self.config.latent_conditional_frames,
+            prompt_source=prompt_source,
+        )
+        return LTXMultiLayerExtraction(
+            hidden_grids=hidden_grids,
+            tokens_by_layer=tokens_by_layer,
+            sigma=sigma,
+            grid_shape=(self.config.state_t, self.config.latent_height, self.config.latent_width),
+            tapped_layers=layer_indices,
+            deepest_layer=deepest,
             provenance=provenance,
         )
 

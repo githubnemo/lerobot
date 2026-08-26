@@ -125,6 +125,27 @@ def _make_eval_envs(cfg: TrainPipelineConfig) -> Iterator[dict[str, dict[int, An
         close_envs(envs)
 
 
+def _apply_policy_randomization_hook(cfg: TrainPipelineConfig, policy: PreTrainedPolicy) -> None:
+    """Apply an explicitly enabled policy randomization hook after weights are loaded."""
+    policy_cfg = cfg.policy
+    if policy_cfg is None or not getattr(policy_cfg, "randomize_vision", False):
+        return
+    if cfg.resume:
+        raise ValueError(
+            "--policy.randomize_vision=true cannot be used with --resume: the checkpoint already "
+            "records the post-randomization vision weights."
+        )
+    if cfg.seed is None:
+        raise ValueError("--policy.randomize_vision=true requires a non-null --seed.")
+    hook = getattr(policy, "apply_vision_randomization", None)
+    if not callable(hook):
+        raise ValueError(
+            f"Policy type {getattr(policy_cfg, 'type', type(policy).__name__)!r} does not implement "
+            "the requested vision randomization hook."
+        )
+    hook(cfg.seed)
+
+
 def _preprocess_dataset_batch(
     batch: dict[str, Any],
     camera_keys: list[str],
@@ -475,6 +496,7 @@ def train(cfg: TrainPipelineConfig):
             rename_map=cfg.rename_map,
             defer_weight_load=defer_weight_load,
         )
+        _apply_policy_randomization_hook(cfg, policy)
 
     peft_model = None
     if cfg.peft is not None:
@@ -552,6 +574,9 @@ def train(cfg: TrainPipelineConfig):
     if is_main_process():
         logging.info("Creating optimizer and scheduler")
     optimizer, lr_scheduler = make_optimizer_and_scheduler(cfg, policy)
+    if is_main_process():
+        fused = getattr(optimizer, "defaults", {}).get("fused", False)
+        logging.info("Optimizer ready: class=%s fused=%s", type(optimizer).__qualname__, fused)
 
     # --- resume phase 1 + dataloaders ----------------------------------------------------------
     step = 0  # number of loop steps (= micro-batches consumed per data-parallel worker)

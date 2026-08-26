@@ -72,6 +72,14 @@ class RTCInferenceConfig(InferenceEngineConfig):
     # (e.g. ``--inference.rtc.execution_horizon=...``).
     rtc: RTCConfig = field(default_factory=RTCConfig)
     queue_threshold: int = 30
+    # Opt-in control-rate visual history. A value above one delays the first
+    # inference until that many policy-rate observations have arrived and adds
+    # ``<image_key>.history`` tensors shaped [B,C,T,H,W] to the policy batch.
+    observation_history_size: int = 1
+
+    def __post_init__(self) -> None:
+        if self.observation_history_size <= 0:
+            raise ValueError("observation_history_size must be positive")
 
 
 # ---------------------------------------------------------------------------
@@ -123,6 +131,7 @@ def create_inference_engine(
             use_torch_compile=use_torch_compile,
             compile_warmup_inferences=compile_warmup_inferences,
             rtc_queue_threshold=config.queue_threshold,
+            observation_history_size=config.observation_history_size,
             shutdown_event=shutdown_event,
         )
     raise ValueError(f"Unknown inference engine type: {type(config).__name__}")

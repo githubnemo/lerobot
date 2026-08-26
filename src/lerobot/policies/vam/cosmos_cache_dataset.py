@@ -11,12 +11,14 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from .context_transform import CONTEXT_TRANSFORMS, context_transform_spec
 from .cosmos_feature_cache import (
     CACHE_SCHEMA_VERSION,
     CosmosFeatureCacheArtifact,
     CosmosFeatureCacheValidationError,
     load_feature_cache,
 )
+from .cosmos_predict2_extractor import VAE_INPUT_MODE_LEGACY_PADDED, VAE_INPUT_MODES
 
 MANIFEST_SCHEMA_VERSION = 1
 _MANIFEST_KEYS = frozenset(
@@ -102,6 +104,24 @@ class CacheManifest:
     @property
     def dataset_revision(self) -> str:
         return str(self.payload["dataset"]["revision"])
+
+    @property
+    def context_transform(self) -> str:
+        """Return the transform already present in stored context tensors."""
+        transform = self.payload["provenance"].get("context_transform", "none")
+        return str(transform)
+
+    @property
+    def vae_input_mode(self) -> str:
+        """Return the VAE mode, treating pre-mode manifests as legacy caches."""
+        mode = self.payload["provenance"].get("vae_input_mode", VAE_INPUT_MODE_LEGACY_PADDED)
+        return str(mode)
+
+    @property
+    def context_tokens(self) -> int | None:
+        """Return the declared stored token count, if this is a new manifest."""
+        value = self.payload["provenance"].get("context_tokens")
+        return None if value is None else int(value)
 
 
 def _sha256(value: str, name: str) -> str:
@@ -255,6 +275,45 @@ def _validate_payload(
         raise CosmosFeatureCacheManifestError("manifest global_seed must be a non-negative integer")
     if not isinstance(payload["provenance"], Mapping) or not payload["provenance"]:
         raise CosmosFeatureCacheManifestError("manifest provenance must be a non-empty object")
+    provenance = payload["provenance"]
+    transform = provenance.get("context_transform")
+    if transform is not None:
+        if transform not in CONTEXT_TRANSFORMS:
+            raise CosmosFeatureCacheManifestError("manifest provenance.context_transform is unsupported")
+        if type(provenance.get("context_tokens")) is not int or provenance["context_tokens"] <= 0:
+            raise CosmosFeatureCacheManifestError(
+                "manifest provenance.context_tokens must be a positive integer"
+            )
+        grid = provenance.get("context_grid")
+        if not isinstance(grid, Mapping) or set(grid) != {
+            "temporal",
+            "height",
+            "width",
+            "flatten_order",
+        }:
+            raise CosmosFeatureCacheManifestError("manifest provenance.context_grid is malformed")
+        if (
+            any(type(grid[name]) is not int or grid[name] <= 0 for name in ("temporal", "height", "width"))
+            or grid["flatten_order"] != "T,H,W"
+        ):
+            raise CosmosFeatureCacheManifestError(
+                "manifest provenance.context_grid has invalid dimensions or order"
+            )
+        spec = context_transform_spec(transform)
+        if (grid["temporal"], grid["height"], grid["width"]) != spec.output_grid or provenance[
+            "context_tokens"
+        ] != spec.output_tokens:
+            raise CosmosFeatureCacheManifestError(
+                "manifest context transform, grid, and token count are inconsistent"
+            )
+    vae_input_mode = provenance.get("vae_input_mode", VAE_INPUT_MODE_LEGACY_PADDED)
+    if vae_input_mode not in VAE_INPUT_MODES:
+        raise CosmosFeatureCacheManifestError("manifest provenance.vae_input_mode is unsupported")
+    random_init_seed = provenance.get("random_init_seed")
+    if random_init_seed is not None and (type(random_init_seed) is not int or random_init_seed < 0):
+        raise CosmosFeatureCacheManifestError(
+            "manifest provenance.random_init_seed must be null or non-negative"
+        )
     if not isinstance(payload["runtime"], Mapping):
         raise CosmosFeatureCacheManifestError("manifest runtime must be an object")
     raw_entries = payload["entries"]
@@ -444,6 +503,27 @@ class CosmosFeatureCacheDataset:
         ):
             raise CosmosFeatureCacheManifestError(
                 f"cache artifact provenance does not match manifest entry {entry.sample_id}"
+            )
+        artifact_mode = artifact.provenance.payload["extractor"].get(
+            "vae_input_mode", VAE_INPUT_MODE_LEGACY_PADDED
+        )
+        if artifact_mode != self.manifest.vae_input_mode:
+            raise CosmosFeatureCacheManifestError(
+                f"cache artifact VAE input mode does not match manifest for {entry.sample_id}"
+            )
+        output = artifact.provenance.payload["output"]
+        artifact_transform = output.get("context_transform", "none")
+        if artifact_transform != self.manifest.context_transform:
+            raise CosmosFeatureCacheManifestError(
+                f"cache artifact context transform does not match manifest for {entry.sample_id}"
+            )
+        declared_tokens = self.manifest.context_tokens
+        if declared_tokens is not None and (
+            artifact.context.shape[1] != declared_tokens
+            or output.get("context_tokens", artifact.context.shape[1]) != declared_tokens
+        ):
+            raise CosmosFeatureCacheManifestError(
+                f"cache artifact token count does not match manifest for {entry.sample_id}"
             )
         if verify_hashes:
             self._verified_sample_ids.add(entry.sample_id)

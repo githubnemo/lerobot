@@ -285,6 +285,10 @@ def build_rollout_context(
             "Please use `cpu` or `cuda` backend."
         )
 
+    validate_rollout_safety = getattr(policy_config, "validate_rollout_safety", None)
+    if callable(validate_rollout_safety):
+        validate_rollout_safety(cfg)
+
     policy = _load_pretrained_policy(policy_config)
 
     if is_rtc:

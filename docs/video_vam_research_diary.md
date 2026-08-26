@@ -1033,133 +1033,7 @@ Cloud budget / quantization constraints:
 
 After these answers, the next step should be a concrete data/hardware audit and feasibility probes—not a large training run.
 
-## 14. Approved native SO-101 World2Action decoder (2026-08-17)
-
-The implementation gate is now closed for the native mimic-video action path.
-The pinned source is `e3355dbc93132b576c02f920a59b4fc18a4f5906`; only the
-upstream `world2action_dit.py` and `beta_scheduler.py` are added to the
-existing minimal Cosmos vendor closure. The LeRobot-owned wrapper is CPU
-unit-testable with an injected fake and does not instantiate the 24-block model
-unless a real CUDA configuration is requested.
-
-### Runtime contract
-
-- State is `[B, 1, 6]`; action target/sample is `[B, 30, 6]`; decoder
-  `max_horizon=31`, `in_channels=6`, and `out_channels=6`.
-- Frozen generic Cosmos context is `[B, N, 2048]`, from xattn layer 20, with
-  video high-noise sigma 10 and explicit context timestep `[B, 1]`.
-- Native capacity is model width 1024, 24 blocks, 8 heads, MLP ratio 4,
-  AdaLN-LoRA enabled with dimension 128, and pair timestep rank 1024. There
-  is no projection adapter for 2048-dimensional Cosmos context.
-- The approved runtime uses PyTorch 2.11 scaled dot-product attention through
-  the upstream torch attention op. This preserves architecture, weights, and
-  capacity but is a latency implementation difference from `flash_attn_no_cp`.
-
-### Objective, gradients, and normalization
-
-Training samples epsilon from a standard normal and uniform `t` from the
-registered Beta(1.0, 1.0) scheduler (bounded to `[0.001, 1.0]` by the official
-implementation). It forms `xt=(1-t)x0+t epsilon`, predicts `u=epsilon-x0`,
-feeds `xt/sqrt((1-t)^2+t^2)` to the decoder, and computes float32 MSE. State and
-action are normalized with train-set-only per-joint min/max statistics to
-`[-1,1]`; degenerate ranges and non-train provenance are rejected. The
-safetensors plus JSON artifact is frozen and pickle-free.
-
-Cosmos context is detached at the wrapper boundary. Decoder parameters,
-including the context LayerNorm, remain trainable; no gradient can enter the
-frozen context tensor. CUDA action training uses BF16 model inputs and weights,
-with the objective evaluated in float32. Inference uses dropout 0, starts from
-seeded Gaussian noise at `t=1`, and takes exactly ten official Euler scheduler
-steps to `t=0`.
-
-### Scientific adaptations and fairness
-
-This is the native decoder family, not a small capacity probe. Explicit
-adaptations are SO-101 6D state/action instead of upstream padded 10D actions,
-horizon 31 instead of upstream 16/61 choices, generic frozen Cosmos first
-instead of Bridge-first, and explicit hidden context/context-timestep inputs.
-None changes decoder capacity. The torch SDPA backend must be reported as a
-latency/runtime difference in fairness comparisons; model quality comparisons
-must keep the architecture, weights, normalization provenance, horizon, and
-sampling schedule fixed. Parameter counts are obtained with
-`World2ActionDecoder.parameter_count_report()` and split decoder versus the
-non-trainable normalizer.
-
-## 15. Scratch initialization for SO-101 action training (2026-08-17)
-
-The native 6D SO-101 action decoder intentionally has no pretrained checkpoint
-path. When `action_checkpoint_path` is omitted, LeRobot constructs the exact
-24-block World2Action DiT through its official constructor and initialization
-path; it never silently loads an upstream 10D checkpoint. The full action
-architecture is trained from scratch for the 6D overfit while generic Cosmos
-context remains frozen.
-
-The wrapper does not reset global torch RNG state. The LeRobot trainer must set
-its established seed before policy construction, and that seed will be recorded
-in later training provenance. An explicitly supplied checkpoint still uses
-strict key/shape validation and safe loading.
-
-## Approved Cosmos cache-builder and World2Action overfit diagnostic
-
-This plumbing run is diagnostic-only and is excluded from scientific comparison. The frozen Cosmos extractor is loaded once and receives only `rgb_history [1,3,5,480,640]` plus the prompt embedding `[1,512,1024]`; state `[1,1,6]`, action labels `[1,30,6]`, and `action_is_pad [1,30]` stay outside that boundary. Each cache artifact stores detached BF16 context `[1,19200,2048]`, FP32 state/action labels, the boolean padding mask, and strict JSON provenance. A full context is roughly 75 MiB/window before sidecar overhead.
-
-The per-window extractor noise seed is `SHA256(dataset_revision, episode, current_frame, global_seed)` reduced to the NumPy-compatible range. It is recorded in the sidecar, so the same window has identical frozen noise across action-training epochs while different windows do not. `action_is_pad=true` means the action token is padding; padded tokens are excluded from flow-loss reduction and train min/max statistics. The current state has no temporal padding and remains `[B,1,6]`.
-
-Parent commands on abakus (no network, model download, or training command is implicit in this diary):
-
-```bash
-cd /home/anton/lerobot-video-vam
-scripts/video_vam/run_build_cosmos_feature_cache.sh \
-  --episodes 0 --max-samples 4 --seed 17 \
-  --output-dir /home/anton/.cache/video-vam/cosmos-features-episode0-4 \
-  --manifest /home/anton/.cache/video-vam/cosmos-features-episode0-4/manifest.json
-
-scripts/video_vam/run_train_cosmos_world2action_overfit.sh \
-  --manifest /home/anton/.cache/video-vam/cosmos-features-episode0-4/manifest.json \
-  --output-dir /home/anton/.cache/video-vam/world2action-overfit-episode0-4 \
-  --steps 300 --batch-size 1 --seed 17 \
-  --i-understand-diagnostic
-
-/home/anton/lerobot-video-vam/.venv/bin/python -c \
-  "import json; from pathlib import Path; p=Path(\"/home/anton/.cache/video-vam/world2action-overfit-episode0-4/metrics.jsonl\"); rows=[json.loads(line) for line in p.read_text().splitlines()]; print(json.dumps({\"first\": rows[0], \"last\": rows[-1]}, indent=2))"
-```
-
-The cache manifest is ordered by episode/current-frame and contains artifact hashes, subset selection, runtime, and frozen-tensor provenance. The lazy training loader validates the manifest first, then hashes and strictly loads only the artifact requested for a step; it does not retain all contexts in RAM. The trainer computes the normalizer from manifest entries only, constructs the full native 499,171,958-parameter decoder from scratch after seeding, converts trainable weights/master weights to FP32, and uses CUDA BF16 autocast for compute. Checkpoints are safetensors weights plus strict JSON metadata, with the normalizer stored separately; optimizer state is intentionally not resumable for this 300-step diagnostic.
-
-Inspect `metrics.jsonl` for the fixed-sample flow loss at step 0 and step 300, per-step loss/gradient/LR/VRAM, and the final ten-step sampled-action physical-unit MSE over valid action positions. No output from this path is a robot-ready policy.
-
-## 16. Torch attention backend interface correction (2026-08-17)
-
-The approved PyTorch SDPA backend exposed a shape mismatch during the first full
-World2Action training step: its helper flattened the head dimension before the
-common `Attention` wrapper, which expects every backend to return `[B, S, H, D]`
-and performs the final flatten itself. The helper now only transposes SDPA's
-`[B, H, S, D]` result back to `[B, S, H, D]`; SDPA scaling, architecture, and
-weights are unchanged. The copied text-to-image helper retains its flattened
-contract because its caller passes that result directly to its output projection.
-
-## 17. Native state-token output contract (2026-08-17)
-
-The native World2Action DiT returns one prediction for the state token followed
-by the 30 action predictions: `[B, 31, 6]`. The LeRobot wrapper now mirrors the
-official pipeline and slices exactly the `HO=1` state-token prefix, exposing
-`[B, 30, 6]` for the action loss and policy output. The state-token prediction
-participates in the internal sequence but is not supervised as an action.
-Explicitly injected denoisers may provide the already-sliced `[B, 30, 6]`
-contract; arbitrary lengths are rejected.
-
-## 18. Diagnostic reopen/evaluation lifecycle (2026-08-17)
-
-The 1,000-step World2Action checkpoint is reopened only through a strict
-safetensors plus JSON path. Metadata must remain
-`diagnostic_only_non_rollout`, `robot_ready=false`, full native parameter count
-499,171,958, and must match the exact cache manifest hash/path and train
-normalizer path. Evaluation reconstructs every manifest entry with fixed
-`t=0.5`, deterministic seeded epsilon, and the exact ten-step sampler; padded
-action positions are excluded from physical MSE. This is training-set
-reconstruction evidence, not generalization or rollout evidence.
-
-## 19. Smallest causal SO-101 Cosmos-VAM path and intentional overfit (2026-08-17)
+## 14. Daily entry — smallest causal SO-101 Cosmos-VAM path and intentional overfit (2026-08-17)
 
 Today’s goal was deliberately narrow: establish the smallest causal SO-101
 Cosmos-VAM end-to-end path and perform an intentional tiny overfit. This was
@@ -1189,8 +1063,7 @@ and the global seed, so the same cached window has stable frozen features.
 There is one LeRobot Python environment at `/home/anton/lerobot-video-vam/.venv`.
 The recorded runtime is Python 3.12.3, torch 2.11.0+cu128, an NVIDIA RTX 4090,
 and Transformer Engine 2.18 with a CUDA 12 runtime. T5 and all generated
-artifacts were retained; no cleanup or alternate environment is part of this
-path.
+artifacts were retained.
 
 The official prompt embedding for `take cube out of box` is `[1, 512, 1024]`
 BF16. The verified T5 checkpoint SHA256 is
@@ -1225,7 +1098,7 @@ The retained one-window smoke cache is:
 
 `/home/anton/.cache/video-vam/cosmos-features/cube-out-of-box-episode-0000-frame-000004.safetensors`
 
-Its JSON sidecar is beside it. The larger diagnostic cache is rooted at
+The larger diagnostic cache is rooted at
 `/home/anton/.cache/video-vam/cosmos-overfit-ep0-64/`; its manifest contains 64
 ordered windows and hashes for every detached context and sidecar.
 
@@ -1245,9 +1118,8 @@ train-set-only per-joint min-max normalization to `[-1, 1]`. The flow objective
 is masked by valid action positions and evaluated in FP32.
 
 The approved runtime deviation is PyTorch SDPA in place of upstream
-`flash_attn_no_cp`. It was applied consistently in the later diagnostic and
-completion runs. This is a backend/runtime difference, not a smaller decoder,
-a changed context, or a changed scientific target.
+`flash_attn_no_cp`. This is a backend/runtime difference, not a smaller
+decoder, a changed context, or a changed scientific target.
 
 ### First diagnostic: all 64 episode-0 windows
 
@@ -1256,11 +1128,6 @@ The 64-window diagnostic cache payload is 5,033,618,046 bytes. The aggressive
 size 1. Its fixed flow loss moved from 3.9865 to 1.0808. The fixed sampled
 physical-action MSE was 469.51. This was a partial fit only; the full 64-window
 run did not fully overfit.
-
-The run and cache are diagnostic artifacts, not candidate policy checkpoints.
-They were useful for exposing the end-to-end memory, shape, loader, scheduler,
-normalization, and decoder contracts before spending time on the approved
-completion run.
 
 ### Approved completion: strict evenly spaced eight-window subset
 
@@ -1273,8 +1140,7 @@ On the fixed flow probe, loss decreased from 4.3372 to 0.1526. The last
 stochastic training loss was 0.1347. The fixed sampled action probe reported
 physical MSE 27.30 and RMSE 5.22.
 
-Reopening the checkpoint and evaluating all eight manifest entries with fixed
-reconstruction inputs and the exact ten-step sampler gave:
+Reopening the checkpoint and evaluating all eight manifest entries gave:
 
 - fixed flow loss mean 0.17590, minimum 0.14695, maximum 0.22224;
 - sampled physical-action MSE mean 52.5811, minimum 22.8734, maximum 90.4789;
@@ -1301,43 +1167,32 @@ The reopened all-eight evaluation JSON is:
 `/home/anton/.cache/video-vam/runs/cosmos-overfit-even8-s0/evaluation-step-001000.json`
 
 The weights-only safetensors file is 1,996,754,912 bytes and contains 610
-tensors. Metadata marks it `diagnostic_only_non_rollout` and `robot_ready=false`.
-The checkpoint is tied to the evenly spaced manifest and the train-only
-normalizer; it is not a robot-ready policy artifact.
+tensors. Metadata marks it `diagnostic_only_non_rollout` and
+`robot_ready=false`.
 
 ### Compatibility and root-cause findings
 
-The following findings are worth carrying forward as compatibility/root-cause
-notes. They are not scientific modifications to the experiment:
-
 - The released scheduler configuration overrides the `BetaScheduler` default
-  with the required uniform `Beta(1,1)` distribution. Treat the registered
-  config as authoritative when reproducing action-time sampling.
+  with the required uniform `Beta(1,1)` distribution.
 - The native image contract is 480x640. The 704x1280 assumption was generic
   Cosmos context, not this pinned camera/checkpoint contract.
 - With Transformers 5, tokenizer length semantics come from `attention_mask`,
-  not the returned length field. This preserves the official prompt embedding.
+  not the returned length field.
 - The strict checkpoint loader allows only the exact known Transformer Engine
-  extra-state metadata entries. Parameters, buffers, missing keys, and other
-  unexpected keys remain strict failures.
+  extra-state metadata entries.
 - Official autocast is needed around the CUDA Cosmos forward so FP32 timestep
-  embeddings reach the autocast-aware linear layers correctly.
-- The torch SDPA helper must honor the common four-dimensional backend contract
-  `[B, S, H, D]`; the common attention wrapper performs the final flatten.
-- The native decoder returns state plus action tokens. The wrapper must slice
-  exactly one internal state token before action loss and policy output.
-
-These corrections explain runtime compatibility and shape failures observed
-along the path. They should not be described later as representation,
-normalization, or model-quality interventions.
+  embeddings reach autocast-aware linear layers correctly.
+- The torch SDPA helper must return `[B, S, H, D]`; the common wrapper performs
+  the final flatten.
+- The native decoder returns state plus action tokens, so exactly one internal
+  state-token output must be sliced before action loss and policy output.
 
 ### Verification record and limitations
 
 Recorded at the end of this session: the final focused suite had 85 passing
-tests, and Ruff/format checks were clean. This count intentionally does not
-inflate the session result with later isolated tests.
+tests, and Ruff/format checks were clean.
 
-Limitations to keep attached to every interpretation:
+Limitations:
 
 - Training used only episode-0 windows; there is no held-out validation split.
 - Each physical-action sample was evaluated with one evaluation seed.
@@ -1345,12 +1200,11 @@ Limitations to keep attached to every interpretation:
   confirmed against the SO-101 dataset and robot interface.
 - The checkpoint is diagnostic-only and is not robot-ready.
 - The optimizer setting was aggressive and intended only for this diagnostic.
-- The full 64-window run did not fully overfit, so the eight-window result is
-  not evidence that the larger training population is solved.
+- The full 64-window run did not fully overfit.
 
 ### Next decision gates
 
-No next direction is selected in this entry. The next decision gates are:
+No next direction is selected in this entry:
 
 - full-episode and held-out protocol;
 - SmolVLA baseline;
@@ -1358,128 +1212,627 @@ No next direction is selected in this entry. The next decision gates are:
 - rollout wrapper and safety;
 - LTX extraction architecture.
 
-## 2026-08-19 — Randomized-sigma online training, effective batch 8
+## 2026-08-18 — Does the video context actually contribute anything?
 
-This entry records an unattended overnight session on `abakus`. Its purpose was
-to remove the two failure modes identified against upstream mimic-video
-@`e3355dbc93132b576c02f920a59b4fc18a4f5906` — a fixed video sigma far above the
-upstream distribution, and drastic under-training — and then to train and
-evaluate under one fixed, recorded evaluation sigma.
+The overnight rehearsal run gave us a training curve that went down, which is
+easy to over-read. This session was spent trying to falsify it. The headline is
+that we could not yet show the pretrained Cosmos context contributes any
+information at all, and we found a concrete defect in our own pipeline that is
+the most likely cause.
 
-### What changed in the code
+### Upstream contract, verified against source
 
-- `scripts/video_vam/train_cosmos_world2action.py`
-  - The online per-step sigma draw is now an explicit named method,
-    `OnlineCosmosContext.draw_sigma`, implementing upstream's law: per sample,
-    `4 * exp(N(0, 1))`, replaced with probability 0.05 by
-    `exp(Uniform(log 200, log 100000))`. The sigma the features were actually
-    generated at is returned by the extractor and passed straight through as the
-    decoder's `context_timestep`, so the decoder is never told a sigma other
-    than the one its features came from.
-  - Fixed a real bug in online mode: the latent noise seed was derived from the
-    optimizer step, so every gradient-accumulation micro-batch inside one step
-    saw identical noise. It is now derived from the global micro-batch index.
-  - New `--eval-sigma` (default 4.0). Validation no longer hardcodes 10.0 for
-    either the fixed-probe flow loss or the ten-step action sampling.
-  - New `--val-manifest`, so validation can read contexts from a cache extracted
-    at the evaluation sigma while training extracts online at random sigmas.
-  - New `--warmup-steps`, so warm-up scales with the step budget instead of
-    being pinned at 1000.
-  - New `--select-metric {flow,rmse}`, so the best checkpoint can be selected by
-    validation action RMSE in degrees rather than by flow loss.
-  - Checkpoint metadata now records the sigma _distribution_, the evaluation
-    sigma, and the selection metric, instead of asserting `video_sigma = 10.0`.
-- `scripts/video_vam/evaluate_action_rmse.py`
-  - Stopped falling through to the decoder default of `video_sigma = 10.0`. It
-    reads the training run's recorded evaluation sigma from the checkpoint
-    metadata, accepts an explicit `--vam-sigma`, and writes the resolved value
-    and its source into the output JSON.
-- `scripts/video_vam/build_cosmos_feature_cache.py`: new `--sigma`, threaded
-  into the extractor config, into both extraction-output validations, and into
-  the manifest provenance.
-- `src/lerobot/policies/vam/cosmos_feature_cache.py`: the cache contract
-  accepted only `high_noise_sigma == 10.0`; it now accepts any finite positive
-  sigma, which is what makes caches at other sigmas legal artifacts.
-- `src/lerobot/policies/vam/action_rmse.py`: `VAMBackend` now falls back to the
-  batch device when the decoder exposes no `denoiser`, which keeps the injected
-  test doubles working alongside the device-placement fix.
+Two claims from earlier in the project needed checking against
+`model/cosmos_predict2/models/world2action_model.py` at ref
+`e3355dbc93132b576c02f920a59b4fc18a4f5906`.
 
-### Judgement calls
+The 35-step `generate_video(..., num_sampling_step=35, guidance=0.0,
+return_all_context=True)` call exists only inside the `validation_step`
+analysis branch, which sweeps action MSE across every scheduler sigma to study
+sigma sensitivity. It is **not** the training path. Training goes through
+`get_crossattn_emb` (lines 323-352), which performs exactly one
+`video2world_pipe.denoise(...)` call with
+`return_only_hidden_states_up_to=xattn_layer_idx`. Our single-forward extractor
+therefore matches upstream and needs no 35x rebuild.
 
-- **The denormalization clamp is kept, not made exact.** Clamping projects a
-  prediction onto the convex training joint range. Every reachable position of
-  this robot lies inside that range, so the projection can only move a
-  prediction closer to its target; it cannot inflate the reported error. The
-  behaviour is documented on `ActionStateNormalizer`.
-- **Validation and final comparison use one fixed sigma, 4.0** — upstream's
-  median — recorded in both the checkpoint metadata and the comparison JSON, so
-  numbers stay comparable across runs and models.
-- **A full sigma-4.0 context cache was built for all 40 episodes** rather than
-  the eight validation episodes alone. The split contract requires every split
-  episode to be present in the manifest it validates against, and 337 windows
-  cost only 16 minutes.
-- **Effective batch 8, micro-batch 1.** Online extraction dominates at about
-  2.4 s per window and peak VRAM is 19.1 GiB of 24 GiB with micro-batch 1, so a
-  larger micro-batch is not available and effective batch 16 would have halved
-  the step count.
-- Padded actions were confirmed excluded from the training loss, the validation
-  metrics, and the normalization statistics.
+The consequential finding is in `draw_video_sigma` (lines 360-379). Upstream
+re-draws **both the noise and the sigma on every training step**, including a
+5% branch that replaces sigma with `exp(U(log 200, log 100000))`, and feeds the
+drawn sigma to the decoder as context-timestep conditioning. Our cached
+pipeline used a **constant sigma of 10.0** for both extraction and decoder
+conditioning. Every window thus had exactly one frozen context vector at one
+noise level, and the decoder's sigma input was a constant.
 
-### Configuration and measured throughput
+Upstream also builds conditioning as a 61-frame zero pixel tensor with only the
+first `T` frames populated (`T in (1, 5)`,
+`num_latent_conditional_frames = 1 if T == 1 else 2`), whereas we encoded `T`
+frames and zero-padded in latent space. Decision taken: align to upstream.
 
-Online context extraction, batch 1 with 8 gradient accumulation steps
-(effective batch 8), lr 1e-4, weight decay 0.1, betas (0.9, 0.99), gradient
-clip 10.0, `loss_scale` 10.0, bfloat16, warm-up 250 steps of a 950-step budget,
-validation and checkpoint every 50 steps, best checkpoint by validation action
-RMSE, evaluation sigma 4.0.
+### Experiment 1 — is the visual conditioning causally used?
 
-Measured **19.6 s per optimizer step** (0.41 samples/s), peak VRAM 19.07 GiB.
-Validation over 88 held-out windows added roughly 7% overhead.
+The 47 dB conditioning reconstruction measured earlier does not prove the DiT
+_uses_ the conditioning, since those frames are written into the latent at
+every step and would reconstruct even if ignored. Test: generate the same
+window twice with identical seed, once with true conditioning frames and once
+with frames from a different episode, then score the two generated futures
+against each other.
 
-### Result
+- true vs foreign conditioning: 15.97 dB / 0.567 SSIM
+- true vs zeroed conditioning: 16.74 dB / 0.553 SSIM
+- foreign vs zero: 14.41 dB / 0.495 SSIM
 
-Training ran 768 steps and stopped at its wall-clock limit. Validation action
-RMSE in degrees fell monotonically in trend but noisily: 68.6 at step 50, 34.7
-at 500, 27.8 at 600, best **26.29 at step 700**, 30.0 at 750. Train loss fell
-from 2.5 to about 0.45. Gradient norms started near 390 and settled around
-20-50, so clip 10.0 still binds.
+Conditioning materially changes the output, so it is not causally inert. The
+failure mode is "used but wrong": a capability and domain-gap limitation, not a
+wiring defect.
 
-Four-way comparison on the eight held-out episodes (88 windows, evaluation
-sigma 4.0):
+### Experiment 2 — one conditioning frame or five?
 
-| backend        | aggregate RMSE (deg) |
-| -------------- | -------------------- |
-| smolvla        | 15.00                |
-| state_repeat   | 18.86                |
-| vam (step 700) | 26.12                |
-| mean_action    | 30.15                |
+Upstream's assert permits `T == 1`. Five frames beat one, so our choice is not
+the problem. Both remain far below a static-frame baseline.
 
-The `state_repeat`, `mean_action`, and `smolvla` numbers reproduce the previous
-session exactly, which confirms the protocol and the sigma-4.0 cache are
-consistent and that only the VAM entry changed.
+| Window     | 1 frame          | 5 frames         | static baseline  |
+| ---------- | ---------------- | ---------------- | ---------------- |
+| episode 0  | 13.41 dB / 0.525 | 14.55 dB / 0.560 | 24.11 dB / 0.851 |
+| episode 19 | 10.70 dB / 0.462 | 10.73 dB / 0.487 | 13.45 dB / 0.698 |
 
-### Interpretation and limitations
+Also confirmed that `guidance=0.0` is canonical; the CFG variant we had added
+made predictions worse (14.75 dB to 12.37 dB), consistent with it being a
+deviation rather than a fix.
 
-- The sigma mismatch is eliminated and the evaluation is now explicit and
-  recorded, but the model still does not clear the `state_repeat` bar of 18.86.
-- This run is _not_ evidence that randomized sigma is worse than fixed sigma.
-  It is under-trained: 768 steps at effective batch 8 is 6.1k samples, against
-  the prior run's 3100 steps at effective batch 2, and the validation curve was
-  still descending when the budget ran out.
-- The run was interrupted once near step 511 and correctly resumed from the
-  step-500 checkpoint; the second half ran at 31 s per step because another job
-  shared the GPU, which is why only 768 of 950 steps completed.
-- The checkpoint remains diagnostic-only and not robot-ready.
+### Experiment 3 — the shuffled-context control (the important one)
 
-### Artifacts
+Pair each window's state and actions with a **different** window's real Cosmos
+features via a seeded derangement. The feature distribution is exactly the real
+one; only the correspondence to the actions is destroyed. This cannot be
+dismissed as random weights producing out-of-distribution activations.
 
-- Run directory: `/home/anton/.cache/video-vam/runs/cosmos2b-online-randsigma-eb8`
-- Logs: `/home/anton/.cache/video-vam/runs/night-20260819/{driver,train,cache_sigma4,eval}.log`
-- Comparison: `/home/anton/.cache/video-vam/runs/night-20260819/action_rmse_comparison.json`
-- Sigma-4.0 cache: `/home/anton/.cache/video-vam/cosmos-rehearsal-stride20-sigma4`
-- W&B run: `video-vam-world2action/k3ntlqcq`
+| Run                     | best flow loss | best RMSE | step |
+| ----------------------- | -------------- | --------- | ---- |
+| baseline (real context) | 0.29559        | 22.66°    | 2300 |
+| shuffled context        | 0.28945        | 22.23°    | 2900 |
 
-### Next decision gate
+Shuffling did not hurt; it was marginally better, which is within noise. Read
+plainly, the decoder is solving the task from proprioceptive state and dataset
+priors while ignoring 19,200 context tokens. This is consistent with the video
+prediction result: a backbone whose futures lose to a static baseline is
+unlikely to carry action-relevant scene information in its hidden states.
 
-Continue this run with `--resume` and a larger step budget before drawing any
-conclusion about randomized sigma, keeping the GPU exclusive.
+As it stands, the planned Cosmos 2B vs 14B vs LTX comparison has no signal to
+measure. Fixing that precedes any scaling up.
+
+### Units
+
+SO-101 `.pos` actions are confirmed to be **degrees**
+(`use_degrees=True`, `MotorNormMode.DEGREES`). An RMSE of 22.66 is therefore a
+very large mean joint error, and the overnight "loss goes down" result is much
+weaker than the bare number suggested.
+
+### Leading hypothesis and the test for it
+
+The frozen sigma of 10.0 is the leading explanation for the shuffled result: a
+single fixed context vector per window, with a constant sigma conditioning
+input, gives the decoder every incentive to ignore the context in favour of
+state. An online-extraction mode reproducing upstream's per-step randomized
+sigma and noise has been implemented. Crucially it must be paired with its own
+shuffled control under the online regime, since a better online number could
+otherwise reflect nothing more than a better-regularized decoder.
+
+Queued: online extraction, online shuffled control, random-init backbone,
+Bridge-LoRA features.
+
+### Infrastructure
+
+abakus dropped off Tailscale mid-session and killed the random-init run at step
+1699; a reboot restored it. All GPU jobs now run in detached tmux sessions with
+teed logfiles so no run depends on an SSH connection surviving.
+
+### Open questions
+
+- Are the cached context vectors discriminative between windows at all, by
+  pairwise cosine similarity? A near-degenerate answer would indicate a
+  conditioning or pooling defect on our side rather than a Cosmos limitation.
+- Does the real context beat its own shuffled control under **any**
+  configuration? This is the gating question for the whole comparison.
+- What is the online step time and peak memory, which decides whether online
+  extraction is affordable for larger backbones.
+
+### Qualitative observations from watching the prediction videos
+
+Two findings from visual inspection that the automatic metrics missed or
+actively contradicted. Recorded because they matter more than the scores.
+
+**Bridge LoRA may be the wrong domain match.** The Bridge-adapted checkpoint
+does not appear to have been trained on first-person / wrist-mounted footage,
+whereas our camera viewpoint is. If the viewpoint distribution differs, the
+Bridge LoRA is not the domain adaptation we assumed it was, and a null result
+from the Bridge-LoRA arm would say nothing about whether domain adaptation
+helps in general — only that _this_ adaptation targets a different viewpoint.
+Worth confirming BridgeData V2's camera setup before spending a run on it.
+
+**CFG 7.0 looked qualitatively better than guidance 0.0, despite scoring
+worse.** By PSNR, CFG made things worse (14.75 dB to 12.37 dB), and on that
+basis it was set aside as a non-canonical deviation. Visually, however, the
+CFG-7 predictions actually placed objects into boxes — that is, they produced
+task-plausible behavior — while also hallucinating artifacts such as human
+hands. Guidance 0.0 did not produce the task behavior at all.
+
+This is a known failure mode of PSNR: it rewards conservative, blurry,
+low-variance predictions and penalizes confident, sharp ones that are spatially
+misaligned. A prediction that performs the right action in the wrong pixels
+scores worse than a prediction that does nothing. For our purposes — extracting
+features that encode task-relevant dynamics — semantic plausibility is likely
+the better signal than pixel fidelity.
+
+Implication: PSNR and SSIM should not be the primary criterion for judging
+backbone suitability here, and the static-frame baseline "winning" on PSNR
+should not be read as the backbone being useless. It also raises the question of
+whether context extracted at non-zero guidance would be more informative, even
+though upstream uses `guidance=0.0` for extraction.
+
+## 2026-08-19 (night) — the first honest comparison, and a course correction
+
+### The number that reframed everything
+
+We finally measured all policies in the same physical units on the same 88
+held-out windows. Action RMSE in degrees, lower is better:
+
+| Backend                                            | RMSE      |
+| -------------------------------------------------- | --------- |
+| SmolVLA (trained on episodes 0–31)                 | **15.00** |
+| `state_repeat` (hold current joint angles for 3 s) | 18.86     |
+| Cosmos-2B VAM (best checkpoint, step 2300)         | 23.63     |
+| mean training action                               | 30.15     |
+
+Our VAM loses to a baseline that does nothing at all. That is not a tuning
+gap — a correctly wired decoder cannot be worse than freezing the arm. It made
+every prior "the loss is going down" observation untrustworthy.
+
+Getting this number required fixing five bugs that all lived in the CUDA path of
+the evaluator, which had only ever been exercised on CPU: a float32 checkpoint
+rejected against a bfloat16 module, `load_state_dict(assign=True)` planting CPU
+tensors inside a CUDA module, batches never moved to the device, SmolVLA's
+mixed-precision action expert needing the noise typed from its action projection
+rather than the first parameter, and a postprocessor loaded without its action
+converters. Worth remembering as a pattern: an evaluation path that has only
+ever run on one device is untested code.
+
+### The night's real lesson: we spent it measuring the measurement
+
+Most of the night went into a linear probe asking whether Cosmos features add
+anything over proprioceptive state. It kept returning an arithmetically
+impossible answer — state alone R² 0.655, context alone 0.196, both together
+0.510. A model containing state as a subset cannot score below state alone, so
+this was a bug in the probe, not a finding.
+
+The cause was regularization, twice over. First a single hard-coded ridge
+penalty of 10.0 shared across a 6-dimensional model and a 512-dimensional one.
+Then, after tuning the penalty per model, the combined model still failed,
+because a _single scalar_ penalty cannot serve two feature blocks of wildly
+different size and quality: strong enough to tame 512 noisy dimensions also
+crushes the 6 informative ones. The chosen values showed the squeeze plainly —
+31.6 for state, 5,623 for context, 178 for the compromise.
+
+We then killed the entire probe line of work, because the question it was asking
+was already answered from first principles: **the cube position is randomized,
+so a policy that cannot see cannot know where to reach.** Vision is necessary by
+construction. The probe's "state alone gets 0.655" was never measuring task
+competence, only that joint trajectories are smooth and the next three seconds
+are largely extrapolable from current motion. We had been carefully quantifying
+an artifact.
+
+The generalizable mistake: when a cheap diagnostic disagrees with a structural
+argument about the task, distrust the diagnostic.
+
+### What the upstream comparison actually found
+
+With the probe abandoned, we extracted upstream mimic-video's exact recipe and
+compared it line by line against ours. The reassuring outcome is that most of
+the hard parts are right: layer 20 of 28, unpooled `(B, 19200, 2048)` context,
+the video sigma fed to the decoder through the pair-time embedder,
+`obs_dropout=0.2` with a learned mask token, and upstream's subtle asymmetry
+where `xt` is divided by `sqrt((1−t)²+t²)` on the way into the network while the
+velocity target `ε−x0` is left unscaled. The action chunk starts at frame `t` in
+both pipelines, and the evaluation harness is fair — identical targets, masks and
+units across every backend.
+
+One hypothesis was raised and then **disproved**, which is worth recording so it
+is not raised again. Upstream feeds the video DiT 61 frames: 5 observation
+frames ending at `t` plus 56 _future_ frames (ground truth during training,
+generated at deployment). Ours pads those 56 slots with zeros, which looked like
+we had deleted the signal the method runs on. In fact the padding never reaches
+the network: the non-conditioning latents are overwritten with
+`noise · sigma · c_in`, pure Gaussian noise at the model's own scale, and the
+zero-derived latents are discarded. Our conditioning is the textbook
+image-to-video setup. The remaining difference is subtler — upstream's noised
+latents are `true_future + ε·σ`, so at their typical sigma some real future is
+visible, while ours carry none.
+
+### The two things actually wrong
+
+1. **Sigma.** We extract at a fixed σ = 10.0. Upstream draws it per step as
+   `4 · exp(N(0,1))`, median ≈ 4, with a 5% loguniform tail in [200, 100000]. At
+   a fixed 10.0 our layer-20 features are noise-dominated, and the decoder is
+   handed a constant sigma conditioning value that tells it nothing.
+2. **Scale.** The best checkpoint ran **3,100 steps at batch size 2** — roughly
+   6,200 samples — with gradient clipping 10× tighter than upstream. Upstream
+   configures batch 32–256. Whatever else is true, that is not a trained model.
+
+Everything else we checked is either matched to upstream or a documented,
+deliberate difference (our normalizer clamps on inversion, so VAM predictions
+are saturated to the training joint range while SmolVLA's inverse is exact; our
+statistics come from the train split only, SmolVLA's from the whole dataset).
+
+### Where things stand
+
+Running: an online training run with upstream-faithful randomized per-step
+sigma, gradient clipping at 10.0, gradient accumulation to a real effective
+batch, held-out episodes 32–39, wandb logging, and the four-way RMSE comparison
+queued behind it. The bar to clear is 18.86 (`state_repeat`); the goal is to
+beat 15.00 (SmolVLA).
+
+Not running, deliberately: the sigma sweep, the context probe, and the
+feature-degeneracy work. All of it was characterizing a measurement rather than
+making the policy work.
+
+### Note on process
+
+Three separate times tonight a job was left running that served no decision:
+a CPU evaluation that burned 2h50m on work the GPU did in three minutes, a
+14-core probe that produced nothing in 23 minutes, and a 1.7-hour feature
+extraction feeding an analysis we were about to abandon. Keeping the GPU busy is
+not the same as making progress, and an idle GPU is the correct state when we do
+not yet know what to train.
+
+---
+
+## 2026-08-20 — The overnight result, and the pivot to connector efficiency
+
+### The overnight cached run finally beats the trivial baseline
+
+`runD-cached` (stride-3 sigma-80 cache, random anchors, K=8 flow draws,
+effective batch 4) trained 4,541 optimizer steps over ~6.5 hours and scored
+**16.92° RMSE** — the first VAM run to beat `state_repeat` (18.86°), still
+behind SmolVLA (14.83°). Validation RMSE fell from 45.8 (step 300) to a best of
+16.59 (step 4500) and plateaued. So the pipeline learns; the question shifted
+from "is it broken?" to "why is it this slow?". The code also finally landed in
+git: `6502968e` (full VAM stack, 98 files) and `67bf38fd` (the 16 remaining
+test files), all pre-commit hooks passing.
+
+### Why one step costs 4.76 s while SmolVLA takes 0.12 s
+
+Side-by-side numbers: SmolVLA did 5,000 steps × batch 8 in **10 minutes**
+(~40k samples, 2.4 GB VRAM); our cached VAM did 4,541 steps × 4 contexts in
+6.5 hours (21.6 GB VRAM) — ~40× slower per step _with the backbone already out
+of the loop_. The cost is the interface: Cosmos hands the decoder 19,200 tokens
+× 2,048 channels of unpooled context, all 24 decoder blocks cross-attend to it,
+and the K/V projections over those 19,200 tokens are recomputed in every block
+(and for each of the K=8 flow draws). Each cached context is ~79 MB bf16, so a
+step also moves ~315 MB disk→GPU.
+
+### Is that really what mimic does? Yes — verified at the code level
+
+A subagent read the upstream repo at commit `e3355db` end to end. There is
+**no connector**: the `(B, 16, 30, 40, 2048)` layer-20 grid is flattened by a
+single `reshape` to `(B, 19200, 2048)` and fed to all 24 action blocks
+(`world2action_model.py:349-350`, `world2action_dit.py:917-925`). Upstream
+doesn't even cache — every training step runs one fresh frozen-backbone denoise
+online with freshly drawn noise and sigma (`exp(N(0,1))·4`, 5% loguniform tail
+in [200, 100000]). Their answer to the cost is multi-GPU hardware, not
+efficiency machinery. Two useful confirmations: only the first 2 of 16 latent
+frames are clean ground-truth conditioning (rest noise — matches our setup),
+and the video DiT's self-attention is **fully bidirectional**
+(`attn_mask_type="no_mask"`), not causal.
+
+### The literature says the unpooled grid is an outlier
+
+A parallel survey (persisted as `docs/video_vam_connector_survey.md`) found
+that every comparable modular system compresses before the action head:
+Video Prediction Policy uses a learned "Video Former" down to **224 tokens** —
+and its ablation shows removing the compressor makes the policy _worse_, not
+just slower; FLARE/GR00T N1.5 use 32 learned queries; VidMan a handful of
+learned action tokens; MinD one token per latent frame. Full visual grids only
+appear inside unified single-transformer models. mimic-video is the outlier.
+
+### Decision: keep the cache, make the interface the research object
+
+The caching approach stays — it is our efficiency advantage over upstream's
+online recipe. Sigma experimentation is explicitly off the table (upstream's
+distribution is noted above for the record; we are not chasing it). The next
+phase is a structured **connector-efficiency ablation**: many small cached-
+feature runs (15–30 min each) over spatial pooling, temporal slicing
+(conditioning-frame vs generated-frame tokens), one-token-per-latent-frame,
+and a VPP-style learned resampler — measuring step time and RMSE-within-budget
+for each, then doubling down on the winners. Because the video attention is
+bidirectional, token position does not cleanly separate observed from imagined
+content, which makes the temporal-slicing arms genuinely informative. This
+phase is deliberately structured as a small standalone research piece
+(candidate blog-post/publication artifact).
+
+## 2026-08-19 (day and evening) — the one-hour rule, and what it exposed
+
+### New ground rules
+
+Two process decisions were made today. First: whenever the user messages,
+re-check alignment before continuing — do not barrel ahead on a stale plan.
+Second, a hard experimental constraint: **a training run may take at most one
+hour.** The justification is the method's own premise — mimic-video claims to
+learn _faster_ than a VLA, so if an okay policy is not trainable in an hour,
+the configuration is wrong, not the budget.
+
+A reference document was also written (`VIDEO_VAM_MIMIC_REFERENCE.md`, mirrored
+to `docs/mimic_video_reference.md` in the worktree): the full upstream recipe
+with citations, our per-item compliance, and an explicit deviations table.
+Discipline going forward: change one deviation at a time, and name which rows a
+run touches before launching.
+
+### Findings, in causal order
+
+**The anchor-diversity bug.** All training had been drawing from a precomputed
+stride-20 window manifest — 337 anchors total, ~265 in the train split. Every
+"undertrained" run had actually seen the same 265 scenes ~23 times each while
+95% of training frames were never used. Fixed with uniform random anchor
+sampling (pool: 4,688).
+
+**The clipping strangulation.** Logged gradient norms ran 225–335 against a
+clip of 10 — every update shrunk ~30×, effective learning rate a few percent of
+nominal. An A/B settled on loss_scale 1.0 with clip 10.0 (norms now 2–15). The
+proprio-only floor immediately improved from 32.7° to 26.65°, confirming the
+diagnosis.
+
+**K flow-draws per context.** Our one sanctioned invention: a Cosmos forward
+costs ~4 s while a decoder update is nearly free, so each extracted context now
+supervises K=8 independent (noise, flow-time) draws. Approved by the user.
+
+**Sigma clarified, then deprioritized.** The user's question — "why noise the
+starting image at all?" — exposed a conceptual muddle. The conditioning frames
+are never noised (they stay clean in both upstream and our code); sigma labels
+only the future latent slots, which in our causal setup are pure noise. The only
+self-consistent label for pure noise is the _generation-start_ sigma, which the
+solver says is exactly 80.0. A controlled A/B (sigma 80 vs sigma 10, everything
+else identical) then showed it barely matters: 45.87 vs 46.43. A conceptually
+satisfying answer with no empirical payoff.
+
+**The real constraint is extraction throughput.** Both one-hour VAM runs got
+only ~230 optimizer steps (10.7 s/step, online extraction dominating) and were
+still improving steeply at cutoff — no plateau in sight. SmolVLA, trained fresh
+for one hour under the same rule, did **29,200 steps** and set a new best of
+**14.83°**. Under equal wall-clock the VAM is starved, not refuted. Response:
+precompute the feature cache once (outside the training hour), keep random
+anchor sampling over the cached pool, and let the training hour consist of fast
+steps. Stride-3 cache at sigma 80 (~1,560 anchors, ~122 GB) building overnight,
+followed by a cached-mode one-hour run.
+
+### Scoreboard (held-out 88 windows, degrees, lower is better)
+
+| policy                                      | RMSE          |
+| ------------------------------------------- | ------------- |
+| SmolVLA, 1 hour, 29,200 steps               | **14.83**     |
+| SmolVLA, 5,000 steps                        | 15.00         |
+| state_repeat                                | 18.86         |
+| best-ever VAM (2026-08-18, legacy features) | 26.12         |
+| proprio-only floor (fixed optimization)     | 26.65         |
+| VAM 1h online, sigma 80 / sigma 10          | 45.87 / 46.43 |
+| VAM 1h online, randomized sigma             | 57.35         |
+
+### Warnings for the record
+
+- **The legacy stride-20 cache does not reproduce** under the current (audited,
+  deterministic) extraction pipeline — max element difference 81.5 on a rebuilt
+  window. The 26.12 best-ever was earned on features we can no longer recompute,
+  because none of the VAM code was ever committed and the extractor was mutated
+  in place across two days. A tar snapshot of the working tree now exists
+  (`vam-code-snapshot-20260819-2300.tar.gz`); the deeper fix is version
+  control discipline.
+- Killing a PID whose cmdline begins with `tmux` kills the tmux **server** and
+  every session on the machine. This happened twice (once costing a training
+  run mid-step, once the user's unrelated processes). Kill sessions by name or
+  Python PIDs only.
+
+## 2026-08-21 — Controls day: the randomization audit, and what the frontier is telling us
+
+Today was about the two randomized-backbone controls the user requested, and it
+turned into a forensic exercise: one control was real, the other was silently
+broken, and finding out why took hashing checkpoints byte by byte.
+
+**Randomized Cosmos: pretraining does not help (at this budget).** The
+random-init pool4 control finished its 30-minute budget at **23.94** fixed-probe
+val RMSE vs **24.04** for the pretrained pool4 arm on identical data, schedule,
+and seed. Identical curves within noise. At a 30-minute budget on this dataset,
+the pretrained Cosmos features carry no measurable advantage over a randomly
+initialized backbone of the same architecture. Sobering, but consistent with the
+structural deviation we documented: our causal setup feeds the backbone pure
+noise in all 14 future latent slots, while upstream mimic-video trains with
+ground-truth future frames (noised) and deploys with solver-generated future
+latents. The features mimic actually exploits are representations of a
+_predicted future_; ours never contain one.
+
+**Randomized SmolVLA: the control never ran.** The reported 14.832° for
+"randomized" SmolVLA was bit-for-bit identical to the pretrained run — same
+RMSE to 13 decimal places, and the two checkpoints hashed identical in both
+vision (197 tensors) and action-expert (155 tensors) groups. Root cause: the
+training process imported lerobot from stale site-packages; the editable source
+link containing the randomization hook was created ~30 minutes _after_ training
+started. The flag was recorded in the config but the code that reads it never
+executed. Secondary trap discovered on the way: the old hook lived in
+`from_pretrained`, so any later _evaluation_ load of the checkpoint silently
+rerandomized the in-memory vision tower — a checkpoint that mutates on reload.
+Both fixed: randomization now happens explicitly in `lerobot_train.py` right
+after `make_policy()` and before optimizer/prepare, keyed on `cfg.seed`, with
+before/after SHA256 digests, changed-tensor count, and the import path logged
+into the training log and checkpoint config. Verified in tonight's rerun:
+197/197 vision tensors changed, non-vision groups untouched, imports resolve
+the source tree.
+
+**VLA-JEPA: fused was never fused.** The "fused AdamW" run OOMed at step 527.
+Autopsy: `use_policy_training_preset=true` silently rebuilt the optimizer from
+the policy preset, discarding the CLI `--optimizer.fused=true`; the traceback
+shows `_single_tensor_adam` allocating a 594 MiB full-tensor temporary (the
+151936x2048 Qwen embedding) with 301 MiB free. All 2.77B parameters trainable
+= ~21.2 GiB persistent before activations. Fix: bypass the preset and pass the
+full explicit optimizer config; startup log must show `fused: True`. If still
+tight, next lever is BF16 for the FP32 action/predictor modules (~2.4 GiB),
+not LoRA/freezing (user wants the baseline unmodified).
+
+**FastWAM:** text-precompute crashed on a missing parent directory (progress
+file written before any mkdir). One-line fix. The cached-text design is sound,
+but the previous VAE-load OOM happened _before_ the text encoder is even
+constructed, so FastWAM may still not fit; tonight's queue will tell.
+
+**Cosmos temporal context confirmed.** Traced end to end: 5 real frames
+(t-4..t, 0.4 s at 10 fps) -> VAE -> 2 clean latent frames + 14 noise slots ->
+one layer-20 forward. The backbone _can_ see observed movement; it is not a
+static-image path. What it never sees is any future.
+
+**Evening queue** (tmux, survives disconnect): 30-min randomized-vision SmolVLA
+(verified real this time) -> FastWAM text-cache + smoke/train -> VLA-JEPA
+truly-fused 30 min. Frozen-protocol RMSE for SmolVLA arms afterwards.
+
+**Meta: where the field is going (user question, two web surveys).** GEN-1.5
+(Generalist AI, 19 Aug) does one-shot "physical prompting" from a 3-12 s
+in-context demo, zero gradient updates — pretraining scale collapsing
+fine-tuning into conditioning. BFL's FLUX 3 (23 Jul) is the omni bet: one
+generative model over image/video/audio with action next; FLUX-mimic reports
+95% on a real kitting task. mimic is not imitation-only anymore: the
+FLUX-mimic post ("Closing the Reinforcement Learning Post-Training Loop")
+describes off-policy RL with a learned critic on deployment rollouts —
+best-of-n during rollout plus ongoing refinement. The convergent recipe:
+massive video/physical pretraining -> cheap per-robot adaptation -> RL as
+final polish on deployment data. Decentralized-path survey: distributed
+pretraining infrastructure is real (Pluralis Agora: 8.6B over 330 consumer
+nodes at 63% efficiency) but nothing competitive in robotics; the community
+lever that demonstrably works is pooled data + open checkpoints (SmolVLA: 78%
+vs 52% with vs without community-data pretraining) and retrieval-based
+policies over community datasets.
+
+**Implications for us.** (1) Our two stacked handicaps vs mimic: no future
+signal in the features (pure-noise slots) and an FPV wrist camera — both
+Cosmos pretraining and the bridge LoRA are third-person, so our viewpoint is
+OOD for the backbone. (2) The bridge-adapted Cosmos checkpoint is worth a long
+run but shares the viewpoint mismatch; the higher-value experiment is giving
+the backbone _generated_ future latents (a few solver steps) so the features
+finally contain a predicted future — that is the ingredient mimic's oracle
+result says carries nearly all the signal. (3) Friday realism: if rollouts
+confirm SmolVLA > VAM here, the finding is not "VAMs fail" but "the VAM
+advantage requires future-video signal, which a causal noise-fill setup
+removes." That is a concise, defensible report thesis.
+
+Living cube-out-of-box leaderboard (append-only, with W&B links): [video_vam_cube_out_of_box_leaderboard.md](video_vam_cube_out_of_box_leaderboard.md). The table below is the 2026-08-21 snapshot and is left unchanged.
+
+### Scoreboard update (fixed-probe val RMSE, degrees)
+
+| arm                                       | RMSE                                                 |
+| ----------------------------------------- | ---------------------------------------------------- |
+| SmolVLA 1h (pretrained vision)            | 14.83 (retry4 ckpt evals 15.00)                      |
+| state_repeat                              | 18.86                                                |
+| pool2 cosmos (best connector arm, 30 min) | 23.32                                                |
+| random-init cosmos pool4, 30 min          | 23.94                                                |
+| pretrained cosmos pool4, 30 min           | 24.04                                                |
+| runD full grid, 14 h                      | 16.59                                                |
+| randomized-vision SmolVLA                 | invalid (never randomized); rerun in tonight's queue |
+
+## Research objective (stated 2026-08-24 — evaluate everything against this)
+
+Priority order, per Anton:
+
+1. **Data efficiency (primary).** Maximum task performance with minimal robot data
+   (demonstrations). This is the quantity to optimize: how good can a policy get from
+   ~30 episodes, and how does performance scale as episodes shrink or grow. Pretrained
+   backbones (video models, VLAs) matter exactly insofar as they buy performance per
+   demonstration.
+2. **Real-time inference (hard constraint).** The deployed policy must control the robot
+   at ~10 Hz on available hardware. Any approach that cannot produce an action chunk fast
+   enough at deployment is disqualified regardless of its offline numbers. With 30-step
+   chunks at 30 fps, one chunk buys ~1 s, so chunk inference must reliably finish well
+   under that; per-approach inference latency must be measured, not assumed.
+3. **Training efficiency (secondary, practical).** The ~1-hour single-GPU training budget
+   is a working constraint for fast iteration, not the research target. Budget-matched
+   comparisons (e.g., VLA-JEPA 19.19, FastWAM 20.36 at 1 h) are fair for iteration speed
+   but are NOT converged ceilings and must be labeled as such.
+
+Implications for how we report results:
+
+- Leaderboard entries should note the number of training episodes alongside RMSE.
+- A data-scaling curve (RMSE vs. episode count) is the more decisive experiment than
+  further architecture variations, once a best recipe is fixed.
+- Every candidate recipe needs a measured deployment-side latency figure (feature
+  extraction + decoder inference on the target GPU) before it can be declared viable.
+  For cached-feature training recipes, note that deployment cannot use the cache: the
+  backbone forward (~4 s/frame for Cosmos-2B unoptimized) is on the critical path and
+  currently violates the 10 Hz constraint — optimizing or amortizing it is open work.
+
+## Planned latency benchmark (prepared 2026-08-24)
+
+The CPU-side benchmark harness is ready for the deployment-critical Cosmos-2B
+latency measurement. It loads the frozen extractor once per arm, warms up three
+times, then records 20 synchronized CUDA iterations with median and p90 timings
+for preprocessing, VAE encode, DiT forward through layer 20, production `pool2`
+reduction, and (unless disabled) the approximately 100M-parameter SmolVLA
+expert's 30-action chunk. Reports include the GPU, CUDA/PyTorch versions,
+dtypes, stage timings, and the implied `30 / chunk_seconds` control rate.
+
+Implemented arms and toggles:
+
+- `baseline`: eager frozen Transformer Engine DiT in BF16.
+- `compile`: `torch.compile(..., mode="reduce-overhead")` around the DiT. If
+  the TE layers are incompatible, the run prints the exception and records
+  clearly labelled eager-baseline fallback timings instead of failing silently.
+- `fp8`: Transformer Engine 2.18 `fp8_autocast` with delayed HYBRID scaling;
+  this is the only usable quantization API currently available in `.venv`; GPU validation is deferred to the later run.
+- `int8`: deliberately rejected. `torchao` and `bitsandbytes` are absent, and
+  PyTorch dynamic int8 quantization is CPU-oriented and does not cover this
+  Transformer Engine CUDA DiT.
+- `--cudnn-benchmark` and `--channels-last` are orthogonal toggles for cheap
+  experiments. The fixed 61-frame padding remains unchanged: shortening the
+  temporal window could change features and is therefore only a future,
+  semantics-validation arm.
+
+Run later, after the GPU queues are clear (do not start this while they are
+running):
+
+```bash
+cd /home/anton/lerobot-video-vam
+source scripts/video_vam/cosmos_cuda_env.sh
+.venv/bin/python scripts/video_vam/benchmark_cosmos_extraction.py \
+  --arm all --iterations 20 --warmups 3 --cudnn-benchmark \
+  --output-dir /home/anton/.cache/video-vam/cosmos-extraction-benchmark
+```
+
+Use `--arm baseline`, `--arm compile`, or `--arm fp8` for an individual arm;
+add `--no-decoder` when only backbone extraction is wanted. The JSON and
+Markdown reports are written under the selected output directory.
+
+## 2026-08-25 — LTX-2.5 real-prompt tiny-overfit gate
+
+Completed the representation/data-efficiency viability gate without building a
+feature cache. The official Gemma-4 12B encoder produced a provenance-checked
+`[1,1024,4096]` BF16 artifact for the exact task text; extraction loaded only the
+artifact. Four episode-0 windows used five real causal frames each, internal
+last-frame padding to the legal nine-frame VAE prefix, canonical per-window
+noise seeds, persistent FP8-cast CPU streaming, and true block-34 early exit.
+Steady extraction was 1.2497 s p50 (`0.800 Hz`), still far outside the 10 Hz
+requirement.
+
+The consumer reduced raw `[1,2400,4096]` features to eight frame-mean tokens,
+then trained a 4096-to-2048 adapter and the established native World2Action
+path. The loss/backward smoke produced non-zero adapter and decoder gradients.
+On three training windows, fixed flow loss fell 2.517702 -> 0.222507 in 230 steps
+(34.625 s), normalized RMSE 1.0083 -> 0.3820, and degree RMSE 73.08 -> 26.58.
+Zero/shuffled-context controls degraded to 66.48/48.37 degrees, so the fit is
+using LTX context rather than only state. A fourth fixed window scored 27.88
+degrees / 0.5015 normalized, but a single nearby window is explicitly not a
+generalization result. Peak extraction/training allocations were 5.15/8.62 GiB;
+total process wall time was 153.29 s. No checkpoint, train cache, validation
+cache, W&B run, full-data training, or rollout was created.
+
+Decision: LTX features pass the tiny trainability/context-sensitivity gate, but
+LTX does not pass the deployment gate. Do not invest in a large LTX cache or
+full training run until there is a credible path from ~0.8 Hz to 10 Hz (or an
+architecture that amortizes extraction outside the control-critical path).
+
+## 2026-08-26 — LTX-2.5 pool2 + pretrained SmolVLA expert
+
+Trainer fixed-probe validation plateaued at step 71,000 (1.68 h; patience 10, min-delta 0.02). Best step 61,000: full-30 masked RMSE 14.0348°, executed h=1 4.4964°, first-five per-step mean 6.2786°. Context was pool2 with 640x4,096; train/val stride 3/20. Confound: none; same stride-3/stride-20 anchors as the LTX World2Action arm. W&B: https://wandb.ai/hubnemo-hugging-face/video-vam-world2action/runs/z1jp21cs
+
+## 2026-08-26 — LTX-2.5 unpooled + pretrained SmolVLA expert
+
+Trainer fixed-probe validation plateaued at step 55,000 (3.68 h; patience 10, min-delta 0.02). Best step 45,000: full-30 masked RMSE 13.8418°, executed h=1 4.5548°, first-five per-step mean 6.2358°. Context was none with 2,400x4,096; train/val stride 3/20. Confound: none; disk guard retained the full stride-3 train cache. W&B: https://wandb.ai/hubnemo-hugging-face/video-vam-world2action/runs/3rypmjug

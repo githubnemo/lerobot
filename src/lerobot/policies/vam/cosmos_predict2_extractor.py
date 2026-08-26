@@ -23,6 +23,14 @@ from torch import nn
 UPSTREAM_REPOSITORY = "https://github.com/mimic-video/mimic-video"
 UPSTREAM_COMMIT = "e3355dbc93132b576c02f920a59b4fc18a4f5906"
 BACKEND_NAME = "minimal_a2a"
+# These are the backend strings accepted by the pinned vendored Cosmos Attention
+# module. ``flash_attn_no_cp`` appears in an older branch of the vendored code,
+# but the current video DiT rejects it during construction and is not exposed.
+COSMOS_ATTENTION_BACKENDS = ("minimal_a2a", "torch", "transformer_engine")
+COMPILE_FRIENDLY_ATTENTION_BACKEND = "torch"
+VAE_INPUT_MODE_OBSERVED_PREFIX = "observed_prefix"
+VAE_INPUT_MODE_LEGACY_PADDED = "legacy_padded_vae"
+VAE_INPUT_MODES = (VAE_INPUT_MODE_OBSERVED_PREFIX, VAE_INPUT_MODE_LEGACY_PADDED)
 
 
 class CosmosPredict2Error(RuntimeError):
@@ -54,6 +62,11 @@ class CosmosPredict2ExtractorConfig:
     high_noise_sigma: float = 10.0
     seed: int = 0
     backend: str = BACKEND_NAME
+    attention_backend: str = BACKEND_NAME
+    compile_friendly: bool = False
+    use_cuda_graphs: bool = False
+    sac_mode: str = "predict2_2b_720"
+    vae_input_mode: str = VAE_INPUT_MODE_OBSERVED_PREFIX
     input_frames: int = 5
     video_frames: int = 61
     input_height: int = 480
@@ -84,6 +97,21 @@ class CosmosPredict2ExtractorConfig:
             raise ValueError("high_noise_sigma must be positive")
         if self.backend != BACKEND_NAME:
             raise ValueError(f"Only backend={BACKEND_NAME!r} is supported")
+        if self.attention_backend not in COSMOS_ATTENTION_BACKENDS:
+            raise ValueError(
+                "attention_backend must be one of "
+                + ", ".join(repr(value) for value in COSMOS_ATTENTION_BACKENDS)
+            )
+        if not isinstance(self.compile_friendly, bool):
+            raise ValueError("compile_friendly must be a boolean")
+        if not isinstance(self.use_cuda_graphs, bool):
+            raise ValueError("use_cuda_graphs must be a boolean")
+        if self.vae_input_mode not in VAE_INPUT_MODES:
+            raise ValueError(
+                "vae_input_mode must be one of " + ", ".join(repr(value) for value in VAE_INPUT_MODES)
+            )
+        if self.sac_mode not in {"none", "predict2_2b_720"}:
+            raise ValueError("sac_mode must be 'none' or 'predict2_2b_720'")
         if (
             self.input_frames not in (1, 5)
             or self.video_frames != 61
@@ -109,6 +137,10 @@ class CosmosPredict2Provenance:
     checkpoint_ignored_metadata_count: int
     noise_seed: int
     random_init_seed: int | None = None
+    attention_backend: str = BACKEND_NAME
+    compile_friendly: bool = False
+    use_cuda_graphs: bool = False
+    vae_input_mode: str = VAE_INPUT_MODE_OBSERVED_PREFIX
 
 
 @dataclass(frozen=True, slots=True)
@@ -165,6 +197,102 @@ def _freeze_module(module: Any) -> None:
         if isinstance(candidate, nn.Module):
             candidate.eval()
             candidate.requires_grad_(False)
+
+
+@torch.library.custom_op("lerobot::cosmos_rms_norm", mutates_args=())
+def _cosmos_rms_norm(input: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
+    """Keep the native RMSNorm kernel opaque to Inductor while retaining eager semantics."""
+    return torch.rms_norm(input, list(weight.shape), weight, eps)
+
+
+@_cosmos_rms_norm.register_fake
+def _cosmos_rms_norm_fake(input: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
+    del weight, eps
+    return torch.empty_like(input)
+
+
+class _CompileFriendlyRMSNorm(nn.RMSNorm):
+    """Native RMSNorm with TE's inference output-dtype contract."""
+
+    def forward(self, input: torch.Tensor) -> torch.Tensor:
+        return _cosmos_rms_norm(input, self.weight, self.eps).to(dtype=self.weight.dtype)
+
+
+def _pure_torch_rotary_pos_emb(
+    tensor: torch.Tensor,
+    freqs: torch.Tensor,
+    *,
+    tensor_format: str = "sbhd",
+    start_positions: torch.Tensor | None = None,
+    interleaved: bool = False,
+    fused: bool = False,
+    cu_seqlens: torch.Tensor | None = None,
+    cp_size: int = 1,
+    cp_rank: int = 0,
+) -> torch.Tensor:
+    """Apply the inference-only bshd RoPE case without a TE custom op.
+
+    Cosmos' video DiT calls fused RoPE with ``tensor_format="bshd"``, no
+    offsets, and no context parallelism. Keeping that fixed contract explicit
+    makes this replacement both compile-friendly and safer than a broad monkey
+    patch of Transformer Engine.
+    """
+    del fused, cu_seqlens, cp_rank
+    if tensor_format != "bshd" or start_positions is not None or cp_size != 1:
+        raise ValueError("compile-friendly RoPE only supports bshd without offsets or context parallelism")
+    freqs = freqs[: tensor.shape[1]].transpose(0, 1)
+    # Keep the trig values and multiply-accumulate in FP32.  TE's fused RoPE
+    # does the same before rounding back to the input dtype; casting cos/sin to
+    # BF16 first measurably compounds drift across 20 transformer blocks.
+    cos = freqs.cos()
+    sin = freqs.sin()
+    rot_dim = freqs.shape[-1]
+    original = tensor[..., :rot_dim]
+    if interleaved:
+        even = original[..., ::2]
+        odd = original[..., 1::2]
+        half = torch.stack((-odd, even), dim=-1).flatten(start_dim=-2)
+    else:
+        first, second = original.chunk(2, dim=-1)
+        half = torch.cat((-second, first), dim=-1)
+    rotated = original.float() * cos + half.float() * sin
+    return torch.cat((rotated, tensor[..., rot_dim:].float()), dim=-1).to(dtype=tensor.dtype)
+
+
+def make_compile_friendly_backbone(backbone: nn.Module) -> dict[str, int]:
+    """Replace inference-time TE normalization and fused RoPE with torch ops.
+
+    Linear layers are already ordinary ``torch.nn.Linear`` modules in the
+    vendored model. Checkpoint loading happens before this function, so the
+    replacement preserves every learned weight while removing the remaining TE
+    custom operators from the executed forward.
+    """
+    rmsnorm_replacements = 0
+    rotary_replacements = 0
+    for parent in backbone.modules():
+        for name, child in list(parent.named_children()):
+            module_name = child.__class__.__module__
+            if child.__class__.__name__ != "RMSNorm" or not module_name.startswith("transformer_engine"):
+                continue
+            normalized_shape = getattr(child, "normalized_shape", child.weight.shape)
+            replacement = _CompileFriendlyRMSNorm(
+                normalized_shape,
+                eps=float(getattr(child, "eps", 1e-5)),
+                elementwise_affine=True,
+                device=child.weight.device,
+                dtype=child.weight.dtype,
+            )
+            replacement.weight = child.weight
+            setattr(parent, name, replacement)
+            rmsnorm_replacements += 1
+    for module in backbone.modules():
+        if hasattr(module, "_rotary_pos_emb") and callable(module._rotary_pos_emb):
+            module._rotary_pos_emb = _pure_torch_rotary_pos_emb
+            rotary_replacements += 1
+    return {
+        "rmsnorm_replacements": rmsnorm_replacements,
+        "rotary_replacements": rotary_replacements,
+    }
 
 
 def _as_tensor_mapping(payload: Any) -> dict[str, torch.Tensor]:
@@ -303,6 +431,8 @@ class CosmosPredict2Extractor:
         self._checkpoint_ignored_metadata_keys = tuple(ignored_metadata_keys)
         self.backbone = backbone
         self.tokenizer = tokenizer
+        if self.config.compile_friendly:
+            make_compile_friendly_backbone(self.backbone)
         _freeze_module(self.backbone)
         _freeze_module(self.tokenizer)
 
@@ -333,6 +463,12 @@ class CosmosPredict2Extractor:
                 "optional CUDA/runtime dependencies."
             ) from exc
 
+        construction_attention_backend = (
+            COMPILE_FRIENDLY_ATTENTION_BACKEND
+            if self.config.compile_friendly
+            else self.config.attention_backend
+        )
+        construction_sac_mode = "none" if self.config.compile_friendly else self.config.sac_mode
         with torch.device("meta"):
             backbone = MinimalV1LVGDiT(
                 max_img_h=240,
@@ -346,7 +482,7 @@ class CosmosPredict2Extractor:
                 model_channels=2048,
                 num_blocks=28,
                 num_heads=16,
-                atten_backend=self.config.backend,
+                atten_backend=construction_attention_backend,
                 pos_emb_cls="rope3d",
                 pos_emb_learnable=True,
                 pos_emb_interpolation="crop",
@@ -357,7 +493,7 @@ class CosmosPredict2Extractor:
                 rope_t_extrapolation_ratio=1.0,
                 extra_per_block_abs_pos_emb=False,
                 rope_enable_fps_modulation=False,
-                sac_config=SACConfig(mode="predict2_2b_720", every_n_blocks=1),
+                sac_config=SACConfig(mode=construction_sac_mode, every_n_blocks=1),
             )
         backbone = backbone.to_empty(device=self.device)
         if self.config.random_init_seed is not None:
@@ -416,6 +552,8 @@ class CosmosPredict2Extractor:
         else:
             raise ValueError("floating-point images must be in [0, 1] or [-1, 1]")
         images = images.to(device=self.device, dtype=self.dtype)
+        if self.config.vae_input_mode == VAE_INPUT_MODE_OBSERVED_PREFIX:
+            return images
         padded = torch.zeros(
             images.shape[0],
             images.shape[1],
@@ -428,7 +566,43 @@ class CosmosPredict2Extractor:
         padded[:, :, : self.config.input_frames] = images
         return padded
 
+    def encode_observed_pixels(self, images: torch.Tensor) -> torch.Tensor:
+        """Encode only observed normalized pixels and zero-expand to ``state_t`` latents."""
+        if not isinstance(images, torch.Tensor) or images.ndim != 5:
+            raise ValueError("images must have shape [B, 3, T, 480, 640]")
+        if tuple(images.shape[1:3]) not in {(3, 1), (3, 5)} or tuple(images.shape[3:]) != (480, 640):
+            raise ValueError(
+                f"observed pixels must have shape [B, 3, T, 480, 640] with T in (1, 5), got {tuple(images.shape)}"
+            )
+        observed_latent_frames = 1 + (images.shape[2] - 1) // 4
+        expected_prefix = (
+            images.shape[0],
+            self.config.latent_channels,
+            observed_latent_frames,
+            self.config.latent_height,
+            self.config.latent_width,
+        )
+        expected_full = (
+            images.shape[0],
+            self.config.latent_channels,
+            self.config.state_t,
+            self.config.latent_height,
+            self.config.latent_width,
+        )
+        latent = self.tokenizer.encode(images)
+        if not isinstance(latent, torch.Tensor) or tuple(latent.shape) != expected_prefix:
+            raise ValueError(
+                f"observed-pixel tokenizer output must have shape {expected_prefix}, got "
+                f"{tuple(latent.shape) if isinstance(latent, torch.Tensor) else type(latent)}"
+            )
+        latent = latent.to(device=self.device, dtype=self.dtype)
+        full = torch.zeros(expected_full, device=self.device, dtype=self.dtype)
+        full[:, :, :observed_latent_frames] = latent
+        return full
+
     def _encode_conditional_latents(self, images: torch.Tensor) -> torch.Tensor:
+        if self.config.vae_input_mode == VAE_INPUT_MODE_OBSERVED_PREFIX:
+            return self.encode_observed_pixels(images)
         latent = self.tokenizer.encode(images)
         if not isinstance(latent, torch.Tensor):
             raise TypeError("Cosmos tokenizer encode() must return a tensor")
@@ -527,7 +701,10 @@ class CosmosPredict2Extractor:
             device=self.device,
             dtype=self.dtype,
         )
-        condition_mask[:, :, : self.config.latent_conditional_frames] = 1
+        conditional_latent_frames = self.config.latent_conditional_frames
+        if self.config.vae_input_mode == VAE_INPUT_MODE_OBSERVED_PREFIX:
+            conditional_latent_frames = 1 + (self.config.input_frames - 1) // 4
+        condition_mask[:, :, :conditional_latent_frames] = 1
         network_input = (conditional / self.config.sigma_data) * condition_mask
         network_input = network_input + x_sigma_max * c_in.to(self.dtype) * (1.0 - condition_mask)
         sigma_conditional = torch.full_like(sigma_b_1_t_1_1, self.config.sigma_conditional)
@@ -554,7 +731,7 @@ class CosmosPredict2Extractor:
                 fps=torch.full((batch_size, 1), 10.0, device=self.device, dtype=torch.float32),
                 padding_mask=padding_mask,
                 data_type=self._data_type(),
-                use_cuda_graphs=False,
+                use_cuda_graphs=self.config.use_cuda_graphs,
                 return_only_hidden_states_up_to=self.config.hidden_layer,
             )
         if not isinstance(result, tuple) or len(result) != 2:
@@ -598,6 +775,10 @@ class CosmosPredict2Extractor:
             checkpoint_ignored_metadata_count=len(self._checkpoint_ignored_metadata_keys),
             noise_seed=seed,
             random_init_seed=self.config.random_init_seed,
+            attention_backend=self.config.attention_backend,
+            compile_friendly=self.config.compile_friendly,
+            use_cuda_graphs=self.config.use_cuda_graphs,
+            vae_input_mode=self.config.vae_input_mode,
         )
         return CosmosPredict2Extraction(
             hidden_grid=hidden,

@@ -14,6 +14,7 @@
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -168,6 +169,10 @@ class FastWAMConfig(PreTrainedConfig):
             per video frame).
         image_size (tuple[int, int]): Concatenated image size as `(height, width)`.
         context_len (int): Maximum text embedding token length.
+        lora_rank (int): Video-expert LoRA rank; zero disables LoRA.
+        lora_alpha (float): LoRA residual scale; defaults to 16.
+        text_context_path (str | None): Optional safetensors artifact containing
+            precomputed, provenance-checked UMT5 contexts keyed by formatted prompt.
         video_dit_config (dict[str, Any] | None): Wan video expert config.
         action_dit_config (dict[str, Any] | None): Action expert config.
         use_gradient_checkpointing (bool): Enable activation checkpointing in both DiT
@@ -188,6 +193,12 @@ class FastWAMConfig(PreTrainedConfig):
     action_video_freq_ratio: int = 4
     image_size: tuple[int, int] = (224, 448)
     context_len: int = 128
+    lora_rank: int = 0
+    lora_alpha: float = 16.0
+    # Optional safetensors + JSON sidecar containing canonical UMT5 contexts. When set,
+    # training/evaluation resolves formatted task prompts from this artifact instead of
+    # constructing the text encoder. `load_text_encoder=False` requires this path.
+    text_context_path: str | None = None
     model_id: str = WAN22_MODEL_ID
     tokenizer_model_id: str = WAN_T5_TOKENIZER_ID
     text_encoder_model_id: str = WAN22_DIFFUSERS_MODEL_ID
@@ -209,6 +220,8 @@ class FastWAMConfig(PreTrainedConfig):
     fp32_attention: bool = True
     use_gradient_checkpointing: bool = False
     freeze_video_expert: bool = False
+    # When enabled, only exact video-expert attention/FFN adapters train; the action expert
+    # remains fully trainable and both joint video/action losses remain enabled.
     toggle_action_dimensions: list[int] = field(default_factory=list)
     video_scheduler: dict[str, float | int] = field(
         default_factory=lambda: {"train_shift": 5.0, "infer_shift": 5.0, "num_train_timesteps": 1000}
@@ -234,6 +247,14 @@ class FastWAMConfig(PreTrainedConfig):
     def __post_init__(self) -> None:
         super().__post_init__()
         self.image_size = tuple(self.image_size)
+        if type(self.lora_rank) is not int or self.lora_rank < 0:
+            raise ValueError(f"`lora_rank` must be a non-negative integer, got {self.lora_rank}.")
+        if not math.isfinite(float(self.lora_alpha)) or self.lora_alpha <= 0:
+            raise ValueError(f"`lora_alpha` must be finite and positive, got {self.lora_alpha}.")
+        if self.text_context_path is not None:
+            self.text_context_path = str(Path(self.text_context_path).expanduser())
+        if not self.load_text_encoder and not self.text_context_path:
+            raise ValueError("FastWAM `load_text_encoder=False` requires `text_context_path`.")
         self.model_id = _validate_wan_model_id(self.model_id, "model_id")
         self.input_features = _coerce_policy_features(self.input_features)
         self.output_features = _coerce_policy_features(self.output_features)

@@ -46,10 +46,35 @@ def make_sample():
     }
 
 
-def make_provenance(context, state, target_action, action_is_pad=None):
+def make_provenance(
+    context, state, target_action, action_is_pad=None, context_transform=None, vae_input_mode=None
+):
     config = CUBE_OUT_OF_BOX_CONTRACT
     if action_is_pad is None:
         action_is_pad = torch.zeros((1, 30), dtype=torch.bool)
+    extractor = {
+        "device": "cpu",
+        "dtype": "bfloat16",
+        "backend": "minimal_a2a",
+        "high_noise_sigma": 10.0,
+        "seed": 0,
+        "noise_seed": 0,
+        "hidden_layer": 20,
+        "stop_after_step": 0,
+        "input_shape": [1, 3, 5, 480, 640],
+        "preprocess": "test pinned 480p",
+        "conditioning": "test frame_replace",
+        "official_resolution": "480",
+        "official_positional_latent_max_h": 240,
+        "official_positional_latent_max_w": 240,
+        "bridge_lora": None,
+        "extractor_input_keys": ["rgb_history", "prompt_embedding"],
+        "excluded_from_extractor": ["state", "target_action"],
+        "checkpoint_ignored_metadata_keys": [],
+        "checkpoint_ignored_metadata_count": 0,
+    }
+    if vae_input_mode is not None:
+        extractor["vae_input_mode"] = vae_input_mode
     return build_feature_cache_provenance(
         dataset={
             "repo_id": config.repo_id,
@@ -89,27 +114,7 @@ def make_provenance(context, state, target_action, action_is_pad=None):
             "shape": [1, 512, 1024],
             "dtype": "bfloat16",
         },
-        extractor={
-            "device": "cpu",
-            "dtype": "bfloat16",
-            "backend": "minimal_a2a",
-            "high_noise_sigma": 10.0,
-            "seed": 0,
-            "noise_seed": 0,
-            "hidden_layer": 20,
-            "stop_after_step": 0,
-            "input_shape": [1, 3, 5, 480, 640],
-            "preprocess": "test pinned 480p",
-            "conditioning": "test frame_replace",
-            "official_resolution": "480",
-            "official_positional_latent_max_h": 240,
-            "official_positional_latent_max_w": 240,
-            "bridge_lora": None,
-            "extractor_input_keys": ["rgb_history", "prompt_embedding"],
-            "excluded_from_extractor": ["state", "target_action"],
-            "checkpoint_ignored_metadata_keys": [],
-            "checkpoint_ignored_metadata_count": 0,
-        },
+        extractor=extractor,
         upstream_commits={
             "lerobot": "1" * 40,
             "mimic_video": "2" * 40,
@@ -134,6 +139,7 @@ def make_provenance(context, state, target_action, action_is_pad=None):
         action_is_pad=action_is_pad,
         raw_hidden_shape=(1, 16, 30, 40, 2048),
         raw_hidden_dtype=torch.bfloat16,
+        context_transform=context_transform,
     )
 
 
@@ -215,6 +221,54 @@ def test_roundtrip_provenance_and_label_roles(tmp_path):
     assert payload["output"]["context_shape"] == [1, 4, 2048]
 
 
+def make_artifact_with_mode(mode):
+    context = torch.arange(4 * 2048, dtype=torch.float32).reshape(1, 4, 2048).to(torch.bfloat16)
+    state = torch.zeros((1, 1, 6), dtype=torch.float32)
+    target_action = torch.ones((1, 30, 6), dtype=torch.float32)
+    action_is_pad = torch.zeros((1, 30), dtype=torch.bool)
+    return CosmosFeatureCacheArtifact(
+        context,
+        state,
+        target_action,
+        action_is_pad,
+        make_provenance(context, state, target_action, action_is_pad, vae_input_mode=mode),
+    )
+
+
+def test_roundtrip_records_observed_prefix_mode(tmp_path):
+    artifact = make_artifact_with_mode("observed_prefix")
+    output = tmp_path / "prefix.safetensors"
+    save_feature_cache(artifact, output)
+    payload = json.loads(output.with_suffix(".json").read_text())
+    assert payload["extractor"]["vae_input_mode"] == "observed_prefix"
+
+
+def test_roundtrip_transform_aware_provenance(tmp_path):
+    context = torch.zeros((1, 1280, 2048), dtype=torch.bfloat16)
+    state = torch.zeros((1, 1, 6), dtype=torch.float32)
+    target_action = torch.ones((1, 30, 6), dtype=torch.float32)
+    action_is_pad = torch.zeros((1, 30), dtype=torch.bool)
+    artifact = CosmosFeatureCacheArtifact(
+        context,
+        state,
+        target_action,
+        action_is_pad,
+        make_provenance(context, state, target_action, action_is_pad, "pool4"),
+    )
+    output = tmp_path / "pool4.safetensors"
+    save_feature_cache(artifact, output)
+    payload = json.loads(output.with_suffix(".json").read_text())
+    assert payload["output"]["context_transform"] == "pool4"
+    assert payload["output"]["context_tokens"] == 1280
+    assert payload["output"]["context_grid"] == {
+        "temporal": 16,
+        "height": 8,
+        "width": 10,
+        "flatten_order": "T,H,W",
+    }
+    assert torch.equal(load_feature_cache(output).context, context)
+
+
 def test_roundtrip_rejects_tampered_output_hash(tmp_path):
     artifact = make_artifact()
     output = tmp_path / "tampered.safetensors"
@@ -270,7 +324,7 @@ def test_window_seed_is_stable_and_window_specific():
     assert first != derive_window_seed(CUBE_OUT_OF_BOX_CONTRACT.revision, 0, 4, 18)
 
 
-def make_manifest(tmp_path, artifact):
+def make_manifest(tmp_path, artifact, vae_input_mode=None):
     output = tmp_path / "episode-0000-frame-000004.safetensors"
     save_feature_cache(artifact, output)
     entry = {
@@ -285,6 +339,9 @@ def make_manifest(tmp_path, artifact):
         "sidecar_sha256": sha256_file(output.with_suffix(".json")),
         "bytes": output.stat().st_size + output.with_suffix(".json").stat().st_size,
     }
+    provenance = {"builder": "test"}
+    if vae_input_mode is not None:
+        provenance["vae_input_mode"] = vae_input_mode
     payload = {
         "schema_version": 1,
         "cache_schema_version": 2,
@@ -293,7 +350,7 @@ def make_manifest(tmp_path, artifact):
             "revision": CUBE_OUT_OF_BOX_CONTRACT.revision,
         },
         "subset": {"episodes": [0], "frame_start": None, "frame_end": None, "max_samples": 1},
-        "provenance": {"builder": "test"},
+        "provenance": provenance,
         "global_seed": 0,
         "entries": [entry],
         "total_bytes": entry["bytes"],
@@ -302,6 +359,26 @@ def make_manifest(tmp_path, artifact):
     manifest = tmp_path / "manifest.json"
     write_cache_manifest(payload, manifest)
     return manifest, output
+
+
+def test_manifest_rejects_artifact_with_mismatched_vae_mode(tmp_path):
+    artifact = make_artifact_with_mode("observed_prefix")
+    manifest, _ = make_manifest(tmp_path, artifact, vae_input_mode="legacy_padded_vae")
+    dataset = CosmosFeatureCacheDataset(manifest)
+
+    with pytest.raises(CosmosFeatureCacheManifestError, match="VAE input mode"):
+        dataset[0]
+
+
+def test_manifest_rejects_unknown_vae_mode(tmp_path):
+    artifact = make_artifact()
+    manifest, _ = make_manifest(tmp_path, artifact)
+    payload = json.loads(manifest.read_text())
+    payload["provenance"]["vae_input_mode"] = "unknown"
+    manifest.write_text(json.dumps(payload))
+
+    with pytest.raises(CosmosFeatureCacheManifestError, match="vae_input_mode"):
+        load_cache_manifest(manifest)
 
 
 def test_manifest_loader_is_lazy_and_checks_artifact_hash_on_access(tmp_path):

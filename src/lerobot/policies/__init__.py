@@ -32,6 +32,7 @@ from .pretrained import PreTrainedPolicy as PreTrainedPolicy
 from .smolvla.configuration_smolvla import SmolVLAConfig as SmolVLAConfig
 from .tdmpc.configuration_tdmpc import TDMPCConfig as TDMPCConfig
 from .utils import make_robot_action, prepare_observation_for_inference
+from .vam.configuration_video_vam import VideoVAMConfig as VideoVAMConfig
 from .vla_jepa.configuration_vla_jepa import VLAJEPAConfig as VLAJEPAConfig
 from .vqbet.configuration_vqbet import VQBeTConfig as VQBeTConfig
 from .wall_x.configuration_wall_x import WallXConfig as WallXConfig
@@ -57,6 +58,7 @@ __all__ = [
     "PI0FastConfig",
     "PI05Config",
     "SmolVLAConfig",
+    "VideoVAMConfig",
     "TDMPCConfig",
     "VLAJEPAConfig",
     "VQBeTConfig",

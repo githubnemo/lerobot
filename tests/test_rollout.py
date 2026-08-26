@@ -104,7 +104,10 @@ def test_inference_config_types():
     rtc = RTCInferenceConfig()
     assert rtc.type == "rtc"
     assert rtc.queue_threshold == 30
+    assert rtc.observation_history_size == 1
     assert rtc.rtc is not None
+    with pytest.raises(ValueError, match="observation_history_size"):
+        RTCInferenceConfig(observation_history_size=0)
 
 
 def test_sentry_config_defaults():

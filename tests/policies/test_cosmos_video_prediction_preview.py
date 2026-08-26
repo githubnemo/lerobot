@@ -25,10 +25,18 @@ def test_temporal_alignment_uses_causal_four_to_one_mapping(tmp_path):
     )
 
     assert spec.pixel_frames == 61
+    assert spec.vae_input_mode == "observed_prefix"
     assert spec.latent_chunk_duration == 21
     assert alignment.conditioning_indices == (10, 11, 12, 13, 14)
     assert alignment.output_indices[:5] == alignment.conditioning_indices
     assert alignment.predicted_future_indices == tuple(range(15, 71))
+
+
+def test_backbone_spec_accepts_legacy_padded_vae_mode(tmp_path):
+    spec = cosmos_2b_backbone_spec(
+        tmp_path / "cosmos.pt", tmp_path / "tokenizer.pth", vae_input_mode="legacy_padded_vae"
+    )
+    assert spec.vae_input_mode == "legacy_padded_vae"
 
 
 def test_temporal_alignment_rejects_inconsistent_prefix_geometry():

@@ -8,12 +8,18 @@ import os
 import platform
 import sys
 import time
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
 import torch
 
 from lerobot.datasets.vam import CUBE_OUT_OF_BOX_CONTRACT, validate_metadata
+from lerobot.policies.vam.context_transform import (
+    CONTEXT_TRANSFORMS,
+    apply_context_transform,
+    context_transform_metadata,
+)
 from lerobot.policies.vam.cosmos_cache_dataset import (
     MANIFEST_SCHEMA_VERSION,
     load_cache_manifest,
@@ -31,6 +37,9 @@ from lerobot.policies.vam.cosmos_feature_cache import (
 )
 from lerobot.policies.vam.cosmos_predict2_extractor import (
     UPSTREAM_COMMIT,
+    VAE_INPUT_MODE_LEGACY_PADDED,
+    VAE_INPUT_MODE_OBSERVED_PREFIX,
+    VAE_INPUT_MODES,
     CosmosPredict2Extractor,
     CosmosPredict2ExtractorConfig,
 )
@@ -40,7 +49,6 @@ from scripts.video_vam.smoke_test_cosmos_extractor import (
     DEFAULT_DATASET_ROOT,
     DEFAULT_PROMPT_PATH,
     DEFAULT_TOKENIZER_PATH,
-    MIMIC_VIDEO_CONDITIONING,
     MIMIC_VIDEO_PREPROCESS,
     _cuda_peak,
     _episode_row,
@@ -48,6 +56,7 @@ from scripts.video_vam.smoke_test_cosmos_extractor import (
     _relative_index,
     _runtime,
     _synchronize,
+    conditioning_description,
     prepare_sample,
     run_timed_extraction,
     validate_extraction_output,
@@ -81,6 +90,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--manifest", type=Path, help="Manifest path; defaults to OUTPUT_DIR/manifest.json.")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument(
+        "--vae-input-mode",
+        choices=VAE_INPUT_MODES,
+        default=VAE_INPUT_MODE_OBSERVED_PREFIX,
+        help=(
+            "VAE input contract for new artifacts: observed_prefix encodes only the five "
+            "observed pixels; legacy_padded_vae restores 5->61 padding."
+        ),
+    )
+    parser.add_argument(
         "--sigma",
         type=float,
         default=10.0,
@@ -93,6 +111,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--random-init-seed",
         type=int,
         help="Use a seeded random Cosmos initialization instead of checkpoint weights.",
+    )
+    parser.add_argument(
+        "--context-transform",
+        choices=CONTEXT_TRANSFORMS,
+        default="none",
+        help=(
+            "Transform the extracted [B, 19200, 2048] context before writing it. "
+            "pool4 stores all 16 latent frames at an adaptive 8x10 spatial grid "
+            "([B, 1280, 2048])."
+        ),
     )
     parser.add_argument("--resume", action="store_true", help="Strictly verify and skip existing artifacts.")
     parser.add_argument("--overwrite", action="store_true")
@@ -116,6 +144,8 @@ def _validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--frame-end must be greater than --frame-start")
     if args.seed < 0:
         raise ValueError("--seed must be non-negative")
+    if args.vae_input_mode not in VAE_INPUT_MODES:
+        raise ValueError(f"--vae-input-mode must be one of {VAE_INPUT_MODES!r}")
     if not math.isfinite(args.sigma) or args.sigma <= 0:
         raise ValueError("--sigma must be finite and positive")
     if args.random_init_seed is not None and args.random_init_seed < 0:
@@ -145,7 +175,17 @@ def _artifact_path(output_dir: Path, episode: int, frame: int) -> Path:
     return output_dir / f"episode-{episode:04d}-frame-{frame:06d}.safetensors"
 
 
-def _existing_entry(output_dir: Path, episode: int, frame: int, *, expected_seed: int):
+def _existing_entry(
+    output_dir: Path,
+    episode: int,
+    frame: int,
+    *,
+    expected_seed: int,
+    expected_transform: str,
+    expected_sigma: float,
+    expected_random_init_seed: int | None,
+    expected_vae_input_mode: str,
+):
     path = _artifact_path(output_dir, episode, frame)
     artifact = verify_feature_cache(path)
     dataset = artifact.provenance.payload["dataset"]
@@ -157,6 +197,15 @@ def _existing_entry(output_dir: Path, episode: int, frame: int, *, expected_seed
         or extractor["noise_seed"] != expected_seed
     ):
         raise ValueError(f"existing cache provenance does not match episode/frame/seed: {path}")
+    stored_transform = artifact.provenance.payload["output"].get("context_transform", "none")
+    if stored_transform != expected_transform:
+        raise ValueError(f"existing cache context transform does not match request: {path}")
+    if abs(float(extractor["high_noise_sigma"]) - expected_sigma) > 1e-9:
+        raise ValueError(f"existing cache sigma does not match request: {path}")
+    if extractor.get("random_init_seed") != expected_random_init_seed:
+        raise ValueError(f"existing cache random-init seed does not match request: {path}")
+    if extractor.get("vae_input_mode", VAE_INPUT_MODE_LEGACY_PADDED) != expected_vae_input_mode:
+        raise ValueError(f"existing cache VAE input mode does not match request: {path}")
     return artifact
 
 
@@ -166,7 +215,10 @@ def _manifest_payload(
     args: argparse.Namespace,
     entries: list[dict[str, Any]],
     runtime: dict[str, Any],
+    weights: Mapping[str, Any],
+    prompt_embedding: Mapping[str, Any],
 ) -> dict[str, Any]:
+    context = context_transform_metadata(args.context_transform)
     return {
         "schema_version": MANIFEST_SCHEMA_VERSION,
         "cache_schema_version": CACHE_SCHEMA_VERSION,
@@ -183,10 +235,23 @@ def _manifest_payload(
             "dataset_revision_seed_input": "dataset.revision + episode + frame + global_seed via SHA256",
             "global_seed": args.seed,
             "high_noise_sigma": args.sigma,
+            "vae_input_mode": args.vae_input_mode,
+            "random_init_seed": args.random_init_seed,
+            "context_transform": args.context_transform,
+            "context_tokens": context["output_tokens"],
+            "context_grid": context["output_grid"],
+            "context_input_grid": context["input_grid"],
+            "context_storage": (
+                f"detached bfloat16 [B, {context['output_tokens']}, 2048] "
+                f"with grid {context['output_grid']['temporal']}x"
+                f"{context['output_grid']['height']}x{context['output_grid']['width']}"
+            ),
+            "weights": dict(weights),
+            "prompt_embedding": dict(prompt_embedding),
             "extractor_input_keys": ["rgb_history", "prompt_embedding"],
             "excluded_from_extractor": ["state", "target_action", ACTION_IS_PAD_KEY],
             "action_padding_semantics": "action_is_pad=true means padded and excluded from decoder loss/statistics",
-            "context_storage": "detached bfloat16 [B, 19200, 2048]",
+            "raw_context_storage": "detached bfloat16 [B, 19200, 2048]",
             "status": "diagnostic_only_non_rollout",
             "selection": {
                 "stride": args.stride,
@@ -273,6 +338,7 @@ def build(args: argparse.Namespace) -> Path:
         hidden_layer=20,
         stop_after_step=0,
         random_init_seed=args.random_init_seed,
+        vae_input_mode=args.vae_input_mode,
     )
     _synchronize(device)
     torch.cuda.reset_peak_memory_stats(device)
@@ -293,7 +359,16 @@ def build(args: argparse.Namespace) -> Path:
         noise_seed = derive_window_seed(dataset.revision, episode, frame, args.seed)
         path = _artifact_path(output_dir, episode, frame)
         if args.resume and path.exists():
-            artifact = _existing_entry(output_dir, episode, frame, expected_seed=noise_seed)
+            artifact = _existing_entry(
+                output_dir,
+                episode,
+                frame,
+                expected_seed=noise_seed,
+                expected_transform=args.context_transform,
+                expected_sigma=args.sigma,
+                expected_random_init_seed=args.random_init_seed,
+                expected_vae_input_mode=args.vae_input_mode,
+            )
             print(f"resume verified {episode}/{frame}: {path}")
         else:
             if (path.exists() or path.with_suffix(".json").exists()) and not args.overwrite:
@@ -310,7 +385,12 @@ def build(args: argparse.Namespace) -> Path:
             )
             validate_extraction_output(timing.extraction, batch_size=1, sigma=args.sigma)
             extraction = timing.extraction
-            context = extraction.tokens.detach().to(device="cpu", dtype=torch.bfloat16).contiguous()
+            context = (
+                apply_context_transform(extraction.tokens, args.context_transform)
+                .detach()
+                .to(device="cpu", dtype=torch.bfloat16)
+                .contiguous()
+            )
             state = prepared.state.detach().cpu().contiguous()
             target_action = prepared.target_action.detach().cpu().contiguous()
             action_is_pad = prepared.action_is_pad.detach().cpu().contiguous()
@@ -353,9 +433,10 @@ def build(args: argparse.Namespace) -> Path:
                     "noise_seed": extraction.provenance.noise_seed,
                     "hidden_layer": config.hidden_layer,
                     "stop_after_step": config.stop_after_step,
+                    "vae_input_mode": config.vae_input_mode,
                     "input_shape": list(prepared.rgb_history.shape),
                     "preprocess": MIMIC_VIDEO_PREPROCESS,
-                    "conditioning": MIMIC_VIDEO_CONDITIONING,
+                    "conditioning": conditioning_description(args.vae_input_mode),
                     "official_resolution": "480",
                     "official_positional_latent_max_h": 240,
                     "official_positional_latent_max_w": 240,
@@ -385,6 +466,7 @@ def build(args: argparse.Namespace) -> Path:
                 action_is_pad=action_is_pad,
                 raw_hidden_shape=tuple(extraction.hidden_grid.shape),
                 raw_hidden_dtype=extraction.hidden_grid.dtype,
+                context_transform=args.context_transform,
             )
             artifact = CosmosFeatureCacheArtifact(context, state, target_action, action_is_pad, provenance)
             save_feature_cache(artifact, path, overwrite=args.overwrite)
@@ -424,6 +506,21 @@ def build(args: argparse.Namespace) -> Path:
         old_subset.setdefault("stride", 1)
         if old_manifest.global_seed != args.seed or old_manifest.dataset_revision != dataset.revision:
             raise ValueError("resume manifest dataset revision or global seed does not match the request")
+        if old_manifest.context_transform != args.context_transform:
+            raise ValueError("resume manifest context transform does not match the request")
+        old_provenance = old_manifest.payload["provenance"]
+        if old_manifest.vae_input_mode != args.vae_input_mode:
+            raise ValueError("resume manifest VAE input mode does not match the request")
+        if (
+            "high_noise_sigma" in old_provenance
+            and abs(float(old_provenance["high_noise_sigma"]) - args.sigma) > 1e-9
+        ):
+            raise ValueError("resume manifest sigma does not match the request")
+        if (
+            "random_init_seed" in old_provenance
+            and old_provenance["random_init_seed"] != args.random_init_seed
+        ):
+            raise ValueError("resume manifest random-init seed does not match the request")
         if old_subset != expected_subset:
             raise ValueError("resume manifest subset does not match the requested selection")
         old_ids = [entry.sample_id for entry in old_manifest.entries]
@@ -451,7 +548,21 @@ def build(args: argparse.Namespace) -> Path:
         "gpu_name": torch.cuda.get_device_name(0),
         "python_version": platform.python_version(),
     }
-    payload = _manifest_payload(dataset=dataset, args=args, entries=entries, runtime=runtime)
+    prompt_payload = {
+        "artifact_path": str(args.prompt.expanduser().resolve()),
+        "output_sha256": prompt_artifact.provenance.output_sha256,
+        "token_ids_sha256": prompt_artifact.provenance.token_ids_sha256,
+        "shape": list(prompt_artifact.embedding.shape),
+        "dtype": str(prompt_artifact.embedding.dtype).removeprefix("torch."),
+    }
+    payload = _manifest_payload(
+        dataset=dataset,
+        args=args,
+        entries=entries,
+        runtime=runtime,
+        weights=weights,
+        prompt_embedding=prompt_payload,
+    )
     write_cache_manifest(payload, manifest_path, overwrite=bool(args.resume or args.overwrite))
     print(f"manifest: {manifest_path}")
     print(f"samples: {len(entries)} total_bytes: {payload['total_bytes']}")

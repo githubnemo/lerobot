@@ -51,6 +51,12 @@ def test_optimizer_build(config_cls, expected_class, model_params):
         assert optimizer.defaults["lr"] == config.lr
 
 
+def test_adamw_build_forwards_fused_flag(model_params):
+    optimizer = AdamWConfig(fused=True).build(model_params)
+
+    assert optimizer.defaults["fused"] is True
+
+
 def test_save_optimizer_state(optimizer, tmp_path):
     save_optimizer_state(optimizer, tmp_path)
     assert (tmp_path / OPTIMIZER_STATE).is_file()

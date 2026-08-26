@@ -83,6 +83,17 @@ class SmolVLAConfig(PreTrainedConfig):
 
     vlm_model_name: str = "HuggingFaceTB/SmolVLM2-500M-Video-Instruct"  # Select the VLM backbone.
     load_vlm_weights: bool = False  # Set to False in case of training the expert from scratch. True when init from pretrained SmolVLA weights
+    # Legacy compatibility field. It is intentionally inert: vision randomization is now an
+    # explicit training-time hook driven by TrainPipelineConfig.seed.
+    vision_random_init_seed: int | None = None
+    randomize_vision: bool = False
+    vision_randomization_applied: bool = False
+    vision_randomization_seed: int | None = None
+    vision_randomization_target_fqn: str | None = None
+    vision_randomization_source_file: str | None = None
+    vision_randomization_before_sha256: str | None = None
+    vision_randomization_after_sha256: str | None = None
+    vision_randomization_changed_tensor_count: int | None = None
 
     add_image_special_tokens: bool = False  # Whether to use special image tokens around image features.
 

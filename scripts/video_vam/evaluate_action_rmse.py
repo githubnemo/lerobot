@@ -6,7 +6,7 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import torch
 
@@ -16,10 +16,12 @@ from lerobot.policies.vam.action_rmse import (
     ACTION_HORIZON,
     ActionPredictionBackend,
     EvaluationBatch,
+    FastWAMBackend,
     MeanActionBackend,
     SmolVLABackend,
     StateRepeatBackend,
     VAMBackend,
+    VLAJEPABackend,
     evaluate_backend,
 )
 from lerobot.policies.vam.cosmos_cache_dataset import CosmosFeatureCacheDataset, load_cache_manifest
@@ -58,6 +60,16 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument("--smolvla-checkpoint", type=Path)
+    parser.add_argument(
+        "--fastwam-checkpoint",
+        type=Path,
+        help="Native FastWAM checkpoint directory with its saved processors and text context.",
+    )
+    parser.add_argument(
+        "--vla-jepa-checkpoint",
+        type=Path,
+        help="Native VLA-JEPA checkpoint directory with its saved processors.",
+    )
     parser.add_argument("--device", choices=("cpu", "cuda"), default="cuda")
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--seed", type=int, default=0)
@@ -138,7 +150,7 @@ def _make_batches(args: argparse.Namespace) -> tuple[list[EvaluationBatch], dict
             raise RuntimeError(
                 f"manifest frame is absent from dataset: {entry.episode_index}/{entry.frame_index}"
             )
-        row = dataset[relative_index]
+        row = cast(dict[str, Any], dataset[relative_index])
         cache_item = cache.load_entry(entry)
         target = row["action"].float()
         padding = row["action_is_pad"].bool()
@@ -197,6 +209,8 @@ def _make_batches(args: argparse.Namespace) -> tuple[list[EvaluationBatch], dict
         "normalization": {
             "vam": _vam_normalization_description(args),
             "smolvla": "checkpoint-native dataset-wide mean/std",
+            "fastwam": "checkpoint-native pre/post processors; native 32 actions sliced to 30",
+            "vla_jepa": "checkpoint-native pre/post processors",
         },
         "vam_context": "zeroed" if args.vam_zero_context else "cosmos_layer20_hidden",
         "padding": "action_is_pad=true tokens excluded",
@@ -321,9 +335,17 @@ def main() -> int:
     if vam is not None:
         backends.append(vam)
         protocol["vam_sigma"] = vam_sigma_provenance
+    if args.fastwam_checkpoint is not None:
+        backends.append(
+            FastWAMBackend.from_pretrained(str(args.fastwam_checkpoint), device=torch.device(args.device))
+        )
     if args.smolvla_checkpoint is not None:
         backends.append(
             SmolVLABackend.from_pretrained(str(args.smolvla_checkpoint), device=torch.device(args.device))
+        )
+    if args.vla_jepa_checkpoint is not None:
+        backends.append(
+            VLAJEPABackend.from_pretrained(str(args.vla_jepa_checkpoint), device=torch.device(args.device))
         )
     results = {backend.name: evaluate_backend(backend, batches, seed=args.seed) for backend in backends}
     payload = {"protocol": protocol, "backends": results}

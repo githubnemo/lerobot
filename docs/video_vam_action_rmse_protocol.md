@@ -18,6 +18,7 @@
 - Raw action feature: the six stored SO-101 `.pos` dimensions, in degrees.
 - Horizon: exactly 30 future actions at 10 Hz.
 - SmolVLA: use only indices `0:30` from its native 50-action chunk; no retraining.
+- FastWAM: use only indices `0:30` from its native 32-action chunk; no retraining.
 - VAM: use its native `[30, 6]` action output.
 - Padding: use the same boolean `action_is_pad` mask for both policies. A padded action token contributes zero error and zero denominator weight.
 - Predictions must be denormalized to stored physical units before scoring.
@@ -32,6 +33,12 @@
 - Aggregate squared-error sums globally; never average batch RMSEs.
 
 ## Native policy configurations
+
+### FastWAM
+
+- Native FastWAM policy and checkpoint-native pre/post processors.
+- Native horizon: 32 actions; score only the first 30 actions.
+- Text conditioning: cached UMT5 context from the checkpoint training config, with the text encoder disabled.
 
 ### VAM
 

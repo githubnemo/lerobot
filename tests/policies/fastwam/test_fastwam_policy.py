@@ -268,6 +268,37 @@ def test_from_pretrained_uses_base_loader_and_skips_wan_backbone(monkeypatch, tm
     assert torch.allclose(policy.model.dit.weight, torch.full_like(policy.model.dit.weight, 1.25))
 
 
+def test_checkpoint_loader_materializes_weights_on_cpu(monkeypatch, tmp_path):
+    cfg = FastWAMConfig(
+        action_dim=3,
+        proprio_dim=2,
+        action_horizon=4,
+        n_action_steps=2,
+        num_video_frames=5,
+        action_video_freq_ratio=1,
+        base_model_id=None,
+    )
+    monkeypatch.setattr(FastWAMPolicy, "_build_core_model", lambda self, config: CoreWithFrozenComponents())
+    reference = FastWAMPolicy(cfg)
+    with torch.no_grad():
+        reference.model.dit.weight.fill_(1.25)
+    reference.save_pretrained(tmp_path)
+
+    import safetensors.torch
+
+    observed_devices = []
+    original_load_file = safetensors.torch.load_file
+
+    def recording_load_file(filename, device="cpu", **kwargs):
+        observed_devices.append(device)
+        return original_load_file(filename, device=device, **kwargs)
+
+    monkeypatch.setattr(safetensors.torch, "load_file", recording_load_file)
+    FastWAMPolicy.from_pretrained(tmp_path)
+
+    assert observed_devices == ["cpu"]
+
+
 def test_save_pretrained_excludes_frozen_components(monkeypatch, tmp_path):
     cfg = FastWAMConfig(
         action_dim=3,

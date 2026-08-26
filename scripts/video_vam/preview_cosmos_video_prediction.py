@@ -15,6 +15,7 @@ import numpy as np
 import torch
 
 from lerobot.datasets.vam import CUBE_OUT_OF_BOX_CONTRACT
+from lerobot.policies.vam.cosmos_predict2_extractor import VAE_INPUT_MODE_OBSERVED_PREFIX, VAE_INPUT_MODES
 from lerobot.policies.vam.cosmos_prompt_embedding import load_prompt_embedding
 from lerobot.policies.vam.cosmos_video_prediction import (
     CosmosVideo2WorldBackend,
@@ -55,6 +56,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--steps", type=int, default=35)
     parser.add_argument("--guidance", type=float, default=0.0)
+    parser.add_argument(
+        "--vae-input-mode",
+        choices=VAE_INPUT_MODES,
+        default=VAE_INPUT_MODE_OBSERVED_PREFIX,
+        help=(
+            "VAE input contract: observed_prefix encodes only real observed pixels (default); "
+            "legacy_padded_vae restores 5->61 padding for compatibility/debugging."
+        ),
+    )
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--overwrite", action="store_true")
     return parser.parse_args(argv)
@@ -280,6 +290,7 @@ def run_preview(args: argparse.Namespace) -> Path:
         device=args.device,
         guidance=args.guidance,
         sampling_steps=args.steps,
+        vae_input_mode=args.vae_input_mode,
     )
     dataset, prepared = _load_prepared_sample(args)
     alignment = temporal_alignment(

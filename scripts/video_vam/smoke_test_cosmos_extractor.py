@@ -11,7 +11,7 @@ import time
 from dataclasses import dataclass
 from numbers import Integral
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import torch
 
@@ -24,6 +24,9 @@ from lerobot.policies.vam.cosmos_feature_cache import (
 )
 from lerobot.policies.vam.cosmos_predict2_extractor import (
     UPSTREAM_COMMIT,
+    VAE_INPUT_MODE_LEGACY_PADDED,
+    VAE_INPUT_MODE_OBSERVED_PREFIX,
+    VAE_INPUT_MODES,
     CosmosPredict2Extraction,
     CosmosPredict2Extractor,
     CosmosPredict2ExtractorConfig,
@@ -43,11 +46,25 @@ DEFAULT_TOKENIZER_PATH = Path(
 )
 DEFAULT_CACHE_DIR = Path("/home/anton/.cache/video-vam/cosmos-features")
 
-# This is the exact pinned mimic-video pipeline contract. The generic checkpoint
-# is the 480p model with resize_online=False; it is not the unrelated generic
-# Cosmos 720p 704x1280 training configuration.
+# The generic checkpoint and preprocessing follow the pinned mimic-video 480p contract;
+# the pixel VAE input mode below is an intentional local optimization choice.
 MIMIC_VIDEO_PREPROCESS = "mimic-video 480p RGB uint8 -> [-1, 1], resize_online=False"
-MIMIC_VIDEO_CONDITIONING = "frame_replace, zero-padded 61 pixel frames with first T observed, encoded whole; latent_conditional_frames=2 for T=5"
+MIMIC_VIDEO_CONDITIONING = (
+    "frame_replace, five observed pixel frames -> two latent frames via prefix-only VAE, "
+    "zero-expanded to 16; latent_conditional_frames=2 for T=5"
+)
+
+
+def conditioning_description(vae_input_mode: str) -> str:
+    """Describe the selected pixel-to-latent conditioning contract for provenance."""
+    if vae_input_mode == VAE_INPUT_MODE_OBSERVED_PREFIX:
+        return MIMIC_VIDEO_CONDITIONING
+    if vae_input_mode == VAE_INPUT_MODE_LEGACY_PADDED:
+        return (
+            "frame_replace, zero-padded 61 pixel frames with first T observed, "
+            "encoded whole; latent_conditional_frames=2 for T=5"
+        )
+    raise ValueError(f"unsupported VAE input mode: {vae_input_mode!r}")
 
 
 @dataclass(frozen=True, slots=True)
@@ -94,6 +111,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_CACHE_DIR)
     parser.add_argument("--output", type=Path, help="Explicit .safetensors output path.")
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument(
+        "--vae-input-mode",
+        choices=VAE_INPUT_MODES,
+        default=VAE_INPUT_MODE_OBSERVED_PREFIX,
+        help=(
+            "VAE input contract: observed_prefix encodes only the five observed pixels "
+            "(default); legacy_padded_vae restores 5->61 padding for compatibility/debugging."
+        ),
+    )
     parser.add_argument("--overwrite", action="store_true")
     return parser.parse_args(argv)
 
@@ -206,7 +232,7 @@ def load_real_sample(
         frame_index=frame_index,
         window_start=window_start,
     )
-    sample = dataset[_relative_index(dataset, current)]
+    sample = cast(dict[str, Any], dataset[_relative_index(dataset, current)])
     prepared = prepare_sample(sample, frame_index=current, config=config)
     sample_episode = prepared.sample.get("episode_index")
     if sample_episode is not None and _scalar_int(sample_episode, "sample episode_index") != episode_index:
@@ -408,6 +434,7 @@ def smoke(args: argparse.Namespace) -> CosmosFeatureCacheArtifact:
         seed=0,
         hidden_layer=20,
         stop_after_step=0,
+        vae_input_mode=args.vae_input_mode,
     )
     _synchronize(device)
     if device.type == "cuda":
@@ -464,9 +491,10 @@ def smoke(args: argparse.Namespace) -> CosmosFeatureCacheArtifact:
             "noise_seed": extraction.provenance.noise_seed,
             "hidden_layer": config.hidden_layer,
             "stop_after_step": config.stop_after_step,
+            "vae_input_mode": config.vae_input_mode,
             "input_shape": list(prepared.rgb_history.shape),
             "preprocess": MIMIC_VIDEO_PREPROCESS,
-            "conditioning": MIMIC_VIDEO_CONDITIONING,
+            "conditioning": conditioning_description(config.vae_input_mode),
             "official_resolution": "480",
             "official_positional_latent_max_h": 240,
             "official_positional_latent_max_w": 240,

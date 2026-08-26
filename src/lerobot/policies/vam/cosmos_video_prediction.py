@@ -23,6 +23,11 @@ import torch
 from torch import Tensor
 from torch.nn import functional
 
+from .cosmos_predict2_extractor import (
+    VAE_INPUT_MODE_OBSERVED_PREFIX,
+    VAE_INPUT_MODES,
+)
+
 UPSTREAM_REPOSITORY = "https://github.com/mimic-video/mimic-video"
 UPSTREAM_COMMIT = "e3355dbc93132b576c02f920a59b4fc18a4f5906"
 REPORT_SCHEMA_VERSION = 1
@@ -62,10 +67,15 @@ class VideoBackboneSpec:
     sigma_min: float
     sigma_max: float
     schedule_order: float
+    vae_input_mode: str = VAE_INPUT_MODE_OBSERVED_PREFIX
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "checkpoint_path", Path(self.checkpoint_path).expanduser())
         object.__setattr__(self, "tokenizer_path", Path(self.tokenizer_path).expanduser())
+        if self.vae_input_mode not in VAE_INPUT_MODES:
+            raise ValueError(
+                "vae_input_mode must be one of " + ", ".join(repr(value) for value in VAE_INPUT_MODES)
+            )
         for name in (
             "input_frames",
             "input_height",
@@ -140,6 +150,7 @@ class VideoBackboneSpec:
             "feature_layer": self.feature_layer,
             "prompt_tokens": self.prompt_tokens,
             "prompt_dim": self.prompt_dim,
+            "vae_input_mode": self.vae_input_mode,
         }
 
 
@@ -151,6 +162,7 @@ def cosmos_2b_backbone_spec(
     dtype: str | torch.dtype = "bfloat16",
     guidance: float = 7.0,
     sampling_steps: int = 35,
+    vae_input_mode: str = VAE_INPUT_MODE_OBSERVED_PREFIX,
 ) -> VideoBackboneSpec:
     """Create the pinned 2B/480p/10fps spec behind the generic seam."""
     return VideoBackboneSpec(
@@ -184,6 +196,7 @@ def cosmos_2b_backbone_spec(
         sigma_min=0.002,
         sigma_max=80.0,
         schedule_order=7.0,
+        vae_input_mode=vae_input_mode,
     )
 
 
@@ -372,6 +385,7 @@ class CosmosVideo2WorldBackend:
             hidden_dim=spec.feature_dim,
             sigma_data=spec.sigma_data,
             sigma_conditional=spec.sigma_conditional,
+            vae_input_mode=spec.vae_input_mode,
         )
         self.extractor = CosmosPredict2Extractor(config)
         self.dtype = self.extractor.dtype
@@ -402,11 +416,14 @@ class CosmosVideo2WorldBackend:
                 raise ValueError("floating-point images must be in [0, 1] or [-1, 1]")
         else:
             raise TypeError("rgb_history must be uint8 or floating point")
-        padded_video = torch.zeros(
-            images.shape[0], 3, self.spec.pixel_frames, 480, 640, device=self.device, dtype=self.dtype
-        )
-        padded_video[:, :, :input_frames] = images
-        conditional_latent = self.extractor.tokenizer.encode(padded_video)
+        if self.spec.vae_input_mode == VAE_INPUT_MODE_OBSERVED_PREFIX:
+            conditional_latent = self.extractor.encode_observed_pixels(images)
+        else:
+            padded_video = torch.zeros(
+                images.shape[0], 3, self.spec.pixel_frames, 480, 640, device=self.device, dtype=self.dtype
+            )
+            padded_video[:, :, :input_frames] = images
+            conditional_latent = self.extractor.tokenizer.encode(padded_video)
         expected_latent = (
             images.shape[0],
             self.spec.latent_channels,

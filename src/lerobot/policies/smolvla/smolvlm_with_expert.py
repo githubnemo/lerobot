@@ -71,6 +71,51 @@ def get_intermediate_size(hidden_dim, ffn_dim_multiplier=4, multiple_of=256):
     return hidden_dim
 
 
+def _module_cuda_devices(module: nn.Module) -> list[int]:
+    """Return CUDA generator indices used by a module's parameters or buffers."""
+    devices = {
+        tensor.device.index
+        for tensor in (*module.parameters(), *module.buffers())
+        if tensor.device.type == "cuda"
+    }
+    return sorted(device for device in devices if device is not None)
+
+
+@torch.no_grad()
+def _reinitialize_module(module: nn.Module, seed: int) -> None:
+    """Reinitialize a module without consuming the caller CPU/CUDA RNG states."""
+    cuda_devices = _module_cuda_devices(module)
+    with torch.random.fork_rng(devices=cuda_devices):
+        torch.random.default_generator.manual_seed(seed)
+        for device_index in cuda_devices:
+            with torch.cuda.device(device_index):
+                torch.cuda.manual_seed(seed)
+
+        init_weights = getattr(module, "init_weights", None)
+        if callable(init_weights):
+            # Transformers marks modules initialized during construction. Clear those markers so
+            # post-load init_weights() actually re-randomizes the checkpoint-loaded tower.
+            for submodule in module.modules():
+                if hasattr(submodule, "_is_hf_initialized"):
+                    submodule._is_hf_initialized = False
+                # Transformers guards torch.nn.init functions with per-tensor markers as well as
+                # module markers. Clear both so a loaded checkpoint is genuinely reinitialized.
+                for parameter in submodule.parameters(recurse=False):
+                    if hasattr(parameter, "_is_hf_initialized"):
+                        parameter._is_hf_initialized = False
+                for buffer in submodule.buffers(recurse=False):
+                    if hasattr(buffer, "_is_hf_initialized"):
+                        buffer._is_hf_initialized = False
+            # PreTrainedModel.init_weights() applies the architecture-specific initializer.
+            init_weights()
+        else:
+            # Keep the helper usable with tiny synthetic modules in focused tests.
+            for submodule in module.modules():
+                reset_parameters = getattr(submodule, "reset_parameters", None)
+                if callable(reset_parameters):
+                    reset_parameters()
+
+
 class SmolVLMWithExpertModel(nn.Module):
     def __init__(
         self,

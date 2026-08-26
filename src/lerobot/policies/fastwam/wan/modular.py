@@ -17,6 +17,7 @@ from __future__ import annotations
 import logging
 import re
 from collections.abc import Sequence
+from contextlib import suppress
 from typing import Any
 
 import torch
@@ -24,6 +25,7 @@ import torch.nn as nn
 import torch.nn.functional as functional
 from PIL import Image
 
+from ..text_context import TextContextArtifact, encode_wan_text_context
 from .components import (
     WAN22_DIFFUSERS_MODEL_ID,
     WAN_T5_TOKENIZER,
@@ -836,6 +838,7 @@ class FastWAM(torch.nn.Module):
         vae,
         text_encoder=None,
         tokenizer=None,
+        text_context_artifact: TextContextArtifact | None = None,
         text_dim: int | None = None,
         proprio_dim: int | None = None,
         device: str = "cpu",
@@ -872,6 +875,7 @@ class FastWAM(torch.nn.Module):
         # Device/dtype moves still reach them via the `_apply` override below.
         object.__setattr__(self, "vae", vae)
         object.__setattr__(self, "text_encoder", text_encoder)
+        object.__setattr__(self, "text_context_artifact", text_context_artifact)
         self.tokenizer = tokenizer
         vae.requires_grad_(False)
         if text_encoder is not None:
@@ -936,6 +940,7 @@ class FastWAM(torch.nn.Module):
         action_num_train_timesteps: int = 1000,
         loss_lambda_video: float = 1.0,
         loss_lambda_action: float = 1.0,
+        text_context_artifact: TextContextArtifact | None = None,
     ):
         if video_dit_config is None:
             raise ValueError("`video_dit_config` is required for FastWAM.from_wan22_pretrained().")
@@ -972,7 +977,11 @@ class FastWAM(torch.nn.Module):
             if load_text_encoder
             else None
         )
-        tokenizer = build_wan_tokenizer(model_id=tokenizer_model_id, tokenizer_max_len=tokenizer_max_len)
+        tokenizer = (
+            build_wan_tokenizer(model_id=tokenizer_model_id, tokenizer_max_len=tokenizer_max_len)
+            if load_text_encoder
+            else None
+        )
 
         return cls(
             video_expert=video_expert,
@@ -981,6 +990,7 @@ class FastWAM(torch.nn.Module):
             vae=vae,
             text_encoder=text_encoder,
             tokenizer=tokenizer,
+            text_context_artifact=text_context_artifact,
             text_dim=int(video_dit_config["text_dim"]),
             proprio_dim=proprio_dim,
             device=device,
@@ -1005,6 +1015,11 @@ class FastWAM(torch.nn.Module):
         self.vae._apply(fn)
         if self.text_encoder is not None:
             self.text_encoder._apply(fn)
+        # `device` is used for input placement, but is not an nn.Module attribute and therefore
+        # would otherwise remain `cpu` after the CPU construction/checkpoint-load path moves the
+        # assembled core to CUDA.
+        with suppress(StopIteration):
+            self.device = next(self.mot.parameters()).device
         return self
 
     @staticmethod
@@ -1024,17 +1039,18 @@ class FastWAM(torch.nn.Module):
                 "Prompt encoding requires loaded text encoder/tokenizer. "
                 "Set `load_text_encoder=true` or provide precomputed `context/context_mask`."
             )
-        ids, mask = self.tokenizer(prompt, return_mask=True, add_special_tokens=True)
-        ids = ids.to(self.device)
-        mask = mask.to(self.device, dtype=torch.bool)
-        prompt_emb = self.text_encoder(ids, mask)
-        seq_lens = mask.gt(0).sum(dim=1).long()
-        for i, v in enumerate(seq_lens):
-            prompt_emb[i, v:] = 0
-        # Match FastWAM/Wan2.2 context semantics: padding embeddings are zeroed,
-        # while cross-attention still sees a fixed-length context.
-        mask = torch.ones_like(mask)
-        return prompt_emb.to(device=self.device), mask
+        return encode_wan_text_context(
+            tokenizer=self.tokenizer,
+            text_encoder=self.text_encoder,
+            prompts=prompt,
+            device=self.device,
+        )
+
+    @torch.no_grad()
+    def encode_cached_prompt(self, prompt: str | Sequence[str]):
+        if self.text_context_artifact is None:
+            raise ValueError("No precomputed FastWAM text context artifact is loaded.")
+        return self.text_context_artifact.lookup(prompt, device=self.device, dtype=self.torch_dtype)
 
     def _append_proprio_to_context(
         self,
@@ -1355,7 +1371,13 @@ class FastWAM(torch.nn.Module):
                 "action": action_pre["t_mod"],
             },
         )
-        pred_video = self.video_expert.post_dit(tokens_out["video"], video_pre)
+        # The video post-head is not needed when video loss is disabled. The video branch
+        # itself still runs because action queries use its cached mixed-attention tokens.
+        pred_video = (
+            self.video_expert.post_dit(tokens_out["video"], video_pre)
+            if self.loss_lambda_video != 0.0
+            else None
+        )
         pred_action = self.action_expert.post_dit(tokens_out["action"], action_pre)
         return pred_video, pred_action
 
@@ -1399,12 +1421,15 @@ class FastWAM(torch.nn.Module):
         inputs = self.build_inputs(sample, tiled=tiled)
         targets = self._sample_training_targets(inputs)
         pred_video, pred_action = self._run_training_mot(inputs=inputs, targets=targets)
-        loss_video = self._compute_training_video_loss(
-            inputs=inputs,
-            pred_video=pred_video,
-            target_video=targets["target_video"],
-            timestep_video=targets["timestep_video"],
-        )
+        if self.loss_lambda_video == 0.0:
+            loss_video = pred_action.new_zeros(())
+        else:
+            loss_video = self._compute_training_video_loss(
+                inputs=inputs,
+                pred_video=pred_video,
+                target_video=targets["target_video"],
+                timestep_video=targets["timestep_video"],
+            )
         loss_action = self._compute_training_action_loss(
             inputs=inputs,
             pred_action=pred_action,
@@ -1626,7 +1651,10 @@ class FastWAM(torch.nn.Module):
         if not use_prompt and not use_context:
             raise ValueError("Either `prompt` or both `context/context_mask` must be provided.")
         if use_prompt:
-            context, context_mask = self.encode_prompt(prompt)
+            if self.text_context_artifact is not None:
+                context, context_mask = self.encode_cached_prompt(prompt)
+            else:
+                context, context_mask = self.encode_prompt(prompt)
         else:
             context, context_mask = self._normalize_context_tensors(context, context_mask)
         if proprio is not None:

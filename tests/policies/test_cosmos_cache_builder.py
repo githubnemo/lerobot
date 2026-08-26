@@ -8,6 +8,13 @@ def test_builder_accepts_episode_zero_and_bounded_subset():
     _validate_args(args)
     assert args.episodes == [0]
     assert args.max_samples == 4
+    assert args.vae_input_mode == "observed_prefix"
+
+
+def test_builder_accepts_explicit_legacy_vae_mode():
+    args = parse_args(["--episodes", "0", "--vae-input-mode", "legacy_padded_vae"])
+    _validate_args(args)
+    assert args.vae_input_mode == "legacy_padded_vae"
 
 
 def test_builder_rejects_ambiguous_resume_overwrite_and_ranges():

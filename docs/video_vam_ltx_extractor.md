@@ -117,9 +117,10 @@ scripts/video_vam/run_smoke_test_ltx_extractor.sh \
 ```
 
 It reports wall-clock, peak allocated/reserved VRAM, shape, dtype, and full
-checkpoint/VAE hashes. The real-weight run remains unverified because the
-checkpoint files were not downloaded from the gated repository. No large
-generation or training job is started by the launcher.
+checkpoint/VAE hashes. The real-weight smoke now passes: 50.488 s for the first
+`extract` call, output `[1, 2400, 4096]`, peak 5.17 GiB allocated / 6.85 GiB
+reserved. No generation or training job is started by the launcher. Detailed
+steady-state measurements are in `video_vam_ltx_latency_optimization.md`.
 
 ## Stage 2: matched extraction point
 
@@ -262,18 +263,101 @@ and CUDA-dependent failures; the first reproducible failure was the existing
 skipped before `--maxfail=1` stopped). The long unconstrained run was stopped
 at 44% after several minutes without progress; no LTX-focused test failed.
 
-The real GPU smoke is intentionally gated by `nvidia-smi` and requires a free
-window. On the attempted run, the guard observed 24,009 MiB used and 100% GPU
-utilization, so it correctly refused to start. The official checkpoint download
-also returned Hugging Face `401 GatedRepoError` because this machine is not
-authenticated for `Lightricks/LTX-2.5`; no authorization workaround was used.
-Therefore real LTX wall-clock/peak-VRAM numbers remain **unverified** and must
-be collected after Hugging Face access is granted and the 4090 is free.
+The real GPU smoke and the 10-iteration synchronized benchmark now pass on the
+RTX 4090. Persistent FP8-cast/CPU-offload execution with true early exit at
+block 34 measures 1.233393/1.234206 s p50/p90, versus 1.656819/1.659106 s for
+full eager execution, with exact BF16 feature equality. Five VAE frames produce
+one latent while nine produce the required two. Full 35-block GPU residency is
+not feasible: the measured 0.720 GiB slot size projects to 26.60 GiB allocated.
+See `video_vam_ltx_latency_optimization.md` for commands, load/warmup, stage
+timings, cache projections, and remaining limitations.
 
-A prior injected CUDA contract smoke completed in 0.090 s with the former
-16-latent-frame geometry; that measurement is intentionally stale after the
-matched-horizon decision. The final 8-latent-frame CUDA smoke has not been run
-because the 4090 is occupied by another training job. It should report hidden
-grid `(1, 8, 15, 20, 4096)`, context `(1, 2400, 4096)`, and peak VRAM once the
-GPU is free. Injected-backbone numbers would validate plumbing only and would
-not measure LTX-2.5 model memory or throughput.
+## Real-prompt action gate (2026-08-25)
+
+The next gate now passes without adding an LTX feature-cache format. The official
+Gemma-4 encoder runs once in a standalone process, then writes a strict
+safetensors/JSON artifact for the exact dataset task text `take cube out of box`.
+The artifact is `[1, 1024, 4096]` BF16, finite and non-zero, and pins the Gemma
+and transformer hashes, source commit, model revision, prompt, output hash, mask
+hash, and generation runtime. Loading is strict and never falls back to zeros.
+The text encoder is not constructed by extraction or training.
+
+Exact prompt command:
+
+```bash
+source scripts/video_vam/cosmos_cuda_env.sh
+.venv/bin/python scripts/video_vam/precompute_ltx_prompt.py --overwrite
+```
+
+The tiny online trainer consumes four causal windows (`0:4,0:24,0:44,0:64`).
+Each extractor input is exactly five observed pixel frames `[1,3,5,480,640]`;
+the LTX VAE repeats the last observation internally to nine frames. Raw block-34
+output is `[1,2400,4096]` / grid `[1,8,15,20,4096]`. A deterministic spatial
+mean produces `[1,8,4096]`; a non-affine LayerNorm plus trainable bias-free
+`Linear(4096,2048)` produces `[1,8,2048]` for the unchanged World2Action API.
+The adapter has 8,388,608 trainable parameters.
+
+Exact gate command (the script has the same defaults):
+
+```bash
+source scripts/video_vam/cosmos_cuda_env.sh
+.venv/bin/python scripts/video_vam/train_ltx_world2action_tiny.py \
+  --windows 0:4,0:24,0:44,0:64 --max-steps 1000 --max-minutes 25 \
+  --eval-every 10 --fit-ratio 0.1 --overwrite
+```
+
+Only frame-mean features are reused in process memory. LTX is closed before the
+native decoder is built; no feature cache or model checkpoint is written. The
+trainer reuses the established train-episode normalizer, masked `[B,30,6]`
+action target, state token, Beta(1,1) flow matching, fixed seed, and physical
+RMSE helper. The actual LTX sigma `1.0` is passed as the decoder context
+timestep instead of the Cosmos default `10.0`.
+
+The four-window run stopped at step 230 after fixed flow loss fell from 2.517702
+to 0.222507 (0.0884x). Deterministic train RMSE fell from 1.0083 to 0.3820
+normalized and from 73.08 to 26.58 degrees. Zeroed and shuffled context scored
+66.48 and 48.37 degrees, respectively, providing context-sensitivity evidence.
+One fixed held-out window scored 27.88 degrees / 0.5015 normalized, but one
+window is not generalization evidence. Steady extraction was 1.2497 s p50
+(0.800 Hz), so this representation gate does not satisfy the 10 Hz deployment
+constraint.
+
+## LTX-2.5 + pretrained SmolVLA expert plateau runs (2026-08-26)
+
+The expert trainer now reads and validates the context transform, token count,
+channel width, and BF16 dtype from either a Cosmos or LTX manifest. Cosmos keeps
+its existing default path (`none` stored -> `pool2`, 4,800x2,048); LTX pool2 is
+640x4,096 and LTX unpooled is 2,400x4,096. The adapter is always
+`LayerNorm(C) -> Linear(C, 960)`. LTX shapes cannot enter the serialized
+batch-one 4,800x2,048 Cosmos CUDA graph and use eager inference with the exact
+per-layer prefix KV cache instead.
+
+The disconnect-safe queue waits for `ltx25-plateau-20260825` to exit naturally,
+then runs the pool2 experiment, builds the resumable unpooled caches, and runs
+the unpooled experiment:
+
+```bash
+cd /home/anton/lerobot-video-vam
+tmux new-session -d -s ltx25-smolexpert-queue-20260826 \
+  'bash scripts/video_vam/run_ltx_smolexpert_overnight.sh'
+tmux attach -t ltx25-smolexpert-queue-20260826
+```
+
+The exact unpooled cache command used by the queue is:
+
+```bash
+source scripts/video_vam/cosmos_cuda_env.sh
+.venv/bin/python -m scripts.video_vam.build_ltx_feature_cache \
+  --train-output-dir /home/anton/.cache/video-vam/ltx25-train0-31-stride3-unpooled \
+  --val-output-dir /home/anton/.cache/video-vam/ltx25-val32-39-stride20-unpooled \
+  --train-stride 3 --val-stride 20 --context-transform none \
+  --min-free-gib 20 --seed 0 --resume
+```
+
+Both training arms use batch 8, LR `1e-4`, 1,000-step warmup, AdamW weight
+decay `1e-10`, gradient clip 10, ten denoising steps, validation every 1,000
+steps, and plateau patience 10 with a `0.02°` min-delta. The safety caps are
+500,000 steps / 10 h for pool2 and 500,000 steps / 14 h for unpooled. Only
+`best.safetensors` and `last.safetensors` are retained; optimizer state is not
+serialized. Validation reports the historical global masked full-30 RMSE
+unchanged, plus h=1 RMSE and the mean of per-step RMSE over h=1..5.

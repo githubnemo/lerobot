@@ -17,6 +17,9 @@ from typing import Any
 import torch
 from safetensors.torch import load_file, save_file
 
+from .context_transform import CONTEXT_TRANSFORMS, context_transform_spec
+from .cosmos_predict2_extractor import VAE_INPUT_MODE_LEGACY_PADDED, VAE_INPUT_MODES
+
 CACHE_SCHEMA_VERSION = 2
 CONTEXT_KEY = "context"
 STATE_KEY = "state"
@@ -90,6 +93,7 @@ _EXTRACTOR_KEYS = frozenset(
         "noise_seed",
     }
 )
+_EXTRACTOR_KEYS_WITH_VAE_INPUT_MODE = _EXTRACTOR_KEYS | frozenset({"vae_input_mode"})
 _RUNTIME_KEYS = frozenset(
     {
         "load_seconds",
@@ -123,6 +127,9 @@ _OUTPUT_KEYS = frozenset(
         "action_is_pad_dtype",
         "action_is_pad_sha256",
     }
+)
+_OUTPUT_KEYS_WITH_TRANSFORM = _OUTPUT_KEYS | frozenset(
+    {"context_transform", "context_tokens", "context_grid"}
 )
 
 
@@ -284,7 +291,13 @@ def _validate_provenance(payload: Mapping[str, Any]) -> dict[str, Any]:
     if not isinstance(extractor, Mapping):
         raise CosmosFeatureCacheValidationError("extractor provenance must be an object")
     extractor_keys = set(extractor)
-    if extractor_keys not in {_EXTRACTOR_KEYS, _EXTRACTOR_KEYS | {"random_init_seed"}}:
+    allowed_extractor_keys = {
+        _EXTRACTOR_KEYS,
+        _EXTRACTOR_KEYS | {"random_init_seed"},
+        _EXTRACTOR_KEYS_WITH_VAE_INPUT_MODE,
+        _EXTRACTOR_KEYS_WITH_VAE_INPUT_MODE | {"random_init_seed"},
+    }
+    if extractor_keys not in allowed_extractor_keys:
         raise CosmosFeatureCacheValidationError("extractor provenance keys are malformed")
     for name in ("device", "dtype", "backend", "preprocess", "conditioning", "official_resolution"):
         _non_empty_string(extractor[name], f"extractor.{name}")
@@ -292,6 +305,9 @@ def _validate_provenance(payload: Mapping[str, Any]) -> dict[str, Any]:
         raise CosmosFeatureCacheValidationError(
             "extractor dtype/backend are not the approved frozen settings"
         )
+    vae_input_mode = extractor.get("vae_input_mode", VAE_INPUT_MODE_LEGACY_PADDED)
+    if vae_input_mode not in VAE_INPUT_MODES:
+        raise CosmosFeatureCacheValidationError("extractor.vae_input_mode is unsupported")
     random_init_seed = extractor.get("random_init_seed")
     if random_init_seed is not None and (type(random_init_seed) is not int or random_init_seed < 0):
         raise CosmosFeatureCacheValidationError("extractor.random_init_seed must be null or non-negative")
@@ -372,13 +388,47 @@ def _validate_provenance(payload: Mapping[str, Any]) -> dict[str, Any]:
     output = payload["output"]
     if not isinstance(output, Mapping):
         raise CosmosFeatureCacheValidationError("output provenance must be an object")
-    _strict_keys(output, _OUTPUT_KEYS, "output")
+    output_keys = set(output)
+    if output_keys not in {_OUTPUT_KEYS, _OUTPUT_KEYS_WITH_TRANSFORM}:
+        raise CosmosFeatureCacheValidationError(
+            "output keys must match the legacy or transform-aware feature-cache schema"
+        )
     for name in ("raw_hidden_shape", "context_shape", "state_shape", "target_action_shape"):
         _shape(output[name], f"output.{name}")
     for name in ("raw_hidden_dtype", "context_dtype", "state_dtype", "target_action_dtype"):
         _non_empty_string(output[name], f"output.{name}")
     for name in ("context_sha256", "state_sha256", "target_action_sha256"):
         _sha256(output[name], f"output.{name}")
+    if output_keys == _OUTPUT_KEYS_WITH_TRANSFORM:
+        transform = output["context_transform"]
+        if transform not in CONTEXT_TRANSFORMS:
+            raise CosmosFeatureCacheValidationError("output.context_transform is unsupported")
+        if type(output["context_tokens"]) is not int or output["context_tokens"] <= 0:
+            raise CosmosFeatureCacheValidationError("output.context_tokens must be positive")
+        if output["context_tokens"] != output["context_shape"][1]:
+            raise CosmosFeatureCacheValidationError("output.context_tokens must match output.context_shape")
+        grid = output["context_grid"]
+        if not isinstance(grid, Mapping) or set(grid) != {
+            "temporal",
+            "height",
+            "width",
+            "flatten_order",
+        }:
+            raise CosmosFeatureCacheValidationError("output.context_grid is malformed")
+        if (
+            any(type(grid[name]) is not int or grid[name] <= 0 for name in ("temporal", "height", "width"))
+            or grid["flatten_order"] != "T,H,W"
+        ):
+            raise CosmosFeatureCacheValidationError("output.context_grid has invalid dimensions or order")
+        expected_grid = context_transform_spec(transform).output_grid
+        if (grid["temporal"], grid["height"], grid["width"]) != expected_grid:
+            raise CosmosFeatureCacheValidationError(
+                "output.context_grid does not match output.context_transform"
+            )
+        if output["context_tokens"] != context_transform_spec(transform).output_tokens:
+            raise CosmosFeatureCacheValidationError(
+                "output.context_tokens does not match output.context_transform"
+            )
     return json.loads(json.dumps(payload))
 
 
@@ -455,6 +505,7 @@ def build_feature_cache_provenance(
     action_is_pad: torch.Tensor,
     raw_hidden_shape: tuple[int, ...] | list[int],
     raw_hidden_dtype: torch.dtype,
+    context_transform: str | None = None,
 ) -> CosmosFeatureCacheProvenance:
     """Build output/hash provenance after validating the candidate tensors."""
     validate_cache_tensors(context, state, target_action, action_is_pad)
@@ -479,6 +530,22 @@ def build_feature_cache_provenance(
         "action_is_pad_dtype": str(action_is_pad.dtype).removeprefix("torch."),
         "action_is_pad_sha256": tensor_sha256(action_is_pad),
     }
+    if context_transform is not None:
+        spec = context_transform_spec(context_transform)
+        if context.shape[1] != spec.output_tokens:
+            raise CosmosFeatureCacheValidationError("context token count does not match context_transform")
+        output.update(
+            {
+                "context_transform": context_transform,
+                "context_tokens": int(context.shape[1]),
+                "context_grid": {
+                    "temporal": spec.output_grid[0],
+                    "height": spec.output_grid[1],
+                    "width": spec.output_grid[2],
+                    "flatten_order": "T,H,W",
+                },
+            }
+        )
     payload = {
         "schema_version": CACHE_SCHEMA_VERSION,
         "dataset": dict(dataset),

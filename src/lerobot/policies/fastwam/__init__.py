@@ -15,9 +15,21 @@
 from .configuration_fastwam import FastWAMConfig
 from .modeling_fastwam import FastWAMPolicy
 from .processor_fastwam import make_fastwam_pre_post_processors
+from .text_context import (
+    TextContextArtifact,
+    TextContextProvenance,
+    encode_wan_text_context,
+    load_text_context_artifact,
+    save_text_context_artifact,
+)
 
 __all__ = [
     "FastWAMConfig",
     "FastWAMPolicy",
     "make_fastwam_pre_post_processors",
+    "TextContextArtifact",
+    "TextContextProvenance",
+    "encode_wan_text_context",
+    "load_text_context_artifact",
+    "save_text_context_artifact",
 ]

@@ -19,7 +19,7 @@ from collections.abc import Iterable, Mapping, Sequence
 from contextlib import nullcontext, suppress
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import numpy as np
 import torch
@@ -28,6 +28,10 @@ from torch.utils.data import DataLoader
 
 from lerobot.common.wandb_utils import get_wandb_run_id_from_filesystem
 from lerobot.datasets import LeRobotDataset
+from lerobot.policies.vam.context_transform import (
+    CONTEXT_TRANSFORMS,
+    apply_context_transform,
+)
 from lerobot.policies.vam.cosmos_cache_dataset import (
     CacheDatasetItem,
     CacheManifest,
@@ -37,6 +41,8 @@ from lerobot.policies.vam.cosmos_cache_dataset import (
     manifest_sha256,
 )
 from lerobot.policies.vam.cosmos_predict2_extractor import (
+    VAE_INPUT_MODE_OBSERVED_PREFIX,
+    VAE_INPUT_MODES,
     CosmosPredict2Extractor,
     CosmosPredict2ExtractorConfig,
 )
@@ -277,19 +283,61 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "per hour almost for free."
         ),
     )
+    parser.add_argument(
+        "--batched-flow-draws",
+        action="store_true",
+        help=(
+            "Fold the K flow draws into the batch dimension (one forward/backward over K*B "
+            "samples) instead of K sequential passes. Identical gradient in expectation; only "
+            "use with compact contexts (context transforms) since activations grow K-fold."
+        ),
+    )
+    parser.add_argument(
+        "--flow-draw-chunk",
+        type=int,
+        default=4,
+        help="Max draws folded into one batched pass when --batched-flow-draws is set.",
+    )
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--backbone-identity", default="cosmos-predict2-2B-hidden-layer-20")
     parser.add_argument("--backbone-checkpoint", type=Path)
+    parser.add_argument(
+        "--vae-input-mode",
+        choices=VAE_INPUT_MODES,
+        default=VAE_INPUT_MODE_OBSERVED_PREFIX,
+        help=(
+            "VAE input contract for online extraction: observed_prefix encodes only real "
+            "observed pixels (default); legacy_padded_vae restores 5->61 padding."
+        ),
+    )
     parser.add_argument(
         "--resume",
         action="store_true",
         help="Resume optimizer, scheduler, RNG, and weights from last.safetensors.",
     )
     parser.add_argument("--overwrite", action="store_true")
+    parser.add_argument(
+        "--no-save-checkpoints",
+        action="store_true",
+        help="Run diagnostics without writing decoder checkpoint or optimizer-state files.",
+    )
     parser.add_argument("--no-wandb", action="store_true", help="Disable Weights & Biases logging.")
     parser.add_argument("--wandb-project", default=DEFAULT_WANDB_PROJECT)
     parser.add_argument("--context-control", choices=("real", "shuffled"), default="real")
+    parser.add_argument(
+        "--context-transform",
+        choices=CONTEXT_TRANSFORMS,
+        default="none",
+        help=(
+            "Reduce the cached (B, 19200, 2048) context before the decoder: "
+            "cond_frames keeps the 2 conditioning latent frames (2,400 tokens); "
+            "gen_frames_pool2 keeps the 14 generated frames 2x2-pooled (4,200); "
+            "pool2/pool4 spatially pool all frames (4,800/1,280); frame_mean "
+            "keeps one token per latent frame (16); global_mean keeps 1 token. "
+            "Applied identically to training and validation batches."
+        ),
+    )
     parser.add_argument(
         "--context-mode",
         choices=CONTEXT_MODES,
@@ -373,6 +421,8 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("the full native decoder trainer requires --device cuda")
     if args.resume and args.overwrite:
         raise ValueError("--resume and --overwrite are mutually exclusive")
+    if args.resume and getattr(args, "no_save_checkpoints", False):
+        raise ValueError("--resume cannot be combined with --no-save-checkpoints")
     if not math.isfinite(args.eval_sigma) or args.eval_sigma <= 0:
         raise ValueError("--eval-sigma must be finite and positive")
     if args.warmup_steps < 0 or args.warmup_steps >= args.max_steps:
@@ -386,6 +436,26 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--context-mode online-random requires --tokenizer and --prompt")
     if args.train_sigma is not None and (not math.isfinite(args.train_sigma) or args.train_sigma <= 0):
         raise ValueError("--train-sigma must be finite and positive")
+
+
+def resolve_context_transform(requested: str, manifest: CacheManifest, *, label: str = "manifest") -> str:
+    """Resolve runtime reduction while rejecting double-transforming a cache."""
+    stored = manifest.context_transform
+    if stored != "none" and requested != "none":
+        raise ValueError(
+            f"{label} already stores context_transform={stored!r}; "
+            "pass --context-transform none to avoid applying it twice"
+        )
+    return "none" if stored != "none" else requested
+
+
+def should_save_checkpoint(args: argparse.Namespace, step: int, should_validate: bool, stop: bool) -> bool:
+    """Return whether this step should write a checkpoint artifact."""
+    if getattr(args, "no_save_checkpoints", False):
+        return False
+    return (
+        step % args.save_every == 0 or should_validate or step == args.max_steps or (should_validate and stop)
+    )
 
 
 def set_reproducible_seeds(seed: int) -> None:
@@ -641,7 +711,7 @@ class RandomAnchorDataset:
         self.config = config
 
     def load(self, anchor: Anchor) -> PreparedSample:
-        sample = self.dataset[_relative_index(self.dataset, anchor.frame_index)]
+        sample = cast(dict[str, Any], self.dataset[_relative_index(self.dataset, anchor.frame_index)])
         episode_index = int(sample["episode_index"])
         if episode_index != anchor.episode_index:
             raise ValueError(
@@ -902,6 +972,7 @@ class OnlineCosmosContext:
             seed=args.seed,
             hidden_layer=20,
             stop_after_step=0,
+            vae_input_mode=args.vae_input_mode,
         )
         self.extractor = CosmosPredict2Extractor(config)
         self.device = device
@@ -960,17 +1031,24 @@ class OnlineCosmosContext:
         return output.tokens, output.sigma[:, None]
 
 
+# Set once from --context-transform in main(); read by _batch_tensors so both
+# the training and validation paths apply the identical reduction.
+ACTIVE_CONTEXT_TRANSFORM = "none"
+
+
 def _batch_tensors(items: Sequence[CacheDatasetItem] | Mapping[str, torch.Tensor], device: torch.device):
     if isinstance(items, Mapping):
         state = items["state"].to(device=device, dtype=torch.float32, non_blocking=True)
         action = items["action"].to(device=device, dtype=torch.float32, non_blocking=True)
         context = items["context"].to(device=device, dtype=torch.bfloat16, non_blocking=True)
         padding = items["padding"].to(device=device, non_blocking=True)
+        context = apply_context_transform(context, ACTIVE_CONTEXT_TRANSFORM)
         return state, action, context, padding
     state = torch.cat([item.state for item in items], dim=0).to(device=device, dtype=torch.float32)
     action = torch.cat([item.target_action for item in items], dim=0).to(device=device, dtype=torch.float32)
     context = torch.cat([item.context for item in items], dim=0).to(device=device, dtype=torch.bfloat16)
     padding = torch.cat([item.action_is_pad for item in items], dim=0).to(device=device)
+    context = apply_context_transform(context, ACTIVE_CONTEXT_TRANSFORM)
     return state, action, context, padding
 
 
@@ -1330,7 +1408,9 @@ def _backbone_payload(args: argparse.Namespace, first_item: CacheDatasetItem) ->
         args.backbone_checkpoint.resolve() if args.backbone_checkpoint else Path(weights["checkpoint_path"])
     )
     checkpoint_sha256 = _json_hash(checkpoint) if args.backbone_checkpoint else weights["checkpoint_sha256"]
-    context = first_item.context
+    stored_output = first_item.artifact.provenance.payload["output"]
+    stored_transform = stored_output.get("context_transform", "none")
+    context = apply_context_transform(first_item.context, ACTIVE_CONTEXT_TRANSFORM)
     return {
         "identity": "constant-zero-context" if mode == "state-only" else args.backbone_identity,
         "context_mode": mode,
@@ -1340,6 +1420,9 @@ def _backbone_payload(args: argparse.Namespace, first_item: CacheDatasetItem) ->
         "context_layer": 20,
         "context_tokens": int(context.shape[-2]),
         "context_channels": int(context.shape[-1]),
+        "context_transform": (stored_transform if stored_transform != "none" else ACTIVE_CONTEXT_TRANSFORM),
+        "stored_context_transform": stored_transform,
+        "stored_context_grid": stored_output.get("context_grid"),
         "context_adapter_used": False,
         "high_noise_sigma": (
             None
@@ -1395,6 +1478,9 @@ def _write_log(stream, record: dict[str, Any]) -> None:
 
 def train(args: argparse.Namespace) -> Path:
     validate_args(args)
+    global ACTIVE_CONTEXT_TRANSFORM
+    if args.context_transform != "none" and args.context_mode != "cached":
+        raise ValueError("--context-transform requires --context-mode cached")
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required; no model or workload is run on CPU")
     device = torch.device(args.device)
@@ -1402,6 +1488,7 @@ def train(args: argparse.Namespace) -> Path:
     split_path = args.split.expanduser().resolve()
     output_dir = args.output_dir.expanduser().resolve()
     manifest = load_cache_manifest(manifest_path)
+    val_manifest: CacheManifest | None = None
     if args.context_mode == "cached" and args.train_sigma is not None:
         cache_sigma = manifest.payload["provenance"].get("high_noise_sigma")
         if cache_sigma is None or abs(float(cache_sigma) - args.train_sigma) > 1e-9:
@@ -1416,13 +1503,17 @@ def train(args: argparse.Namespace) -> Path:
         # be a denser, train-only cache built at the same sigma).
         val_manifest_path = args.val_manifest.expanduser().resolve()
         val_manifest = load_cache_manifest(val_manifest_path)
+        if val_manifest.context_transform != manifest.context_transform:
+            raise ValueError(
+                "training and validation manifests must declare the same stored context transform"
+            )
         val_cache_sigma = val_manifest.payload["provenance"].get("high_noise_sigma")
         if val_cache_sigma is None or abs(float(val_cache_sigma) - args.eval_sigma) > 1e-9:
             raise ValueError(
                 f"--eval-sigma {args.eval_sigma} does not match the --val-manifest extraction "
                 f"sigma {val_cache_sigma!r}"
             )
-        split = load_vam_split(split_path, val_manifest)
+        split = load_vam_split(split_path, val_manifest, allow_partial=True)
         train_dataset_payload = manifest.payload["dataset"]
         if (
             train_dataset_payload["repo_id"] != split.dataset_repo_id
@@ -1437,11 +1528,16 @@ def train(args: argparse.Namespace) -> Path:
         train_entries = tuple(
             entry for entry in manifest.entries if entry.episode_index in split.train_episodes
         )
-        val_entries = get_val_entries(val_manifest, split)
+        # ``val_manifest`` is intentionally a held-out-only partial manifest;
+        # load_vam_split(..., allow_partial=True) already validated its probes.
+        val_entries = tuple(
+            entry for entry in val_manifest.entries if entry.episode_index in split.val_episodes
+        )
     else:
         split = load_vam_split(split_path, manifest)
         train_entries = get_train_entries(manifest, split)
         val_entries = get_val_entries(manifest, split)
+    ACTIVE_CONTEXT_TRANSFORM = resolve_context_transform(args.context_transform, manifest)
     if not train_entries or not val_entries:
         raise ValueError("both train and validation splits must contain cache entries")
     cache_dataset = CosmosFeatureCacheDataset(manifest, shuffle_seed=0)
@@ -1452,6 +1548,7 @@ def train(args: argparse.Namespace) -> Path:
     )
     val_dataset: CosmosFeatureCacheDataset | ContextControlDataset = context_dataset
     if args.val_manifest is not None:
+        assert val_manifest is not None
         if not val_entries:
             raise ValueError("--val-manifest contains no validation entries")
         val_dataset = CosmosFeatureCacheDataset(val_manifest, shuffle_seed=0)
@@ -1659,26 +1756,57 @@ def train(args: argparse.Namespace) -> Path:
                     state, action, _, padding = _batch_tensors(items, device)
                     context, context_timestep = online_context.extract(batch_entries, microbatch_index)
                 samples_this_step += int(state.shape[0])
-                # The draws are looped rather than batched: the decoder cross-attends over
-                # ~19k context tokens, so repeating the batch would multiply activation
-                # memory by --flow-draws without reducing the compute.
                 draw_losses: list[float] = []
-                for _draw in range(args.flow_draws):
-                    with autocast_context(device):
-                        loss = decoder.flow_matching_loss(
-                            state,
-                            action,
-                            context,
-                            action_is_pad=padding,
-                            context_timestep=context_timestep,
-                            generator=train_generator,
-                        )
-                        scaled = loss * args.loss_scale / (args.grad_accum_steps * args.flow_draws)
-                    if not torch.isfinite(scaled).item():
-                        raise FloatingPointError("training loss is non-finite")
-                    scaled.backward()
-                    draw_losses.append(float(loss.detach().float().item()))
-                    del loss, scaled
+                if args.batched_flow_draws and args.flow_draws > 1:
+                    # Fold the K independent flow draws into the batch dimension in
+                    # chunks: fewer, larger forward/backward passes instead of K
+                    # small sequential ones. Mathematically identical gradient (t
+                    # and epsilon are drawn per batch element; padding is replicated
+                    # so per-replica valid counts match). Profiling on 2026-08-20
+                    # showed the sequential loop is launch-latency bound (~2.0s per
+                    # optimizer step regardless of context size). Chunking caps the
+                    # K-fold activation growth: all 8 draws at once OOMs a 24GB card
+                    # with pool2's 4,800-token contexts.
+                    remaining = args.flow_draws
+                    while remaining > 0:
+                        k = min(remaining, args.flow_draw_chunk)
+                        remaining -= k
+
+                        def _rep(t: torch.Tensor, k: int = k) -> torch.Tensor:
+                            return t.repeat(k, *([1] * (t.dim() - 1)))
+
+                        with autocast_context(device):
+                            loss = decoder.flow_matching_loss(
+                                _rep(state),
+                                _rep(action),
+                                _rep(context),
+                                action_is_pad=_rep(padding),
+                                context_timestep=_rep(context_timestep),
+                                generator=train_generator,
+                            )
+                            scaled = loss * args.loss_scale * k / (args.grad_accum_steps * args.flow_draws)
+                        if not torch.isfinite(scaled).item():
+                            raise FloatingPointError("training loss is non-finite")
+                        scaled.backward()
+                        draw_losses.append(float(loss.detach().float().item()))
+                        del loss, scaled
+                else:
+                    for _draw in range(args.flow_draws):
+                        with autocast_context(device):
+                            loss = decoder.flow_matching_loss(
+                                state,
+                                action,
+                                context,
+                                action_is_pad=padding,
+                                context_timestep=context_timestep,
+                                generator=train_generator,
+                            )
+                            scaled = loss * args.loss_scale / (args.grad_accum_steps * args.flow_draws)
+                        if not torch.isfinite(scaled).item():
+                            raise FloatingPointError("training loss is non-finite")
+                        scaled.backward()
+                        draw_losses.append(float(loss.detach().float().item()))
+                        del loss, scaled
                 raw_losses.append(sum(draw_losses) / len(draw_losses))
                 del items, state, action, context, padding
             grad_norm = torch.nn.utils.clip_grad_norm_(parameters, args.grad_clip)
@@ -1714,6 +1842,7 @@ def train(args: argparse.Namespace) -> Path:
                 else ""
             )
             should_validate = step % args.val_every == 0 or step == args.max_steps
+            stop = False
             if should_validate:
                 validation = evaluate_validation(
                     decoder,
@@ -1760,12 +1889,7 @@ def train(args: argparse.Namespace) -> Path:
             if should_validate:
                 wandb_logger.update_summary(best_metric=best_metric, best_step=best_step)
             _write_log(metrics, record)
-            should_save = (
-                step % args.save_every == 0
-                or should_validate
-                or step == args.max_steps
-                or (should_validate and stop)
-            )
+            should_save = should_save_checkpoint(args, step, should_validate, stop)
             if should_save:
                 state_path = output_dir / "last.state.pt"
                 metadata = checkpoint_metadata(
@@ -1827,8 +1951,11 @@ def train(args: argparse.Namespace) -> Path:
         ) from exc
     finally:
         metrics.close()
-    print(f"last checkpoint: {last_path}", flush=True)
-    print(f"best checkpoint: {output_dir / 'best.safetensors'}", flush=True)
+    if getattr(args, "no_save_checkpoints", False):
+        print("checkpoints: disabled by --no-save-checkpoints", flush=True)
+    else:
+        print(f"last checkpoint: {last_path}", flush=True)
+        print(f"best checkpoint: {output_dir / 'best.safetensors'}", flush=True)
     print("rollout readiness: false", flush=True)
     return output_dir
 

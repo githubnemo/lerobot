@@ -1249,6 +1249,8 @@ class _StubChunkPolicy:
         self._release = Semaphore(0)
         self.in_inference = Event()
         self.predicted_tasks: list[str] = []
+        self.predicted_image_histories: list[torch.Tensor] = []
+        self.predicted_history_frame_indices: list[int] = []
         self.generate_thread_names: list[str] = []
 
     def allow_one_inference(self) -> None:
@@ -1265,6 +1267,10 @@ class _StubChunkPolicy:
         if not released:
             raise TimeoutError("test never released the inference gate")
         self.predicted_tasks.append(batch["task"][0])
+        history = batch.get("observation.images.front.history")
+        if history is not None:
+            self.predicted_image_histories.append(history.detach().cpu().clone())
+            self.predicted_history_frame_indices.append(int(batch["observation.history_frame_index"].item()))
         return torch.zeros(1, self.chunk_len, self.action_dim)
 
     def reset(self):
@@ -1280,24 +1286,37 @@ class _StubChunkPolicy:
         return f"answer: {batch[QUERY_TEXT]}"
 
 
-def _make_rtc_engine(rtc_queue_threshold: int = 30, chunk_len: int = 10):
+def _make_rtc_engine(
+    rtc_queue_threshold: int = 30,
+    chunk_len: int = 10,
+    observation_history_size: int = 1,
+    include_camera: bool = False,
+):
     from lerobot.policies.rtc.configuration_rtc import RTCConfig
     from lerobot.rollout.inference import RTCInferenceEngine
 
     policy = _StubChunkPolicy(chunk_len=chunk_len)
+    hw_features = {
+        "observation.state": {"dtype": "float32", "shape": (2,), "names": ["j1.pos", "j2.pos"]},
+    }
+    if include_camera:
+        hw_features["observation.images.front"] = {
+            "dtype": "image",
+            "shape": (2, 3, 3),
+            "names": ["height", "width", "channels"],
+        }
     engine = RTCInferenceEngine(
         policy=policy,
         preprocessor=_IdentityPipeline(),
         postprocessor=_IdentityPipeline(),
         robot_wrapper=SimpleNamespace(robot_type="mock", action_features={}),
         rtc_config=RTCConfig(enabled=True, execution_horizon=8, max_guidance_weight=1.0),
-        hw_features={
-            "observation.state": {"dtype": "float32", "shape": (2,), "names": ["j1.pos", "j2.pos"]},
-        },
+        hw_features=hw_features,
         task="task A",
         fps=30.0,
         device="cpu",
         rtc_queue_threshold=rtc_queue_threshold,
+        observation_history_size=observation_history_size,
     )
     return engine, policy
 
@@ -1313,6 +1332,34 @@ def _running_rtc_engine(rtc_queue_threshold: int = 30, chunk_len: int = 10):
         engine.resume()
         engine.notify_observation(dict(_RTC_OBS))
         yield engine, policy
+    finally:
+        policy.unblock()
+        engine.stop()
+
+
+def test_rtc_engine_hands_policy_exact_control_rate_image_history():
+    engine, policy = _make_rtc_engine(observation_history_size=5, include_camera=True)
+    engine.start()
+    try:
+        engine.resume()
+        for frame_index in range(4):
+            engine.notify_observation({**_RTC_OBS, "front": np.full((2, 3, 3), frame_index, dtype=np.uint8)})
+        assert not policy.in_inference.wait(timeout=0.05)
+
+        engine.notify_observation({**_RTC_OBS, "front": np.full((2, 3, 3), 4, dtype=np.uint8)})
+        assert _wait_for(policy.in_inference.is_set)
+        policy.allow_one_inference()
+        assert _wait_for(lambda: len(policy.predicted_image_histories) == 1)
+
+        history = policy.predicted_image_histories[0]
+        assert policy.predicted_history_frame_indices == [4]
+        assert history.shape == (1, 3, 5, 2, 3)
+        torch.testing.assert_close(
+            history[0, 0, :, 0, 0],
+            torch.arange(5, dtype=torch.float32) / 255.0,
+            rtol=0.0,
+            atol=0.0,
+        )
     finally:
         policy.unblock()
         engine.stop()

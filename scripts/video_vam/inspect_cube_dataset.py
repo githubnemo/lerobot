@@ -6,7 +6,7 @@ from __future__ import annotations
 import argparse
 import sys
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 from lerobot.datasets import LeRobotDataset
 from lerobot.datasets.vam import (
@@ -103,7 +103,8 @@ def main(argv: list[str] | None = None) -> int:
         )
         report = validate_metadata(dataset.meta, config)
         boundary_samples = [
-            dataset[relative_index] for _, relative_index in sample_indices(dataset, episodes)
+            cast(dict[str, Any], dataset[relative_index])
+            for _, relative_index in sample_indices(dataset, episodes)
         ]
         report.extend(validate_samples(boundary_samples, config))
     except Exception as error:

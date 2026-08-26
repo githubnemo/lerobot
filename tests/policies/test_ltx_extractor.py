@@ -95,6 +95,8 @@ def test_extractor_pads_causal_window_and_records_full_provenance():
     assert extraction.provenance.model_revision == "6c7e5e573ac1667efc83407806fe9b0b93730e60"
     assert extraction.provenance.quantization == "fp8-cast"
     assert extraction.provenance.offload_mode == "cpu"
+    assert extraction.provenance.vae_compile_mode is None
+    assert extraction.provenance.to_dict()["vae_compile_mode"] is None
     assert fake_backbone.calls[0]["layer_index"] == 34
 
 
@@ -109,3 +111,37 @@ def test_extractor_rejects_prompt_width_mismatch():
             torch.zeros((1, 3, 5, 480, 640), dtype=torch.uint8),
             torch.zeros((1, 4, 1024), dtype=torch.bfloat16),
         )
+
+
+class CloseableFakeBackbone(FakeBackbone):
+    def __init__(self):
+        super().__init__()
+        self.persistent = False
+        self.explicit_prefix = False
+        self.closed = False
+
+    def close(self):
+        self.closed = True
+
+
+def test_persistent_backend_is_default_and_context_manager_closes_it():
+    backbone = CloseableFakeBackbone()
+    config = LTXExtractorConfig(device="cpu")
+    assert config.persistent_transformer is True
+    assert config.explicit_prefix_execution is True
+    assert config.vae_compile_mode is None
+
+    with LTXExtractor(config, backbone=backbone, latent_encoder=FakeEncoder()) as extractor:
+        assert extractor.backbone.persistent is True
+        assert extractor.backbone.explicit_prefix is True
+        assert backbone.closed is False
+
+    assert backbone.closed is True
+
+
+def test_vae_compile_mode_is_explicit_and_validated():
+    config = LTXExtractorConfig(device="cpu", vae_compile_mode="reduce-overhead")
+    assert config.vae_compile_mode == "reduce-overhead"
+
+    with pytest.raises(ValueError, match="vae_compile_mode"):
+        LTXExtractorConfig(device="cpu", vae_compile_mode="fastest")
