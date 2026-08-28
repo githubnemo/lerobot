@@ -93,6 +93,7 @@ class VideoVAMPolicy(PreTrainedPolicy):
         self._action_queue: deque[Tensor] = deque()
         self.rtc_processor: RTCProcessor | None = None
         self._closed = False
+        self._ltx_context_transform: str | None = None
 
         injected = (decoder is not None, extractor is not None, prompt_embedding is not None)
         if any(injected) and not all(injected):
@@ -153,17 +154,33 @@ class VideoVAMPolicy(PreTrainedPolicy):
                 raise ValueError(f"checkpoint action_semantics.{key} must be {value}")
         injection = metadata.get("injection", {})
         if self.config.backend == "cosmos":
-            if metadata.get("artifact") != "smolexpert_on_cosmos_training_checkpoint":
+            allowed_artifacts = {
+                "smolexpert_on_cosmos_training_checkpoint",
+                "smolexpert_on_cached_context_training_checkpoint",
+            }
+            if metadata.get("artifact") not in allowed_artifacts:
                 raise ValueError("Cosmos wrapper requires a Cosmos SmolExpert checkpoint")
-            if injection.get("cosmos_context_transform") != "pool2":
+            if not any(
+                injection.get(key) == "pool2"
+                for key in ("cosmos_context_transform", "stored_context_transform")
+            ):
                 raise ValueError("Cosmos checkpoint must declare pool2 context")
-            if injection.get("cosmos_input_shape") != ["B", 4800, 2048]:
+            if not any(
+                injection.get(key) == ["B", 4800, 2048] for key in ("cosmos_input_shape", "input_shape")
+            ):
                 raise ValueError("Cosmos checkpoint input shape must be [B, 4800, 2048]")
         else:
-            if injection.get("stored_context_transform") != "pool2":
-                raise ValueError("LTX checkpoint must declare stored pool2 context")
-            if injection.get("input_shape") != ["B", 640, 4096]:
-                raise ValueError("LTX checkpoint input shape must be [B, 640, 4096]")
+            transform = injection.get("stored_context_transform")
+            expected_shapes = {
+                "pool2": ["B", 640, 4096],
+                "none": ["B", 2400, 4096],
+            }
+            if transform not in expected_shapes:
+                raise ValueError("LTX checkpoint stored_context_transform must be one of 'pool2' or 'none'")
+            expected_shape = expected_shapes[transform]
+            if injection.get("input_shape") != expected_shape:
+                raise ValueError(f"LTX checkpoint input shape must be {expected_shape}")
+            self._ltx_context_transform = transform
 
     def _build_extractor(self) -> tuple[Any, Tensor]:
         if self.config.backend == "cosmos":
@@ -249,11 +266,24 @@ class VideoVAMPolicy(PreTrainedPolicy):
         else:
             from .ltx_action import pool2_ltx_context
 
-            context = pool2_ltx_context(extraction.hidden_grid)
-            expected = (1, 640, 4096)
+            transform = self._ltx_context_transform
+            if transform == "pool2":
+                context = pool2_ltx_context(extraction.hidden_grid)
+                expected = (1, 640, 4096)
+            elif transform == "none":
+                hidden_grid = extraction.hidden_grid
+                if hidden_grid.ndim != 5 or tuple(hidden_grid.shape[1:]) != (8, 15, 20, 4096):
+                    raise ValueError(
+                        "LTX hidden grid must have shape [B, 8, 15, 20, 4096] for unpooled context"
+                    )
+                context = hidden_grid.reshape(hidden_grid.shape[0], 2400, 4096).contiguous()
+                expected = (1, 2400, 4096)
+            else:
+                raise ValueError("LTX context transform was not resolved from checkpoint metadata")
         if tuple(context.shape) != expected:
             raise ValueError(
-                f"{self.config.backend} pool2 context has shape {tuple(context.shape)}, expected {expected}"
+                f"{self.config.backend} {self._ltx_context_transform} context has shape "
+                f"{tuple(context.shape)}, expected {expected}"
             )
         return context.to(device=self.config.device, dtype=torch.bfloat16)
 

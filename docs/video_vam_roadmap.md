@@ -48,15 +48,33 @@ Cosmos was worse than frozen features in our one attempt.
 1. LTX layer probe -> retrain best LTX configuration to plateau (no wall-clock
    cap; cap only as safety net).
 2. Cosmos to plateau under the same stopping rule, so converged-vs-converged.
+   Done for generic prefix-pool2 (13.81 deg at 36k) and video-LoRA expert
+   (13.06 deg at 38k, W&B ixzworl4, stopped on patience 10).
 3. LoRA fine-tune of the backbone on our 32 training episodes, video loss
    only, then freeze and retrain the action expert. Distinct from the failed
-   co-training arm (joint losses). Do for LTX-2.5 first (untested, our best
-   backbone), Cosmos second.
+   co-training arm (joint losses). Cosmos video-only LoRA (step 6k) + SmolExpert
+   is done and is the current offline best. LTX-2.5 video LoRA still open
+   (22B will not LoRA-train on a 4090).
 4. Real-robot deployment of best SmolVLA / Cosmos / LTX policies on a freshly
    collected dataset; success-rate is the metric that matters, RMSE is proxy.
    Real-time gap: video backbones ~1 Hz vs 10 Hz target; RTC + chunking is
    the mitigation, quantization/compile gains largely exhausted on 4090.
-5. Cheap high-value ablations if time permits: image-only backbone control,
+   Mac can only run SmolVLA locally; Cosmos/LTX go through abakus RPC.
+5. Joint-state / calibration noise during SmolExpert training (not at deploy).
+   Sample a per-window or per-batch bias/scale on the 6 joints in physical
+   units, apply the same offset to action targets, then normalize. Val stays
+   clean. Isolates SO-101 recalibration mismatch and the episode-24 sign flip
+   without rebuilding video caches.
+6. Pregenerate augmented feature caches: apply cheap image augs (photometric
+   noise, small shifts/crops) _before_ Cosmos/LTX extract; write extra cache
+   entries with aug seed in provenance; mix with the clean 1,572-window cache
+   at train time. Val stays unaugmented. Do not replace the clean cache.
+   Budget: clean train cache is already ~31 GB / ~30 min; K extra augs costs
+   ~K times that. Start with K=2 photometric-only.
+7. Cosmos+LoRA continuation-video comparison vs generic Cosmos on the same
+   windows (episode 0 frame 4, episode 19 frame 2203) using
+   preview_cosmos_video_prediction.py --checkpoint fused-step6000.pt.
+8. Cheap high-value ablations if time permits: image-only backbone control,
    multi-seed random-init, Cosmos-14B scale point.
 
 ## What this argues for a BFL forward-deployed-engineer story

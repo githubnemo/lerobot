@@ -30,7 +30,10 @@ class _FakeExtractor:
         self.images = images.clone()
         self.noise_seed = noise_seed
         assert prompt.shape == (1, 2, 3)
-        return SimpleNamespace(tokens=torch.zeros(1, 1, 1))
+        return SimpleNamespace(
+            tokens=torch.zeros(1, 1, 1),
+            hidden_grid=torch.zeros(1, 8, 15, 20, 4096),
+        )
 
     def close(self) -> None:
         self.closed = True
@@ -48,13 +51,66 @@ class _FakeDecoder(nn.Module):
 
 
 def _config(**kwargs) -> VideoVAMConfig:
+    backend = kwargs.pop("backend", "cosmos")
     return VideoVAMConfig(
         device="cpu",
-        backend="cosmos",
+        backend=backend,
         feature_seed_episode_index=32,
         joint_limits_min=[-180.0, -180.0, -180.0, -180.0, -180.0, 0.0],
         joint_limits_max=[180.0, 180.0, 180.0, 180.0, 180.0, 100.0],
         **kwargs,
+    )
+
+
+def test_ltx_checkpoint_contract_selects_pool2_or_unpooled_context() -> None:
+    action_semantics = {"action_dim": 6, "horizon": 30, "internal_action_dim": 32, "euler_steps": 10}
+    for transform, input_shape, expected_shape in (
+        ("pool2", ["B", 640, 4096], (1, 640, 4096)),
+        ("none", ["B", 2400, 4096], (1, 2400, 4096)),
+    ):
+        extractor = _FakeExtractor()
+        policy = VideoVAMPolicy(
+            _config(backend="ltx"),
+            decoder=_FakeDecoder(torch.zeros(1, 30, 6)),
+            extractor=extractor,
+            prompt_embedding=torch.zeros(1, 2, 3),
+        )
+        policy._validate_checkpoint_contract(
+            {
+                "action_semantics": action_semantics,
+                "injection": {
+                    "stored_context_transform": transform,
+                    "input_shape": input_shape,
+                },
+            }
+        )
+        context = policy._extract_context(torch.zeros(1, 3, 5, 480, 640, dtype=torch.uint8), 1)
+        assert policy._ltx_context_transform == transform
+        assert tuple(context.shape) == expected_shape
+
+
+def test_cosmos_cached_context_checkpoint_contract() -> None:
+    policy = VideoVAMPolicy(
+        _config(),
+        decoder=_FakeDecoder(torch.zeros(1, 30, 6)),
+        extractor=_FakeExtractor(),
+        prompt_embedding=torch.zeros(1, 2, 3),
+    )
+
+    policy._validate_checkpoint_contract(
+        {
+            "artifact": "smolexpert_on_cached_context_training_checkpoint",
+            "action_semantics": {
+                "action_dim": 6,
+                "horizon": 30,
+                "internal_action_dim": 32,
+                "euler_steps": 10,
+            },
+            "injection": {
+                "stored_context_transform": "pool2",
+                "input_shape": ["B", 4800, 2048],
+            },
+        }
     )
 
 
