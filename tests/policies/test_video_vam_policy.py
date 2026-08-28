@@ -164,6 +164,75 @@ def test_wrapper_matches_live_history_seed_and_internal_physical_actions(monkeyp
     assert call_kwargs["rtc_processor"] is None
 
 
+def test_wrapper_forwards_rtc_leftover_and_delay(monkeypatch) -> None:
+    actions = torch.zeros(1, 30, 6)
+    actions[..., 5] = 50.0
+    decoder = _FakeDecoder(actions)
+    config = _config()
+    config.rtc_config = RTCConfig(enabled=True, execution_horizon=10)
+    policy = VideoVAMPolicy(
+        config,
+        decoder=decoder,
+        extractor=_FakeExtractor(),
+        prompt_embedding=torch.zeros(1, 2, 3),
+    )
+    policy.init_rtc_processor()
+    monkeypatch.setattr(
+        "lerobot.policies.vam.modeling_video_vam.apply_context_transform",
+        lambda tokens, transform: torch.zeros(1, 4800, 2048, dtype=torch.bfloat16),
+    )
+    leftover = torch.zeros(10, 6)
+    leftover[..., 5] = 50.0
+    policy.predict_action_chunk(
+        {
+            "observation.images.front.history": torch.zeros(1, 3, 5, 480, 640),
+            "observation.state": torch.zeros(1, 6),
+            HISTORY_FRAME_INDEX_KEY: torch.tensor([4]),
+        },
+        inference_delay=3,
+        prev_chunk_left_over=leftover,
+    )
+    assert decoder.call is not None
+    call_kwargs = decoder.call[2]
+    assert call_kwargs["inference_delay"] == 3
+    assert call_kwargs["execution_horizon"] == 10
+    assert call_kwargs["rtc_processor"] is policy.rtc_processor
+    assert torch.equal(call_kwargs["prev_chunk_left_over"], leftover)
+
+
+def test_wrapper_rejects_leftover_without_rtc_processor(monkeypatch) -> None:
+    policy = VideoVAMPolicy(
+        _config(),
+        decoder=_FakeDecoder(torch.zeros(1, 30, 6)),
+        extractor=_FakeExtractor(),
+        prompt_embedding=torch.zeros(1, 2, 3),
+    )
+    monkeypatch.setattr(
+        "lerobot.policies.vam.modeling_video_vam.apply_context_transform",
+        lambda tokens, transform: torch.zeros(1, 4800, 2048, dtype=torch.bfloat16),
+    )
+    with pytest.raises(ValueError, match="init_rtc_processor"):
+        policy.predict_action_chunk(
+            {
+                "observation.images.front.history": torch.zeros(1, 3, 5, 480, 640),
+                "observation.state": torch.zeros(1, 6),
+                HISTORY_FRAME_INDEX_KEY: torch.tensor([4]),
+            },
+            prev_chunk_left_over=torch.zeros(10, 6),
+        )
+
+
+def test_init_rtc_processor_requires_rtc_config() -> None:
+    policy = VideoVAMPolicy(
+        _config(),
+        decoder=_FakeDecoder(torch.zeros(1, 30, 6)),
+        extractor=_FakeExtractor(),
+        prompt_embedding=torch.zeros(1, 2, 3),
+    )
+    with pytest.raises(ValueError, match="rtc_config"):
+        policy.init_rtc_processor()
+
+
 def test_wrapper_fails_loudly_before_out_of_range_chunk_is_returned(monkeypatch) -> None:
     actions = torch.zeros(1, 30, 6)
     actions[0, 3, 5] = 101.0

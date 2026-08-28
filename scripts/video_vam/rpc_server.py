@@ -51,6 +51,45 @@ def _validate_frame(frame: torch.Tensor) -> torch.Tensor:
     return frame.contiguous()
 
 
+def rtc_kwargs_from_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    """Parse leftover/delay for VideoVAMPolicy.predict_action_chunk.
+
+    Open-loop requests omit both fields. RTC requests send the unconsumed original
+    prefix plus how many control steps inference is expected to take.
+    """
+    leftover = payload.get("prev_chunk_left_over")
+    delay = payload.get("inference_delay")
+    kwargs: dict[str, Any] = {}
+    if leftover is None:
+        if delay is not None and int(delay) != 0:
+            raise ValueError("inference_delay requires prev_chunk_left_over")
+        return kwargs
+    tensor = torch.tensor(leftover, dtype=torch.float32)
+    if tensor.ndim != 2 or tensor.shape[-1] != 6 or tensor.shape[0] < 1:
+        raise ValueError(f"prev_chunk_left_over must have shape [T, 6] with T>=1, got {tuple(tensor.shape)}")
+    if not torch.isfinite(tensor).all().item():
+        raise ValueError("prev_chunk_left_over must be finite")
+    resolved_delay = 0 if delay is None else int(delay)
+    if resolved_delay < 0:
+        raise ValueError("inference_delay must be >= 0")
+    kwargs["prev_chunk_left_over"] = tensor
+    kwargs["inference_delay"] = resolved_delay
+    return kwargs
+
+
+def _apply_execution_horizon(backend: Any, payload: dict[str, Any]) -> None:
+    horizon = payload.get("execution_horizon")
+    if horizon is None:
+        return
+    resolved = int(horizon)
+    if resolved < 1:
+        raise ValueError("execution_horizon must be >= 1")
+    rtc_config = getattr(getattr(backend, "config", None), "rtc_config", None)
+    if rtc_config is None:
+        raise ValueError("execution_horizon requires an RTC-enabled video_vam server")
+    rtc_config.execution_horizon = resolved
+
+
 class RPCApplication:
     def __init__(self, args: argparse.Namespace) -> None:
         self.name = args.policy
@@ -72,6 +111,15 @@ class RPCApplication:
             if config.joint_limits_min is None or config.joint_limits_max is None:
                 raise ValueError("video_vam requires --joint-limits-min and --joint-limits-max")
             self.backend = VideoVAMPolicy.from_pretrained(args.checkpoint, config=config)
+            from lerobot.policies.rtc.configuration_rtc import RTCConfig
+
+            rtc_config = RTCConfig(
+                enabled=True,
+                execution_horizon=args.execution_horizon,
+                max_guidance_weight=args.max_guidance_weight,
+            )
+            self.backend.config.rtc_config = rtc_config
+            self.backend.init_rtc_processor()
             self.history_key = f"{config.camera_key}.history"
             self.history_index_key = HISTORY_FRAME_INDEX_KEY
             self.config = config
@@ -118,6 +166,10 @@ class RPCApplication:
                 self.history_index_key: torch.tensor([self.frame_index], dtype=torch.long),
             }
             kwargs = {} if supplied_seed is None else {"feature_noise_seed": supplied_seed}
+            kwargs.update(rtc_kwargs_from_payload(payload))
+            _apply_execution_horizon(self.backend, payload)
+            if "prev_chunk_left_over" in kwargs and self.backend.rtc_processor is None:
+                raise RuntimeError("RTC leftover received but rtc_processor is not initialized")
             actions = self.backend.predict_action_chunk(batch, **kwargs)[0].cpu()
         self.frame_index += 1
         if self.device.type == "cuda":
@@ -141,7 +193,14 @@ class Handler(BaseHTTPRequestHandler):
         if self.path != "/healthz":
             self._send(404, {"error": "not found"})
             return
-        self._send(200, {"ok": True, "policy": self.app.name})
+        self._send(
+            200,
+            {
+                "ok": True,
+                "policy": self.app.name,
+                "rtc": getattr(self.app.backend, "rtc_processor", None) is not None,
+            },
+        )
 
     def do_POST(self) -> None:
         if self.path != "/predict":
@@ -178,7 +237,18 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--joint-limits-min", type=float, nargs=6)
     parser.add_argument("--joint-limits-max", type=float, nargs=6)
+    parser.add_argument(
+        "--execution-horizon",
+        type=int,
+        default=10,
+        help="RTC leftover prefix length (overridable per request)",
+    )
+    parser.add_argument("--max-guidance-weight", type=float, default=10.0)
     args = parser.parse_args(argv)
+    if args.execution_horizon < 1:
+        parser.error("--execution-horizon must be >= 1")
+    if args.max_guidance_weight <= 0:
+        parser.error("--max-guidance-weight must be positive")
     if (args.joint_limits_min is None) != (args.joint_limits_max is None):
         parser.error("joint limits must be supplied together")
     print("Operator must hold the existing GPU lock before starting this server.", flush=True)

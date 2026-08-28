@@ -313,6 +313,8 @@ class VideoVAMPolicy(PreTrainedPolicy):
         return True
 
     def init_rtc_processor(self) -> None:
+        if self.config.rtc_config is None:
+            raise ValueError("init_rtc_processor requires config.rtc_config")
         self.rtc_processor = RTCProcessor(self.config.rtc_config)
 
     @torch.no_grad()
@@ -339,6 +341,14 @@ class VideoVAMPolicy(PreTrainedPolicy):
         feature_seed = self._feature_seed(batch, feature_noise_seed)
         context = self._extract_context(images, feature_seed)
         rtc = self.rtc_processor if prev_chunk_left_over is not None else None
+        if prev_chunk_left_over is not None and rtc is None:
+            raise ValueError("prev_chunk_left_over requires init_rtc_processor()")
+        execution_horizon = None
+        if rtc is not None:
+            rtc_config = self.config.rtc_config
+            if rtc_config is None:
+                raise ValueError("prev_chunk_left_over requires config.rtc_config")
+            execution_horizon = rtc_config.execution_horizon
         actions = self.decoder.sample_actions(
             state.to(device=self.config.device, dtype=torch.float32),
             context,
@@ -347,7 +357,7 @@ class VideoVAMPolicy(PreTrainedPolicy):
             rtc_processor=rtc,
             inference_delay=inference_delay,
             prev_chunk_left_over=prev_chunk_left_over,
-            execution_horizon=self.config.rtc_config.execution_horizon if rtc is not None else None,
+            execution_horizon=execution_horizon,
         )
         return self._apply_action_safety(actions)
 

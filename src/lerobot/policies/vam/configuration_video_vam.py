@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import ClassVar
 
 from lerobot.configs import FeatureType, PolicyFeature, PreTrainedConfig
+from lerobot.policies.rtc.configuration_rtc import RTCConfig
 from lerobot.utils.constants import ACTION, OBS_STATE
 
 DEFAULT_COSMOS_CHECKPOINT = Path(
@@ -100,6 +101,8 @@ class VideoVAMConfig(PreTrainedConfig):
     joint_limits_min: list[float] | None = None
     joint_limits_max: list[float] | None = None
     joint_limit_tolerance: float = 0.0
+
+    rtc_config: RTCConfig | None = None
 
     def __post_init__(self) -> None:
         super().__post_init__()
