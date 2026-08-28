@@ -1,13 +1,19 @@
+import json
 from pathlib import Path
 
 import pytest
+import torch
+from torch import nn
 
 from lerobot.policies.vam.cosmos_cache_dataset import CacheManifest
+from lerobot.policies.vam.ltx_layer_mix import LTXLayerAttentionMix
 from scripts.video_vam.train_smolexpert_on_cosmos import (
     CANONICAL_DATASET,
     CANONICAL_REVISION,
     LTX_PROMPT_ARTIFACT,
     context_spec_from_manifest,
+    load_joint_checkpoint,
+    save_checkpoint,
 )
 
 
@@ -86,3 +92,29 @@ def test_ltx_manifest_rejects_zero_prompt_provenance() -> None:
     )
     with pytest.raises(ValueError, match="real Gemma-4"):
         context_spec_from_manifest(manifest)
+
+
+def test_joint_checkpoint_roundtrip_preserves_mixer_and_provenance(tmp_path: Path) -> None:
+    decoder = nn.Linear(4, 3)
+    mixer = LTXLayerAttentionMix((8, 14, 20), hidden_width=4, attn_width=4, num_heads=1, seed=7)
+    expected_decoder = {name: value.detach().clone() for name, value in decoder.state_dict().items()}
+    expected_mixer = {name: value.detach().clone() for name, value in mixer.state_dict().items()}
+    metadata = {
+        "train_manifest_sha256": "a" * 64,
+        "val_manifest_sha256": "b" * 64,
+        "split_sha256": "c" * 64,
+        "attention_mixer": {"layers": [8, 14, 20], "attn_width": 4, "attn_heads": 1},
+    }
+    checkpoint = tmp_path / "joint.safetensors"
+    save_checkpoint(decoder, checkpoint, metadata, mixer)
+    with torch.no_grad():
+        for parameter in (*decoder.parameters(), *mixer.parameters()):
+            parameter.zero_()
+
+    load_joint_checkpoint(decoder, mixer, checkpoint)
+
+    for name, value in expected_decoder.items():
+        torch.testing.assert_close(decoder.state_dict()[name], value)
+    for name, value in expected_mixer.items():
+        torch.testing.assert_close(mixer.state_dict()[name], value)
+    assert json.loads(checkpoint.with_suffix(".json").read_text()) == metadata

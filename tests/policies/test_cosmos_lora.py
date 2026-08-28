@@ -1,5 +1,6 @@
 import torch
 from torch import nn
+from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import checkpoint_wrapper
 
 from lerobot.datasets.vam import CUBE_OUT_OF_BOX_CONTRACT
 from lerobot.policies.vam.cosmos_lora import (
@@ -14,6 +15,7 @@ from lerobot.policies.vam.cosmos_lora import (
     load_lora_state_dict,
     lora_parameters,
     lora_state_dict,
+    merge_lora_into_base,
     prepare_full_clip_sample,
     rectified_flow_target,
     rectified_flow_video_loss,
@@ -164,6 +166,25 @@ def test_frozen_base_weights_do_not_receive_gradients():
     assert module.lora_B.grad is not None
 
 
+def test_merge_lora_into_base_matches_wrapped_linear():
+    model = _TinyBackbone()
+    inject_lora(model, rank=2, alpha=4)
+    wrapped = model.blocks[0].self_attn.q_proj
+    inputs = torch.randn(3, 8)
+    with torch.no_grad():
+        wrapped.lora_A.copy_(torch.arange(16, dtype=torch.float32).reshape(2, 8) / 10)
+        wrapped.lora_B.copy_(torch.arange(16, dtype=torch.float32).reshape(8, 2) / 20)
+    expected = wrapped.base_layer.weight.detach() + 2 * (wrapped.lora_B @ wrapped.lora_A)
+    before = wrapped(inputs)
+    merged = merge_lora_into_base(model)
+    fused = model.blocks[0].self_attn.q_proj
+    assert len(merged) == 28 * 10
+    assert isinstance(fused, nn.Linear) and not isinstance(fused, LoRALinear)
+    assert torch.allclose(fused.weight, expected)
+    assert torch.allclose(fused(inputs), before)
+    assert not any(isinstance(module, LoRALinear) for module in model.modules())
+
+
 def test_arm_b_detaches_action_context_but_arm_a_does_not():
     features = torch.randn(1, 4, 8, requires_grad=True)
     assert action_context_for_arm(features, action_grad_to_backbone=True) is features
@@ -222,3 +243,21 @@ def test_full_clip_contract_extends_only_camera_and_masks_repeat_last_padding():
     assert timestamps[config.camera_key][0] == -0.4
     assert timestamps[config.camera_key][-1] == 5.6
     assert config.delta_timestamps()[config.camera_key] == [-0.4, -0.3, -0.2, -0.1, 0.0]
+
+
+def test_lora_roundtrip_across_activation_checkpoint_wrapper(tmp_path):
+    source = _TinyBackbone()
+    inject_lora(source, rank=2)
+    for index, block in enumerate(source.blocks):
+        source.blocks[index] = checkpoint_wrapper(block, preserve_rng_state=False)
+    expected = lora_state_dict(source)
+    path = tmp_path / "wrapped-adapter.safetensors"
+    save_lora_state_dict(source, path)
+
+    target = _TinyBackbone()
+    inject_lora(target, rank=2)
+    load_lora_state_dict(target, path)
+
+    actual = lora_state_dict(target)
+    assert expected.keys() == actual.keys()
+    assert all(torch.equal(expected[name], actual[name]) for name in expected)

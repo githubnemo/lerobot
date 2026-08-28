@@ -69,6 +69,20 @@ _WEIGHT_KEYS = frozenset(
         "bridge_lora",
     }
 )
+_WEIGHT_KEYS_WITH_LORA = _WEIGHT_KEYS | frozenset({"lora", "adapters_applied"})
+_LORA_PROVENANCE_KEYS = frozenset(
+    {
+        "path",
+        "sha256",
+        "size_bytes",
+        "rank",
+        "alpha",
+        "metadata_path",
+        "metadata_sha256",
+        "adapters_applied",
+        "adapter_modules",
+    }
+)
 _PROMPT_KEYS = frozenset({"artifact_path", "output_sha256", "token_ids_sha256", "shape", "dtype"})
 _EXTRACTOR_KEYS = frozenset(
     {
@@ -93,7 +107,11 @@ _EXTRACTOR_KEYS = frozenset(
         "noise_seed",
     }
 )
+_EXTRACTOR_KEYS_WITH_LORA = _EXTRACTOR_KEYS | frozenset({"lora_weights", "adapters_applied"})
 _EXTRACTOR_KEYS_WITH_VAE_INPUT_MODE = _EXTRACTOR_KEYS | frozenset({"vae_input_mode"})
+_EXTRACTOR_KEYS_WITH_VAE_INPUT_MODE_AND_LORA = _EXTRACTOR_KEYS_WITH_VAE_INPUT_MODE | frozenset(
+    {"lora_weights", "adapters_applied"}
+)
 _RUNTIME_KEYS = frozenset(
     {
         "load_seconds",
@@ -262,7 +280,9 @@ def _validate_provenance(payload: Mapping[str, Any]) -> dict[str, Any]:
     weights = payload["weights"]
     if not isinstance(weights, Mapping):
         raise CosmosFeatureCacheValidationError("weights provenance must be an object")
-    _strict_keys(weights, _WEIGHT_KEYS, "weights")
+    weight_keys = set(weights)
+    if weight_keys not in {_WEIGHT_KEYS, _WEIGHT_KEYS_WITH_LORA}:
+        _strict_keys(weights, _WEIGHT_KEYS, "weights")
     for name in ("checkpoint_path", "tokenizer_path", "checkpoint_kind"):
         _non_empty_string(weights[name], f"weights.{name}")
     for name in ("checkpoint_size_bytes", "tokenizer_size_bytes"):
@@ -274,6 +294,38 @@ def _validate_provenance(payload: Mapping[str, Any]) -> dict[str, Any]:
         raise CosmosFeatureCacheValidationError("weights.checkpoint_kind is unsupported")
     if weights["bridge_lora"] is not None and not isinstance(weights["bridge_lora"], Mapping):
         raise CosmosFeatureCacheValidationError("weights.bridge_lora must be null or an object")
+    if weight_keys == _WEIGHT_KEYS_WITH_LORA:
+        adapters_applied = weights["adapters_applied"]
+        lora = weights["lora"]
+        if not isinstance(adapters_applied, bool):
+            raise CosmosFeatureCacheValidationError("weights.adapters_applied must be boolean")
+        if adapters_applied != (lora is not None):
+            raise CosmosFeatureCacheValidationError("weights adapter state is inconsistent")
+        if lora is not None:
+            if not isinstance(lora, Mapping):
+                raise CosmosFeatureCacheValidationError("weights.lora must be null or an object")
+            _strict_keys(lora, _LORA_PROVENANCE_KEYS, "weights.lora")
+            for name in ("path", "metadata_path"):
+                _non_empty_string(lora[name], f"weights.lora.{name}")
+            for name in ("size_bytes", "rank"):
+                if type(lora[name]) is not int or lora[name] <= 0:
+                    raise CosmosFeatureCacheValidationError(f"weights.lora.{name} must be a positive integer")
+            for name in ("sha256", "metadata_sha256"):
+                _sha256(lora[name], f"weights.lora.{name}")
+            if not isinstance(lora["alpha"], (int, float)) or isinstance(lora["alpha"], bool):
+                raise CosmosFeatureCacheValidationError("weights.lora.alpha must be numeric")
+            if not math.isfinite(float(lora["alpha"])) or float(lora["alpha"]) <= 0:
+                raise CosmosFeatureCacheValidationError("weights.lora.alpha must be finite and positive")
+            if not isinstance(lora["adapters_applied"], bool) or not lora["adapters_applied"]:
+                raise CosmosFeatureCacheValidationError("weights.lora.adapters_applied must be true")
+            if (
+                not isinstance(lora["adapter_modules"], list)
+                or not lora["adapter_modules"]
+                or any(not isinstance(name, str) or not name for name in lora["adapter_modules"])
+            ):
+                raise CosmosFeatureCacheValidationError(
+                    "weights.lora.adapter_modules must be non-empty strings"
+                )
 
     prompt = payload["prompt_embedding"]
     if not isinstance(prompt, Mapping):
@@ -296,6 +348,10 @@ def _validate_provenance(payload: Mapping[str, Any]) -> dict[str, Any]:
         _EXTRACTOR_KEYS | {"random_init_seed"},
         _EXTRACTOR_KEYS_WITH_VAE_INPUT_MODE,
         _EXTRACTOR_KEYS_WITH_VAE_INPUT_MODE | {"random_init_seed"},
+        _EXTRACTOR_KEYS_WITH_LORA,
+        _EXTRACTOR_KEYS_WITH_LORA | {"random_init_seed"},
+        _EXTRACTOR_KEYS_WITH_VAE_INPUT_MODE_AND_LORA,
+        _EXTRACTOR_KEYS_WITH_VAE_INPUT_MODE_AND_LORA | {"random_init_seed"},
     }
     if extractor_keys not in allowed_extractor_keys:
         raise CosmosFeatureCacheValidationError("extractor provenance keys are malformed")
@@ -325,6 +381,13 @@ def _validate_provenance(payload: Mapping[str, Any]) -> dict[str, Any]:
             raise CosmosFeatureCacheValidationError(f"extractor.{name} must be a positive integer")
     if extractor["bridge_lora"] is not None and not isinstance(extractor["bridge_lora"], Mapping):
         raise CosmosFeatureCacheValidationError("extractor.bridge_lora must be null or an object")
+    if "lora_weights" in extractor:
+        if not isinstance(extractor["adapters_applied"], bool):
+            raise CosmosFeatureCacheValidationError("extractor.adapters_applied must be boolean")
+        if extractor["adapters_applied"] != (extractor["lora_weights"] is not None):
+            raise CosmosFeatureCacheValidationError("extractor adapter state is inconsistent")
+        if extractor["lora_weights"] is not None and not isinstance(extractor["lora_weights"], Mapping):
+            raise CosmosFeatureCacheValidationError("extractor.lora_weights must be null or an object")
     if extractor["extractor_input_keys"] != ["rgb_history", "prompt_embedding"]:
         raise CosmosFeatureCacheValidationError("extractor input keys must exclude labels and state")
     if extractor["excluded_from_extractor"] != ["state", "target_action"]:

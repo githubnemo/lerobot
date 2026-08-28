@@ -84,7 +84,7 @@ class LoRALinear(nn.Module):
     def forward(self, input: torch.Tensor) -> torch.Tensor:
         result = self.base_layer(input)
         update = functional.linear(functional.linear(input.float(), self.lora_A), self.lora_B)
-        return result + update.to(dtype=result.dtype)
+        return result + (update * self.scaling).to(dtype=result.dtype)
 
 
 def _is_lora_target(name: str, module: nn.Module) -> bool:
@@ -133,6 +133,45 @@ def freeze_base_parameters(model: nn.Module) -> None:
         parameter.requires_grad_(name.endswith("lora_A") or name.endswith("lora_B"))
 
 
+def merge_lora_into_base(model: nn.Module) -> tuple[str, ...]:
+    """Fuse every LoRALinear residual into its base Linear in place.
+
+    For each wrapped projection this computes ``W + (alpha / rank) * B @ A``
+    in the base weight dtype, replaces the wrapper with a plain ``nn.Linear``,
+    and freezes the resulting layer for inference.
+    """
+    candidates = [(name, module) for name, module in model.named_modules() if isinstance(module, LoRALinear)]
+    if not candidates:
+        raise ValueError("model has no LoRALinear modules to merge")
+
+    merged: list[str] = []
+    with torch.no_grad():
+        for name, module in candidates:
+            base_layer = module.base_layer
+            update = (module.lora_B @ module.lora_A) * (module.alpha / module.rank)
+            fused_weight = base_layer.weight + update.to(
+                device=base_layer.weight.device, dtype=base_layer.weight.dtype
+            )
+            fused_layer = nn.Linear(
+                module.in_features,
+                module.out_features,
+                bias=base_layer.bias is not None,
+                device=base_layer.weight.device,
+                dtype=base_layer.weight.dtype,
+            )
+            fused_layer.weight.copy_(fused_weight)
+            if base_layer.bias is not None and fused_layer.bias is not None:
+                fused_layer.bias.copy_(base_layer.bias)
+            fused_layer.train(module.training)
+            for parameter in fused_layer.parameters():
+                parameter.requires_grad_(False)
+            parent_name, attribute = name.rsplit(".", 1)
+            parent = model.get_submodule(parent_name)
+            setattr(parent, attribute, fused_layer)
+            merged.append(name)
+    return tuple(merged)
+
+
 def lora_parameters(model: nn.Module) -> list[nn.Parameter]:
     """Return trainable LoRA parameters in stable module order."""
     parameters = [
@@ -145,13 +184,22 @@ def lora_parameters(model: nn.Module) -> list[nn.Parameter]:
     return parameters
 
 
+def _canonical_lora_name(name: str) -> str:
+    # Activation checkpoint wrappers add this internal module segment.  Adapter
+    # files must remain loadable by the unwrapped inference-time backbone.
+    return name.replace("._checkpoint_wrapped_module.", ".")
+
+
 def lora_state_dict(model: nn.Module) -> dict[str, torch.Tensor]:
-    """Return only adapter tensors for compact checkpoints."""
-    state = {
-        name: parameter.detach().cpu().contiguous()
-        for name, parameter in model.named_parameters()
-        if name.endswith(("lora_A", "lora_B"))
-    }
+    """Return only adapter tensors with wrapper-independent names."""
+    state: dict[str, torch.Tensor] = {}
+    for name, parameter in model.named_parameters():
+        if not name.endswith(("lora_A", "lora_B")):
+            continue
+        canonical_name = _canonical_lora_name(name)
+        if canonical_name in state:
+            raise ValueError(f"duplicate canonical LoRA parameter name: {canonical_name}")
+        state[canonical_name] = parameter.detach().cpu().contiguous()
     if not state:
         raise ValueError("model has no LoRA state")
     return state
@@ -166,14 +214,24 @@ def save_lora_state_dict(model: nn.Module, path: str | Path) -> None:
 
 def load_lora_state_dict(model: nn.Module, path: str | Path) -> None:
     """Strictly load an adapter-only safetensors checkpoint."""
-    actual = load_file(str(Path(path)), device="cpu")
+    raw_actual = load_file(str(Path(path)), device="cpu")
+    actual: dict[str, torch.Tensor] = {}
+    for name, tensor in raw_actual.items():
+        canonical_name = _canonical_lora_name(name)
+        if canonical_name in actual:
+            raise ValueError(f"duplicate canonical LoRA checkpoint key: {canonical_name}")
+        actual[canonical_name] = tensor
     expected = lora_state_dict(model)
     if set(actual) != set(expected):
         raise ValueError(
             f"LoRA checkpoint keys mismatch: missing={sorted(set(expected) - set(actual))}, "
             f"unexpected={sorted(set(actual) - set(expected))}"
         )
-    parameters = dict(model.named_parameters())
+    parameters = {
+        _canonical_lora_name(name): parameter
+        for name, parameter in model.named_parameters()
+        if name.endswith(("lora_A", "lora_B"))
+    }
     with torch.no_grad():
         for name, expected_tensor in expected.items():
             tensor = actual[name]

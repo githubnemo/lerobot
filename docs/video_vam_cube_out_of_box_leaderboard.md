@@ -146,3 +146,9 @@ At `s_min=10` the slow video policies have too little soft overlap left after in
 
 Full report: `docs/video_vam_temporal_consistency_report.md`.
 | 2026-08-26 | LTX-2.5 unpooled + pretrained SmolVLA expert | trainer fixed-probe val | **13.84** (h1 4.55; first-5 mean 6.24) | best step 45,000; plateau step 55,000 / 3.68 h | [3rypmjug](https://wandb.ai/hubnemo-hugging-face/video-vam-world2action/runs/3rypmjug) | tokens=2,400, train stride=3; confound: none; disk guard retained the full stride-3 train cache. |
+
+<!-- ltx-layer-probe-20260826 -->
+
+| 2026-08-26 | LTX multi-depth learned scalar mix, blocks 8/14/20/26/34/40 | trainer fixed-probe val | **15.09** | best 19,200 / stopped 25,200 | [run](https://wandb.ai/hubnemo-hugging-face/video-vam-world2action/runs/lwvtjptm) | Full-30 global masked mixed-unit RMSE; h=1 6.79, first-5 8.77; per-joint: shoulder_pan=20.493, shoulder_lift=14.006, elbow_flex=14.221, wrist_flex=17.948, wrist_roll=8.160, gripper=12.599. pool2 (640 tokens) + World2Action; weights are a hypothesis. |
+| 2026-08-26 | LTX top-1 confirmation, block 40 only | trainer fixed-probe val | **16.03** | best 5,100 / stopped 8,100 | [run](https://wandb.ai/hubnemo-hugging-face/video-vam-world2action/runs/tz8nhgdg) | Same pool2 + World2Action; h=1 8.36, first-5 9.87; per-joint: shoulder_pan=22.341, shoulder_lift=15.020, elbow_flex=14.859, wrist_flex=19.694, wrist_roll=8.072, gripper=11.960. |
+| 2026-08-26 | LTX top-2 confirmation, blocks 34/40 | trainer fixed-probe val | **15.29** | best 11,100 / stopped 14,100 | [run](https://wandb.ai/hubnemo-hugging-face/video-vam-world2action/runs/jdod8g03) | Same pool2 + World2Action; h=1 8.36, first-5 9.99; per-joint: shoulder_pan=21.252, shoulder_lift=13.844, elbow_flex=15.495, wrist_flex=17.473, wrist_roll=8.228, gripper=12.081. |

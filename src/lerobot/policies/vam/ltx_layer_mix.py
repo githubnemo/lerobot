@@ -250,33 +250,64 @@ class LTXLayerAttentionMix(nn.Module):
     @torch.no_grad()
     def diagnostics(self, contexts: Mapping[int, torch.Tensor]) -> dict[str, object]:
         """Return mean layer weights, contribution norms, gain, and token dispersion."""
+        accumulator = LTXAttentionDiagnosticsAccumulator(self)
+        accumulator.update(contexts)
+        return accumulator.compute()
 
-        components, query, keys, values = self._attention_inputs(contexts)
+
+class LTXAttentionDiagnosticsAccumulator:
+    """Aggregate exact attention diagnostics across validation minibatches."""
+
+    def __init__(self, mixer: LTXLayerAttentionMix) -> None:
+        self.mixer = mixer
+        shape = (mixer.num_heads, len(mixer.layers))
+        self.weight_sums = torch.zeros(shape, dtype=torch.float64)
+        self.weight_square_sums = torch.zeros(shape, dtype=torch.float64)
+        self.contribution_norm_sums = torch.zeros(len(mixer.layers), dtype=torch.float64)
+        self.positions = 0
+
+    @torch.no_grad()
+    def update(self, contexts: Mapping[int, torch.Tensor]) -> None:
+        components, query, keys, values = self.mixer._attention_inputs(contexts)
         batch, tokens, _channels = components[0].shape
-        layer_count = len(self.layers)
-        scores = (query.float() * keys.float()).sum(dim=-1) / math.sqrt(self.head_width)
+        layer_count = len(self.mixer.layers)
+        scores = (query.float() * keys.float()).sum(dim=-1) / math.sqrt(self.mixer.head_width)
         attention_weights = torch.softmax(scores, dim=-1)
-        token_weights = attention_weights.reshape(batch, tokens, self.num_heads, layer_count)
-        mean_weights = token_weights.mean(dim=(0, 1, 2))
-        flattened = token_weights.permute(2, 3, 0, 1).reshape(self.num_heads, layer_count, batch * tokens)
-        dispersion = flattened.std(dim=-1, unbiased=False).mean()
-
-        norms: list[torch.Tensor] = []
+        token_weights = attention_weights.reshape(batch, tokens, self.mixer.num_heads, layer_count)
+        token_weights64 = token_weights.double().cpu()
+        self.weight_sums += token_weights64.sum(dim=(0, 1))
+        self.weight_square_sums += token_weights64.square().sum(dim=(0, 1))
         for index, component in enumerate(components):
             weighted_value = attention_weights[..., index].unsqueeze(-1) * values[:, :, index]
-            projected = self.out_proj(weighted_value.reshape(batch, tokens, self.attn_width)).float()
+            projected = self.mixer.out_proj(
+                weighted_value.reshape(batch, tokens, self.mixer.attn_width)
+            ).float()
             contribution = component / layer_count + projected
-            norms.append(torch.linalg.vector_norm(contribution, dim=-1).mean())
+            self.contribution_norm_sums[index] += (
+                torch.linalg.vector_norm(contribution, dim=-1).sum().double().cpu()
+            )
+        self.positions += batch * tokens
+
+    def compute(self) -> dict[str, object]:
+        if self.positions <= 0:
+            raise ValueError("attention diagnostics require at least one validation position")
+        head_layer_means = self.weight_sums / self.positions
+        mean_weights = head_layer_means.mean(dim=0)
+        variances = (self.weight_square_sums / self.positions - head_layer_means.square()).clamp_min(0.0)
+        dispersion = variances.sqrt().mean()
+        contribution_norms = self.contribution_norm_sums / self.positions
+        weight_sum = float(mean_weights.sum().item())
+        if not math.isclose(weight_sum, 1.0, rel_tol=0.0, abs_tol=1.0e-5):
+            raise ValueError(f"mean attention weights must sum to one, got {weight_sum}")
         return {
             "weights": {
-                layer: float(weight.detach().cpu())
-                for layer, weight in zip(self.layers, mean_weights, strict=True)
+                layer: float(weight) for layer, weight in zip(self.mixer.layers, mean_weights, strict=True)
             },
             "mean_contribution_norms": {
-                layer: float(norm.detach().cpu()) for layer, norm in zip(self.layers, norms, strict=True)
+                layer: float(norm) for layer, norm in zip(self.mixer.layers, contribution_norms, strict=True)
             },
-            "gain": float(self.gain.detach().cpu()),
-            "weight_dispersion": float(dispersion.detach().cpu()),
+            "gain": float(self.mixer.gain.detach().cpu()),
+            "weight_dispersion": float(dispersion),
         }
 
 

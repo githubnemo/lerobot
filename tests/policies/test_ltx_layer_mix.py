@@ -8,6 +8,7 @@ from lerobot.policies.vam.ltx_action import (
     apply_ltx_context_transform as policy_context_transform,
 )
 from lerobot.policies.vam.ltx_layer_mix import (
+    LTXAttentionDiagnosticsAccumulator,
     LTXLayerAttentionMix,
     LTXLayerGatedMix,
     LTXLayerScalarMix,
@@ -256,6 +257,21 @@ def test_mixer_diagnostics_have_comparable_keys_and_normalized_weights(mixer):
     assert sum(diagnostics["weights"].values()) == pytest.approx(1.0, abs=1.0e-6)
     if not isinstance(mixer, LTXLayerScalarMix):
         assert diagnostics["weight_dispersion"] >= 0.0
+
+
+def test_attention_diagnostics_aggregate_exactly_across_validation_batches():
+    mixer = LTXLayerAttentionMix((8, 14, 20), hidden_width=8, attn_width=8, num_heads=2, seed=29)
+    contexts = _independent_contexts()
+    whole = mixer.diagnostics(contexts)
+    accumulator = LTXAttentionDiagnosticsAccumulator(mixer)
+    for index in range(contexts[8].shape[0]):
+        accumulator.update({layer: value[index : index + 1] for layer, value in contexts.items()})
+    split = accumulator.compute()
+
+    assert sum(split["weights"].values()) == pytest.approx(1.0, abs=1.0e-6)
+    assert split["weights"] == pytest.approx(whole["weights"], abs=1.0e-7)
+    assert split["mean_contribution_norms"] == pytest.approx(whole["mean_contribution_norms"], abs=1.0e-6)
+    assert split["weight_dispersion"] == pytest.approx(whole["weight_dispersion"], abs=1.0e-7)
 
 
 def test_default_mixer_parameter_counts_have_expected_order_of_magnitude():

@@ -1,6 +1,13 @@
+import json
+from pathlib import Path
+
 import pytest
 
-from scripts.video_vam.build_cosmos_feature_cache import _validate_args, parse_args
+from scripts.video_vam.build_cosmos_feature_cache import (
+    _lora_checkpoint_provenance,
+    _validate_args,
+    parse_args,
+)
 
 
 def test_builder_accepts_episode_zero_and_bounded_subset():
@@ -24,3 +31,17 @@ def test_builder_rejects_ambiguous_resume_overwrite_and_ranges():
     args = parse_args(["--episodes", "0", "--frame-start", "8", "--frame-end", "8"])
     with pytest.raises(ValueError, match="greater"):
         _validate_args(args)
+
+
+def test_builder_reads_strict_lora_provenance(tmp_path: Path):
+    weights = tmp_path / "best_lora.safetensors"
+    weights.write_bytes(b"adapter tensors")
+    weights.with_suffix(".json").write_text(json.dumps({"lora": {"rank": 16, "alpha": 16.0}}) + "\n")
+
+    provenance = _lora_checkpoint_provenance(weights)
+
+    assert provenance["path"] == str(weights.resolve())
+    assert len(provenance["sha256"]) == 64
+    assert provenance["rank"] == 16
+    assert provenance["alpha"] == 16.0
+    assert provenance["adapters_applied"] is True

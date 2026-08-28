@@ -9,6 +9,7 @@ from lerobot.policies.rtc.configuration_rtc import RTCConfig
 from lerobot.policies.rtc.modeling_rtc import RTCProcessor
 from lerobot.policies.vam.context_transform import apply_context_transform
 from lerobot.policies.vam.cosmos_cache_dataset import CacheManifestEntry
+from lerobot.policies.vam.ltx_layer_mix import LTXLayerAttentionMix
 from lerobot.policies.vam.smol_expert import (
     CosmosPrefixAdapter,
     SmolExpertActionDecoder,
@@ -181,6 +182,28 @@ def test_smol_expert_loss_is_finite_and_backpropagates() -> None:
     loss.backward()
     assert decoder.context_adapter.projection.weight.grad is not None
     assert torch.isfinite(decoder.context_adapter.projection.weight.grad).all()
+
+
+def test_attention_mixer_and_smol_expert_receive_joint_gradients() -> None:
+    torch.manual_seed(0)
+    decoder = _decoder()
+    mixer = LTXLayerAttentionMix((8, 14, 20), hidden_width=4, attn_width=4, num_heads=1, seed=0)
+    contexts = {layer: torch.randn(2, 4, 4) + index for index, layer in enumerate(mixer.layers)}
+    mixed = mixer(contexts)
+    loss = decoder.flow_matching_loss(
+        torch.randn(2, 6),
+        torch.randn(2, 30, 6),
+        mixed,
+        action_is_pad=torch.zeros(2, 30, dtype=torch.bool),
+    )
+    assert torch.isfinite(loss)
+    loss.backward()
+    for name, parameter in mixer.named_parameters():
+        assert parameter.grad is not None, name
+        assert torch.isfinite(parameter.grad).all(), name
+        assert parameter.grad.abs().sum().item() > 0, name
+    assert decoder.context_adapter.projection.weight.grad is not None
+    assert decoder.expert.layers[0].self_attn.q_proj.weight.grad is not None
 
 
 def test_sampling_with_fixed_probe_seed_is_deterministic() -> None:

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import math
 import os
 import platform
@@ -35,6 +36,7 @@ from lerobot.policies.vam.cosmos_feature_cache import (
     save_feature_cache,
     verify_feature_cache,
 )
+from lerobot.policies.vam.cosmos_lora import inject_lora, load_lora_state_dict
 from lerobot.policies.vam.cosmos_predict2_extractor import (
     UPSTREAM_COMMIT,
     VAE_INPUT_MODE_LEGACY_PADDED,
@@ -85,6 +87,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--prompt", type=Path, default=DEFAULT_PROMPT_PATH)
     parser.add_argument("--checkpoint", type=Path, default=DEFAULT_CHECKPOINT_PATH)
+    parser.add_argument("--lora-weights", type=Path, help="Adapter-only Cosmos LoRA safetensors checkpoint.")
     parser.add_argument("--tokenizer", type=Path, default=DEFAULT_TOKENIZER_PATH)
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
     parser.add_argument("--manifest", type=Path, help="Manifest path; defaults to OUTPUT_DIR/manifest.json.")
@@ -152,6 +155,45 @@ def _validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--random-init-seed must be non-negative")
     if args.resume and args.overwrite:
         raise ValueError("--resume and --overwrite are mutually exclusive")
+    if args.lora_weights is not None and args.random_init_seed is not None:
+        raise ValueError("--lora-weights cannot be combined with --random-init-seed")
+
+
+def _lora_checkpoint_provenance(path: Path) -> dict[str, Any]:
+    path = path.expanduser().resolve()
+    if not path.is_file():
+        raise FileNotFoundError(f"LoRA weights not found: {path}")
+    metadata_path = path.with_suffix(".json")
+    if not metadata_path.is_file():
+        raise FileNotFoundError(f"LoRA provenance sidecar not found: {metadata_path}")
+    try:
+        payload = json.loads(metadata_path.read_text())
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(f"could not read LoRA provenance sidecar {metadata_path}: {exc}") from exc
+    lora = payload.get("lora")
+    if not isinstance(lora, dict):
+        raise ValueError(f"LoRA provenance sidecar has no lora object: {metadata_path}")
+    rank = lora.get("rank")
+    alpha = lora.get("alpha")
+    if isinstance(rank, bool) or not isinstance(rank, int) or rank <= 0:
+        raise ValueError(f"LoRA provenance rank must be a positive integer: {metadata_path}")
+    if (
+        not isinstance(alpha, (int, float))
+        or isinstance(alpha, bool)
+        or not math.isfinite(float(alpha))
+        or alpha <= 0
+    ):
+        raise ValueError(f"LoRA provenance alpha must be finite and positive: {metadata_path}")
+    return {
+        "path": str(path),
+        "sha256": sha256_file(path),
+        "size_bytes": path.stat().st_size,
+        "rank": rank,
+        "alpha": float(alpha),
+        "metadata_path": str(metadata_path),
+        "metadata_sha256": sha256_file(metadata_path),
+        "adapters_applied": True,
+    }
 
 
 def _selected_frames(dataset: Any, args: argparse.Namespace):
@@ -185,6 +227,7 @@ def _existing_entry(
     expected_sigma: float,
     expected_random_init_seed: int | None,
     expected_vae_input_mode: str,
+    expected_lora_sha256: str | None,
 ):
     path = _artifact_path(output_dir, episode, frame)
     artifact = verify_feature_cache(path)
@@ -206,6 +249,10 @@ def _existing_entry(
         raise ValueError(f"existing cache random-init seed does not match request: {path}")
     if extractor.get("vae_input_mode", VAE_INPUT_MODE_LEGACY_PADDED) != expected_vae_input_mode:
         raise ValueError(f"existing cache VAE input mode does not match request: {path}")
+    stored_lora = extractor.get("lora_weights")
+    stored_lora_sha256 = stored_lora.get("sha256") if isinstance(stored_lora, dict) else None
+    if stored_lora_sha256 != expected_lora_sha256:
+        raise ValueError(f"existing cache LoRA provenance does not match request: {path}")
     return artifact
 
 
@@ -247,6 +294,8 @@ def _manifest_payload(
                 f"{context['output_grid']['height']}x{context['output_grid']['width']}"
             ),
             "weights": dict(weights),
+            "lora_weights": weights.get("lora"),
+            "adapters_applied": bool(weights.get("adapters_applied", False)),
             "prompt_embedding": dict(prompt_embedding),
             "extractor_input_keys": ["rgb_history", "prompt_embedding"],
             "excluded_from_extractor": ["state", "target_action", ACTION_IS_PAD_KEY],
@@ -289,6 +338,11 @@ def build(args: argparse.Namespace) -> Path:
 
     checkpoint_path = args.checkpoint.expanduser().resolve()
     tokenizer_path = args.tokenizer.expanduser().resolve()
+    lora_info = _lora_checkpoint_provenance(args.lora_weights) if args.lora_weights is not None else None
+    if lora_info is not None and "bridge" in checkpoint_path.name:
+        raise ValueError(
+            "--lora-weights requires the generic Cosmos checkpoint, not a fused bridge checkpoint"
+        )
     weights = verify_pinned_checkpoints(
         DEFAULT_CHECKPOINT_PATH if "bridge" in checkpoint_path.name else checkpoint_path,
         tokenizer_path,
@@ -344,6 +398,19 @@ def build(args: argparse.Namespace) -> Path:
     torch.cuda.reset_peak_memory_stats(device)
     load_start = time.perf_counter()
     extractor = CosmosPredict2Extractor(config)
+    if lora_info is not None:
+        adapter_names = inject_lora(
+            extractor.backbone,
+            rank=int(lora_info["rank"]),
+            alpha=float(lora_info["alpha"]),
+        )
+        load_lora_state_dict(extractor.backbone, args.lora_weights.expanduser().resolve())
+        extractor.backbone.eval()
+        lora_info["adapter_modules"] = list(adapter_names)
+        lora_info["adapters_applied"] = True
+    weights = dict(weights)
+    weights["lora"] = lora_info
+    weights["adapters_applied"] = lora_info is not None
     _synchronize(device)
     load_seconds = time.perf_counter() - load_start
     load_peak = _cuda_peak(device)
@@ -368,6 +435,7 @@ def build(args: argparse.Namespace) -> Path:
                 expected_sigma=args.sigma,
                 expected_random_init_seed=args.random_init_seed,
                 expected_vae_input_mode=args.vae_input_mode,
+                expected_lora_sha256=None if lora_info is None else str(lora_info["sha256"]),
             )
             print(f"resume verified {episode}/{frame}: {path}")
         else:
@@ -441,6 +509,8 @@ def build(args: argparse.Namespace) -> Path:
                     "official_positional_latent_max_h": 240,
                     "official_positional_latent_max_w": 240,
                     "bridge_lora": weights.get("bridge_lora"),
+                    "lora_weights": weights.get("lora"),
+                    "adapters_applied": bool(weights.get("adapters_applied", False)),
                     "extractor_input_keys": ["rgb_history", "prompt_embedding"],
                     "excluded_from_extractor": ["state", "target_action"],
                     "checkpoint_ignored_metadata_keys": list(
@@ -509,6 +579,12 @@ def build(args: argparse.Namespace) -> Path:
         if old_manifest.context_transform != args.context_transform:
             raise ValueError("resume manifest context transform does not match the request")
         old_provenance = old_manifest.payload["provenance"]
+        if old_provenance.get("lora_weights") != weights.get("lora"):
+            raise ValueError("resume manifest LoRA provenance does not match the request")
+        if bool(old_provenance.get("adapters_applied", False)) != bool(
+            weights.get("adapters_applied", False)
+        ):
+            raise ValueError("resume manifest adapter state does not match the request")
         if old_manifest.vae_input_mode != args.vae_input_mode:
             raise ValueError("resume manifest VAE input mode does not match the request")
         if (

@@ -17,7 +17,7 @@ from typing import Any
 
 import numpy as np
 import torch
-from safetensors.torch import save_file
+from safetensors.torch import load_file, save_file
 
 from lerobot.policies.vam.context_transform import apply_context_transform
 from lerobot.policies.vam.cosmos_cache_dataset import (
@@ -30,6 +30,16 @@ from lerobot.policies.vam.cosmos_cache_dataset import (
 from lerobot.policies.vam.ltx_feature_cache import (
     LTXFeatureCacheDataset,
     load_ltx_cache_manifest,
+)
+from lerobot.policies.vam.ltx_layer_mix import (
+    LTX_LAYER_PROBE_DEPTHS,
+    LTXAttentionDiagnosticsAccumulator,
+    LTXLayerAttentionMix,
+)
+from lerobot.policies.vam.ltx_layer_mix_cache import (
+    LTXLayerMixCacheDataset,
+    load_layer_mix_manifest,
+    sha256_file,
 )
 from lerobot.policies.vam.smol_expert import (
     ACTION_DIM,
@@ -57,6 +67,8 @@ DEFAULT_WARMUP_STEPS = 1_000
 DEFAULT_NUM_STEPS = 10
 DEFAULT_WANDB_PROJECT = "video-vam-world2action"
 DEFAULT_RUN_NAME = "smolexpert-on-cosmos-pool2"
+DEFAULT_ATTN_WIDTH = 2_048
+DEFAULT_ATTN_HEADS = 8
 TRAIN_EPISODES = tuple(range(32))
 CONTEXT_TRANSFORM = "pool2"
 CANONICAL_DATASET = "hubnemo/cube_out_of_box_dataset"
@@ -76,6 +88,7 @@ class ContextSpec:
     model_tokens: int
     channels: int
     dtype: str
+    tapped_layers: tuple[int, ...] = ()
 
 
 def context_spec_from_manifest(manifest: CacheManifest, *, requested_transform: str = "auto") -> ContextSpec:
@@ -89,7 +102,21 @@ def context_spec_from_manifest(manifest: CacheManifest, *, requested_transform: 
     if not isinstance(provenance, dict):
         raise ValueError("cache manifest provenance must be an object")
     artifact = str(payload.get("artifact") or "cosmos_feature_manifest")
-    if artifact == "ltx25_frozen_feature_manifest":
+    tapped_layers: tuple[int, ...] = ()
+    if artifact == "ltx25_multidepth_pool2_feature_manifest":
+        stored_transform = str(provenance.get("context_transform"))
+        stored_tokens = provenance.get("context_tokens_per_layer")
+        channels = provenance.get("context_channels")
+        dtype = provenance.get("context_dtype")
+        model_transform = stored_transform if requested_transform == "auto" else requested_transform
+        if model_transform != stored_transform:
+            raise ValueError("multidepth LTX training must consume the cache-declared representation")
+        if provenance.get("tapped_layers") != list(LTX_LAYER_PROBE_DEPTHS):
+            raise ValueError("multidepth LTX cache does not contain the canonical tapped layers")
+        tapped_layers = LTX_LAYER_PROBE_DEPTHS
+        backbone = "LTX-2.5-22B-distilled"
+        model_tokens = stored_tokens
+    elif artifact == "ltx25_frozen_feature_manifest":
         if (
             provenance.get("backbone") != "LTX-2.5-22B-distilled"
             or provenance.get("hidden_layer") != 34
@@ -158,17 +185,22 @@ def context_spec_from_manifest(manifest: CacheManifest, *, requested_transform: 
         model_tokens,
         channels,
         dtype,
+        tapped_layers,
     )
 
 
 def load_context_manifest(path: Path) -> CacheManifest:
     payload = json.loads(path.read_text())
+    if str(payload.get("artifact", "")).startswith("ltx25_multidepth_"):
+        return load_layer_mix_manifest(path)
     if payload.get("artifact") == "ltx25_frozen_feature_manifest":
         return load_ltx_cache_manifest(path)
     return load_cache_manifest(path)
 
 
 def build_context_dataset(manifest: CacheManifest):
+    if str(manifest.payload.get("artifact", "")).startswith("ltx25_multidepth_"):
+        return LTXLayerMixCacheDataset(manifest)
     if manifest.payload.get("artifact") == "ltx25_frozen_feature_manifest":
         return LTXFeatureCacheDataset(manifest)
     return CosmosFeatureCacheDataset(manifest, shuffle_seed=0)
@@ -189,6 +221,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--expert-checkpoint", default=SMOLVLA_CHECKPOINT)
     parser.add_argument("--vlm-config", default=SMOLVLM_CONFIG)
     parser.add_argument("--batch-size", type=int, default=DEFAULT_BATCH_SIZE)
+    parser.add_argument("--grad-accum-steps", type=int, default=1)
     parser.add_argument("--max-steps", type=int, default=DEFAULT_MAX_STEPS)
     parser.add_argument("--max-hours", type=float)
     parser.add_argument("--val-every", type=int, default=DEFAULT_VAL_EVERY)
@@ -200,6 +233,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--warmup-steps", type=int, default=DEFAULT_WARMUP_STEPS)
     parser.add_argument("--num-steps", type=int, default=DEFAULT_NUM_STEPS)
     parser.add_argument("--context-transform", choices=("auto", "none", "pool2"), default="auto")
+    parser.add_argument("--mixer", choices=("none", "attention"), default="none")
+    parser.add_argument("--attn-width", type=int, default=DEFAULT_ATTN_WIDTH)
+    parser.add_argument("--attn-heads", type=int, default=DEFAULT_ATTN_HEADS)
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--pin-memory", action="store_true")
     parser.add_argument("--prefetch-factor", type=int, default=2)
@@ -214,8 +250,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 
 def validate_args(args: argparse.Namespace) -> None:
-    if args.batch_size <= 0 or args.max_steps <= 0 or args.val_every <= 0 or args.patience <= 0:
-        raise ValueError("batch-size, max-steps, val-every, and patience must be positive")
+    if (
+        args.batch_size <= 0
+        or args.grad_accum_steps <= 0
+        or args.max_steps <= 0
+        or args.val_every <= 0
+        or args.patience <= 0
+    ):
+        raise ValueError("batch-size, grad-accum-steps, max-steps, val-every, and patience must be positive")
     if args.max_hours is not None and args.max_hours <= 0:
         raise ValueError("max-hours must be positive")
     if args.seed < 0 or args.lr <= 0 or args.weight_decay < 0 or args.grad_clip <= 0:
@@ -234,6 +276,8 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError(
             "num-steps must be positive; worker and prefetch counts must be non-negative/positive"
         )
+    if args.attn_width <= 0 or args.attn_heads <= 0 or args.attn_width % args.attn_heads:
+        raise ValueError("attn-width must be positive and divisible by attn-heads")
     if args.device != "cuda":
         raise ValueError("the SmolExpert trainer requires --device cuda")
 
@@ -284,6 +328,34 @@ def prepare_cached_context(context: torch.Tensor, spec: ContextSpec) -> torch.Te
     return transformed
 
 
+def prepare_model_context(
+    context: torch.Tensor,
+    spec: ContextSpec,
+    mixer: LTXLayerAttentionMix | None,
+) -> torch.Tensor:
+    """Prepare either a single cached context or a jointly trained multidepth mix."""
+    if mixer is None:
+        if spec.tapped_layers:
+            raise ValueError("multidepth cache requires --mixer attention")
+        return prepare_cached_context(context, spec)
+    if not spec.tapped_layers:
+        raise ValueError("--mixer attention requires a multidepth LTX cache")
+    expected = (len(spec.tapped_layers), spec.stored_tokens, spec.channels)
+    if tuple(context.shape[1:]) != expected or context.dtype != torch.bfloat16:
+        raise ValueError(
+            f"multidepth context must be BF16 [B, {expected[0]}, {expected[1]}, {expected[2]}], "
+            f"got {context.dtype} {tuple(context.shape)}"
+        )
+    contexts = {layer: context[:, index] for index, layer in enumerate(spec.tapped_layers)}
+    return mixer(contexts)
+
+
+def layer_context_mapping(context: torch.Tensor, spec: ContextSpec) -> dict[int, torch.Tensor]:
+    if not spec.tapped_layers:
+        raise ValueError("layer mapping requires a multidepth context")
+    return {layer: context[:, index] for index, layer in enumerate(spec.tapped_layers)}
+
+
 def batch_tensors(
     items: list[CacheDatasetItem],
     device: torch.device,
@@ -294,7 +366,7 @@ def batch_tensors(
     action = torch.cat([item.target_action for item in items], dim=0).to(device=device, dtype=torch.float32)
     context = torch.cat([item.context for item in items], dim=0).to(device=device, dtype=torch.bfloat16)
     padding = torch.cat([item.action_is_pad for item in items], dim=0).to(device=device)
-    return state, action, prepare_cached_context(context, context_spec), padding
+    return state, action, context, padding
 
 
 def compute_training_normalizer(
@@ -388,9 +460,31 @@ def build_scheduler(optimizer: torch.optim.Optimizer, args: argparse.Namespace):
     }
 
 
+def assert_finite_nonzero_gradients(module: torch.nn.Module, label: str) -> None:
+    """Fail a smoke run if any trainable tensor is disconnected or numerically invalid."""
+    missing: list[str] = []
+    nonfinite: list[str] = []
+    zero: list[str] = []
+    for name, parameter in module.named_parameters():
+        if not parameter.requires_grad:
+            continue
+        if parameter.grad is None:
+            missing.append(name)
+        elif not torch.isfinite(parameter.grad).all().item():
+            nonfinite.append(name)
+        elif not torch.count_nonzero(parameter.grad).item():
+            zero.append(name)
+    if missing or nonfinite or zero:
+        raise FloatingPointError(
+            f"{label} gradient health failed: missing={missing[:8]}, "
+            f"nonfinite={nonfinite[:8]}, zero={zero[:8]}"
+        )
+
+
 @torch.no_grad()
 def evaluate_validation(
     decoder: SmolExpertActionDecoder,
+    mixer: LTXLayerAttentionMix | None,
     dataset: Any,
     entries: tuple[CacheManifestEntry, ...],
     split: VAMSplit,
@@ -402,6 +496,9 @@ def evaluate_validation(
     if not entries:
         raise ValueError("validation split contains no entries")
     decoder.eval()
+    if mixer is not None:
+        mixer.eval()
+    diagnostics = LTXAttentionDiagnosticsAccumulator(mixer) if mixer is not None else None
     squared_total = 0.0
     valid_scalars = 0
     prefix_squared = [0.0] * 5
@@ -410,9 +507,13 @@ def evaluate_validation(
     flow_count = 0
     for start in range(0, len(entries), batch_size):
         batch_entries = entries[start : start + batch_size]
-        state, action, context, padding = batch_tensors(
+        state, action, raw_context, padding = batch_tensors(
             load_items(dataset, batch_entries), device, context_spec=context_spec
         )
+        if diagnostics is not None:
+            diagnostics.update(layer_context_mapping(raw_context, context_spec))
+        with autocast_context(device):
+            context = prepare_model_context(raw_context, context_spec, mixer)
         probes = [split.probe_for(entry.sample_id) for entry in batch_entries]
         noise = torch.cat([decoder._noise_for_seed(1, device, probe.sample_seed) for probe in probes], dim=0)
         prediction = decoder.sample_actions(state, context, noise=noise)
@@ -443,17 +544,40 @@ def evaluate_validation(
     prefix_rmse = [
         math.sqrt(squared / count) for squared, count in zip(prefix_squared, prefix_valid, strict=True)
     ]
-    return {
+    result: dict[str, float | int] = {
         "val_aggregate_rmse_deg": math.sqrt(squared_total / valid_scalars),
         "val_prefix_h1_rmse_deg": prefix_rmse[0],
         "val_prefix_first5_mean_rmse_deg": sum(prefix_rmse) / len(prefix_rmse),
         "val_fixed_flow_loss": flow_total / max(flow_count, 1),
         "val_samples": len(entries),
     }
+    if diagnostics is not None:
+        mix_diagnostics = diagnostics.compute()
+        weights = mix_diagnostics["weights"]
+        contribution_norms = mix_diagnostics["mean_contribution_norms"]
+        if not isinstance(weights, dict) or not isinstance(contribution_norms, dict):
+            raise TypeError("layer-mix diagnostics must contain dict weights and norms")
+        for layer, weight in weights.items():
+            if not isinstance(weight, (int, float)):
+                raise TypeError(f"layer weight for {layer} must be numeric")
+            result[f"layer_weight_{layer}"] = weight
+        for layer, norm in contribution_norms.items():
+            if not isinstance(norm, (int, float)):
+                raise TypeError(f"layer contribution norm for {layer} must be numeric")
+            result[f"layer_contribution_norm_{layer}"] = norm
+        dispersion = mix_diagnostics["weight_dispersion"]
+        gain = mix_diagnostics["gain"]
+        if not isinstance(dispersion, (int, float)) or not isinstance(gain, (int, float)):
+            raise TypeError("layer-mix dispersion and gain must be numeric")
+        result["layer_weight_dispersion"] = dispersion
+        result["layer_mix_gain"] = gain
+        result["layer_weight_sum"] = sum(float(value) for value in weights.values())
+    return result
 
 
 def checkpoint_metadata(
     decoder: SmolExpertActionDecoder,
+    mixer: LTXLayerAttentionMix | None,
     *,
     step: int,
     best_step: int,
@@ -479,12 +603,16 @@ def checkpoint_metadata(
         "best_val_aggregate_rmse_deg": best_rmse,
         "best_validation": best_validation,
         "train_manifest": str(train_manifest.path.resolve()),
+        "train_manifest_sha256": sha256_file(train_manifest.path),
         "val_manifest": str(val_manifest.path.resolve()),
+        "val_manifest_sha256": sha256_file(val_manifest.path),
         "split": str(split.path.resolve()),
+        "split_sha256": sha256_file(split.path),
         "split_name": split.split_name,
         "train_episodes": list(train_episodes),
         "val_episodes": list(split.val_episodes),
         "normalizer_source": normalizer_source,
+        "normalizer_sha256": sha256_file(args.output_dir.resolve() / "normalizer.safetensors"),
         "expert_checkpoint": args.expert_checkpoint,
         "expert_checkpoint_tensor_digests": dict(decoder.loaded_checkpoint_digests),
         "injection": {
@@ -512,24 +640,76 @@ def checkpoint_metadata(
         "hyperparameters": {
             key: str(value) if isinstance(value, Path) else value for key, value in vars(args).items()
         },
-        "trainable_parameters": sum(
+        "attention_mixer": (
+            {
+                "layers": list(mixer.layers),
+                "architecture": (
+                    "separate non-affine LayerNorm per layer; broadcast learned query; "
+                    "layer-axis multi-head SDPA; projected residual around uniform mean; global learned gain"
+                ),
+                "attn_width": mixer.attn_width,
+                "attn_heads": mixer.num_heads,
+                "trainable_parameters": sum(
+                    parameter.numel() for parameter in mixer.parameters() if parameter.requires_grad
+                ),
+            }
+            if mixer is not None
+            else None
+        ),
+        "expert_trainable_parameters": sum(
             parameter.numel() for parameter in decoder.parameters() if parameter.requires_grad
         ),
-        "frozen_parameters": sum(
+        "expert_frozen_parameters": sum(
             parameter.numel() for parameter in decoder.parameters() if not parameter.requires_grad
         ),
+        "total_trainable_parameters": sum(
+            parameter.numel() for parameter in decoder.parameters() if parameter.requires_grad
+        )
+        + (
+            sum(parameter.numel() for parameter in mixer.parameters() if parameter.requires_grad)
+            if mixer is not None
+            else 0
+        ),
+        "frozen_backbone": True,
         "torch_version": torch.__version__,
         "cuda_version": torch.version.cuda or "unavailable",
         "gpu_name": torch.cuda.get_device_name(0) if torch.cuda.is_available() else "unavailable",
     }
 
 
-def save_checkpoint(decoder: SmolExpertActionDecoder, path: Path, metadata: dict[str, Any]) -> None:
+def save_checkpoint(
+    decoder: SmolExpertActionDecoder,
+    path: Path,
+    metadata: dict[str, Any],
+    mixer: LTXLayerAttentionMix | None = None,
+) -> None:
     tensors = {
         f"model.{name}": value.detach().cpu().contiguous() for name, value in decoder.state_dict().items()
     }
+    if mixer is not None:
+        tensors.update(
+            {f"mixer.{name}": value.detach().cpu().contiguous() for name, value in mixer.state_dict().items()}
+        )
     save_file(tensors, str(path))
     path.with_suffix(".json").write_text(json.dumps(metadata, indent=2, sort_keys=True) + "\n")
+
+
+def load_joint_checkpoint(
+    decoder: SmolExpertActionDecoder,
+    mixer: LTXLayerAttentionMix,
+    path: Path,
+) -> None:
+    tensors = load_file(str(path), device="cpu")
+    decoder_state = {
+        key.removeprefix("model."): value for key, value in tensors.items() if key.startswith("model.")
+    }
+    mixer_state = {
+        key.removeprefix("mixer."): value for key, value in tensors.items() if key.startswith("mixer.")
+    }
+    if len(decoder_state) + len(mixer_state) != len(tensors):
+        raise ValueError("joint checkpoint contains unrecognized tensor keys")
+    decoder.load_state_dict(decoder_state, strict=True)
+    mixer.load_state_dict(mixer_state, strict=True)
 
 
 def train(args: argparse.Namespace) -> Path:
@@ -549,6 +729,10 @@ def train(args: argparse.Namespace) -> Path:
             f"train and validation context contracts differ: {train_context_spec!r} != {val_context_spec!r}"
         )
     context_spec = train_context_spec
+    if (args.mixer == "attention") != bool(context_spec.tapped_layers):
+        raise ValueError(
+            "canonical multidepth manifests require --mixer attention, and single-context manifests require --mixer none"
+        )
     split = load_vam_split(args.split.expanduser().resolve(), val_manifest, allow_partial=True)
     train_episodes = (
         tuple(args.train_episodes) if args.train_episodes is not None else tuple(split.train_episodes)
@@ -571,13 +755,25 @@ def train(args: argparse.Namespace) -> Path:
         raise ValueError("both train and validation splits must contain entries")
     train_dataset = build_context_dataset(train_manifest)
     val_dataset = build_context_dataset(val_manifest)
+    mixer = (
+        LTXLayerAttentionMix(
+            context_spec.tapped_layers,
+            hidden_width=context_spec.channels,
+            attn_width=args.attn_width,
+            num_heads=args.attn_heads,
+            seed=args.seed,
+        ).to(device=device, dtype=torch.float32)
+        if args.mixer == "attention"
+        else None
+    )
     for label, dataset, entries in (
         ("train", train_dataset, train_entries),
         ("validation", val_dataset, val_entries),
     ):
         sample = dataset.load_entry(entries[0])
         try:
-            prepare_cached_context(sample.context, context_spec)
+            with torch.no_grad(), autocast_context(device):
+                prepare_model_context(sample.context.to(device=device), context_spec, mixer)
         except ValueError as exc:
             raise ValueError(f"{label} cache sample violates manifest context contract: {exc}") from exc
     normalizer, normalizer_source = compute_training_normalizer(train_dataset, train_entries, train_episodes)
@@ -602,14 +798,30 @@ def train(args: argparse.Namespace) -> Path:
         num_steps=args.num_steps,
         input_channels=context_spec.channels,
     )
-    optimizer, _optimizer_settings = build_optimizer(decoder, args, device)
-    scheduler, _scheduler_settings = build_scheduler(optimizer, args)
+    expert_trainable_parameters = sum(
+        parameter.numel() for parameter in decoder.parameters() if parameter.requires_grad
+    )
+    mixer_trainable_parameters = (
+        sum(parameter.numel() for parameter in mixer.parameters() if parameter.requires_grad)
+        if mixer is not None
+        else 0
+    )
+    total_trainable_parameters = expert_trainable_parameters + mixer_trainable_parameters
+    trainable_model = torch.nn.ModuleList([decoder] + ([mixer] if mixer is not None else []))
+    optimizer, optimizer_settings = build_optimizer(trainable_model, args, device)
+    scheduler, scheduler_settings = build_scheduler(optimizer, args)
+    print(
+        f"EXPERT_TRAINABLE_PARAMETERS={expert_trainable_parameters} "
+        f"MIXER_TRAINABLE_PARAMETERS={mixer_trainable_parameters} "
+        f"TOTAL_TRAINABLE_PARAMETERS={total_trainable_parameters}",
+        flush=True,
+    )
     loader = build_training_loader(
         train_dataset,
         train_entries,
         batch_size=args.batch_size,
         start_microbatch=0,
-        batches=args.max_steps,
+        batches=args.max_steps * args.grad_accum_steps,
         seed=args.seed,
         num_workers=args.num_workers,
         pin_memory=args.pin_memory,
@@ -641,14 +853,20 @@ def train(args: argparse.Namespace) -> Path:
                     "dataset_revision": train_manifest.dataset_revision,
                     "train_stride": train_manifest.stride,
                     "val_stride": val_manifest.stride,
+                    "train_manifest_sha256": sha256_file(train_manifest.path),
+                    "val_manifest_sha256": sha256_file(val_manifest.path),
+                    "split_sha256": sha256_file(split.path),
                     **{
                         key: str(value) if isinstance(value, Path) else value
                         for key, value in vars(args).items()
                     },
                     "train_episodes": list(train_episodes),
-                    "trainable_parameters": sum(
-                        parameter.numel() for parameter in decoder.parameters() if parameter.requires_grad
-                    ),
+                    "mixer_layers": list(context_spec.tapped_layers),
+                    "mixer_trainable_parameters": mixer_trainable_parameters,
+                    "expert_trainable_parameters": expert_trainable_parameters,
+                    "total_trainable_parameters": total_trainable_parameters,
+                    "optimizer": optimizer_settings,
+                    "scheduler": scheduler_settings,
                 },
             )
             wandb_url = str(wandb_run.url)
@@ -663,6 +881,7 @@ def train(args: argparse.Namespace) -> Path:
     stop_reason = "max_steps"
     latest = output_dir / "last.safetensors"
     best = output_dir / "best.safetensors"
+    metrics = (output_dir / "metrics.jsonl").open("w")
     try:
         for step in range(1, args.max_steps + 1):
             if args.max_hours is not None and time.perf_counter() - started >= args.max_hours * 3600:
@@ -670,31 +889,79 @@ def train(args: argparse.Namespace) -> Path:
                 break
             final_step = step
             decoder.train()
+            if mixer is not None:
+                mixer.train()
             optimizer.zero_grad(set_to_none=True)
-            batch = next(iterator)
-            state = batch["state"].to(device=device, dtype=torch.float32)
-            action = batch["action"].to(device=device, dtype=torch.float32)
-            context = prepare_cached_context(
-                batch["context"].to(device=device, dtype=torch.bfloat16), context_spec
-            )
-            padding = batch["padding"].to(device=device)
-            with autocast_context(device):
-                loss = decoder.flow_matching_loss(state, action, context, action_is_pad=padding)
-            if not torch.isfinite(loss).item():
-                raise FloatingPointError("training loss is non-finite")
-            loss.backward()
+            losses: list[float] = []
+            for _accumulation in range(args.grad_accum_steps):
+                batch = next(iterator)
+                state = batch["state"].to(device=device, dtype=torch.float32)
+                action = batch["action"].to(device=device, dtype=torch.float32)
+                raw_context = batch["context"].to(device=device, dtype=torch.bfloat16)
+                padding = batch["padding"].to(device=device)
+                with autocast_context(device):
+                    context = prepare_model_context(raw_context, context_spec, mixer)
+                    loss = decoder.flow_matching_loss(state, action, context, action_is_pad=padding)
+                    scaled_loss = loss / args.grad_accum_steps
+                if not torch.isfinite(scaled_loss).item():
+                    raise FloatingPointError("training loss is non-finite")
+                scaled_loss.backward()
+                losses.append(float(loss.detach().float().item()))
+            if step == 1:
+                assert_finite_nonzero_gradients(decoder, "expert")
+                if mixer is not None:
+                    assert_finite_nonzero_gradients(mixer, "mixer")
             grad_norm = torch.nn.utils.clip_grad_norm_(
-                [parameter for parameter in decoder.parameters() if parameter.requires_grad], args.grad_clip
+                [parameter for parameter in trainable_model.parameters() if parameter.requires_grad],
+                args.grad_clip,
             )
             if not torch.isfinite(torch.as_tensor(grad_norm)).item():
                 raise FloatingPointError("gradient norm is non-finite")
+            expert_grad_norm = torch.linalg.vector_norm(
+                torch.stack(
+                    [
+                        parameter.grad.detach().float().norm()
+                        for parameter in decoder.parameters()
+                        if parameter.requires_grad and parameter.grad is not None
+                    ]
+                )
+            )
+            mixer_grad_norm = (
+                torch.linalg.vector_norm(
+                    torch.stack(
+                        [
+                            parameter.grad.detach().float().norm()
+                            for parameter in mixer.parameters()
+                            if parameter.requires_grad and parameter.grad is not None
+                        ]
+                    )
+                )
+                if mixer is not None
+                else torch.zeros((), device=device)
+            )
+            if (
+                not torch.isfinite(expert_grad_norm).item()
+                or expert_grad_norm.item() <= 0
+                or (
+                    mixer is not None
+                    and (not torch.isfinite(mixer_grad_norm).item() or mixer_grad_norm.item() <= 0)
+                )
+            ):
+                raise FloatingPointError("expert and mixer gradient norms must be finite and nonzero")
             optimizer.step()
             scheduler.step()
             record: dict[str, float | int] = {
                 "step": step,
-                "train_loss": float(loss.detach().float().item()),
+                "train_loss": sum(losses) / len(losses),
                 "learning_rate": float(optimizer.param_groups[0]["lr"]),
                 "grad_norm": float(torch.as_tensor(grad_norm).item()),
+                "expert_grad_norm": float(expert_grad_norm.item()),
+                "mixer_grad_norm": float(mixer_grad_norm.item()),
+                "mixer_trainable_parameters": mixer_trainable_parameters,
+                "expert_trainable_parameters": expert_trainable_parameters,
+                "total_trainable_parameters": total_trainable_parameters,
+                "effective_batch_size": args.batch_size * args.grad_accum_steps,
+                "peak_vram_bytes": int(torch.cuda.max_memory_allocated()),
                 "wall_clock_seconds": time.perf_counter() - started,
             }
             should_validate = step % args.val_every == 0 or step == args.max_steps
@@ -702,6 +969,7 @@ def train(args: argparse.Namespace) -> Path:
             if should_validate:
                 validation = evaluate_validation(
                     decoder,
+                    mixer,
                     val_dataset,
                     val_entries,
                     split,
@@ -733,6 +1001,7 @@ def train(args: argparse.Namespace) -> Path:
                 if improved and not args.no_save_checkpoints:
                     metadata = checkpoint_metadata(
                         decoder,
+                        mixer,
                         step=step,
                         best_step=best_step,
                         best_rmse=best_rmse,
@@ -745,7 +1014,7 @@ def train(args: argparse.Namespace) -> Path:
                         normalizer_source=normalizer_source,
                         context_spec=context_spec,
                     )
-                    save_checkpoint(decoder, best, metadata)
+                    save_checkpoint(decoder, best, metadata, mixer)
                 if bad_validations >= args.patience:
                     print(f"early stopping at step={step}", flush=True)
                     stop_reason = "validation_plateau"
@@ -758,9 +1027,12 @@ def train(args: argparse.Namespace) -> Path:
                 )
             if wandb_run is not None:
                 wandb_run.log(record, step=step)
+            metrics.write(json.dumps(record, sort_keys=True) + "\n")
+            metrics.flush()
             if not args.no_save_checkpoints and should_validate:
                 metadata = checkpoint_metadata(
                     decoder,
+                    mixer,
                     step=step,
                     best_step=best_step,
                     best_rmse=best_rmse,
@@ -774,12 +1046,29 @@ def train(args: argparse.Namespace) -> Path:
                     context_spec=context_spec,
                 )
                 metadata["checkpoint_kind"] = "last"
-                save_checkpoint(decoder, latest, metadata)
+                save_checkpoint(decoder, latest, metadata, mixer)
             if should_stop:
                 break
     finally:
+        metrics.close()
         if wandb_run is not None:
             wandb_run.finish()
+    if not args.no_save_checkpoints:
+        for metadata_path in (best.with_suffix(".json"), latest.with_suffix(".json")):
+            if metadata_path.is_file():
+                metadata = json.loads(metadata_path.read_text())
+                metadata.update(
+                    {
+                        "stop_reason": stop_reason,
+                        "final_step": final_step,
+                        "best_step": best_step,
+                        "best_val_aggregate_rmse_deg": best_rmse,
+                        "best_validation": best_validation,
+                        "wall_clock_seconds": time.perf_counter() - started,
+                        "wandb_url": wandb_url,
+                    }
+                )
+                metadata_path.write_text(json.dumps(metadata, indent=2, sort_keys=True) + "\n")
     if args.no_save_checkpoints:
         print("checkpoints: disabled by --no-save-checkpoints", flush=True)
     else:
@@ -797,6 +1086,14 @@ def train(args: argparse.Namespace) -> Path:
         "bad_validations_at_stop": bad_validations,
         "patience": args.patience,
         "min_delta": args.min_delta,
+        "mixer": args.mixer,
+        "mixer_trainable_parameters": mixer_trainable_parameters,
+        "expert_trainable_parameters": expert_trainable_parameters,
+        "total_trainable_parameters": total_trainable_parameters,
+        "train_manifest_sha256": sha256_file(train_manifest.path),
+        "val_manifest_sha256": sha256_file(val_manifest.path),
+        "split_sha256": sha256_file(split.path),
+        "expert_checkpoint_tensor_digests": dict(decoder.loaded_checkpoint_digests),
         "context": {
             "backbone": context_spec.backbone,
             "transform": context_spec.model_transform,
@@ -804,6 +1101,9 @@ def train(args: argparse.Namespace) -> Path:
             "channels": context_spec.channels,
             "train_stride": train_manifest.stride,
             "val_stride": val_manifest.stride,
+            "tapped_layers": list(context_spec.tapped_layers),
+            "attention_width": mixer.attn_width if mixer is not None else None,
+            "attention_heads": mixer.num_heads if mixer is not None else None,
         },
     }
     (output_dir / "result.json").write_text(json.dumps(result, indent=2, sort_keys=True) + "\n")

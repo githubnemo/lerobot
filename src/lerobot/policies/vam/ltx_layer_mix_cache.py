@@ -99,6 +99,11 @@ class LTXLayerMixCacheItem:
     provenance: dict[str, Any]
     entry: CacheManifestEntry | None = None
 
+    @property
+    def context(self) -> torch.Tensor:
+        """Expose aligned layers to generic cache collators as ``[B, L, N, C]``."""
+        return torch.stack([self.contexts[layer] for layer in LTX_LAYER_PROBE_DEPTHS], dim=1)
+
 
 def context_key(layer: int) -> str:
     if layer not in LTX_LAYER_PROBE_DEPTHS:

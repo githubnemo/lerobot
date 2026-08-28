@@ -1836,3 +1836,24 @@ Trainer fixed-probe validation plateaued at step 71,000 (1.68 h; patience 10, mi
 ## 2026-08-26 — LTX-2.5 unpooled + pretrained SmolVLA expert
 
 Trainer fixed-probe validation plateaued at step 55,000 (3.68 h; patience 10, min-delta 0.02). Best step 45,000: full-30 masked RMSE 13.8418°, executed h=1 4.5548°, first-five per-step mean 6.2358°. Context was none with 2,400x4,096; train/val stride 3/20. Confound: none; disk guard retained the full stride-3 train cache. W&B: https://wandb.ai/hubnemo-hugging-face/video-vam-world2action/runs/3rypmjug
+
+<!-- ltx-layer-probe-20260826 -->
+
+## 2026-08-26 — LTX depth-selection probe
+
+Captured blocks 8/14/20/26/34/40 in one frozen LTX pass through block 40,
+pool2-reduced each aligned grid to 640 tokens, and trained a non-attention scalar
+mix with separate non-affine LayerNorms and one global gain ahead of the native
+World2Action head. The best full mix reached 15.088°
+full-30 RMSE, 6.794° at h=1, and
+8.771° over the first five actions.
+Block 40 had the largest converged scalar weight; the top-two set was
+[34, 40]. The isolated top-1/top-2 confirmations scored
+16.029° and
+15.288° full-30, respectively.
+
+On the same real prompt/window and persistent FP8-cast CPU-streaming path, tapping
+to block 40 cost 15.9% more total extraction time
+and 17.1% more transformer time than the
+single block-34 default. This is a pool2 + World2Action ranking experiment, not
+evidence that the learned scalar weights are causal importance scores.

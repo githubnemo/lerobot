@@ -361,3 +361,56 @@ steps, and plateau patience 10 with a `0.02°` min-delta. The safety caps are
 `best.safetensors` and `last.safetensors` are retained; optimizer state is not
 serialized. Validation reports the historical global masked full-30 RMSE
 unchanged, plus h=1 RMSE and the mean of per-step RMSE over h=1..5.
+
+<!-- ltx-layer-probe-20260826 -->
+
+## Multi-depth layer-selection result (2026-08-26)
+
+This probe used the canonical five-frame input, nine-frame causal VAE prefix,
+two clean plus six sigma-1 noise latent frames, real Gemma-4 prompt artifact,
+persistent FP8-cast CPU streaming, and one transformer prefix through block 40.
+All six tapped grids were independently pool2-reduced to `[1,640,4096]`. The
+consumer applied a separate non-affine LayerNorm per layer, a learned scalar
+softmax, and one global learned gain before the unchanged 4096-to-2048 adapter
+and native World2Action decoder.
+
+| block | best softmax weight |    mean ` |     | weight \* LN(h) |     | `   |
+| ----: | ------------------: | --------: | --- | --------------- | --- | --- |
+|     8 |            0.140067 |  8.964307 |
+|    14 |            0.138605 |  8.870725 |
+|    20 |            0.147567 |  9.444263 |
+|    26 |            0.187185 | 11.979851 |
+|    34 |            0.187666 | 12.010623 |
+|    40 |            0.198910 | 12.730214 |
+
+Best mix validation: 15.088° full-30,
+6.794° h=1, and
+8.771° first-5. Confirmation
+with only block 40 scored 16.029°;
+the top-two blocks [34, 40] scored 15.288°.
+The confirmation runs, not attention mass or scalar weights alone, determine
+whether the ranking holds.
+
+Block-40 multi-tapping added 15.9% total extraction
+time (17.1% transformer-only) relative to the
+established block-34 path. Layer-34 outputs agreed with the single-layer path at
+cosine 1.0024298, max absolute 0.
+
+Exact commands:
+
+```bash
+.venv/bin/python -m scripts.video_vam.benchmark_ltx_layer_mix \
+  --output /home/anton/.cache/video-vam/runs/ltx25-layer-probe-20260826/extraction-cost.json
+.venv/bin/python -m scripts.video_vam.build_ltx_layer_mix_cache \
+  --train-output-dir /home/anton/.cache/video-vam/ltx25-layer-probe-train0-31-stride3-pool2 \
+  --val-output-dir /home/anton/.cache/video-vam/ltx25-layer-probe-val32-39-stride20-pool2 \
+  --train-stride 3 --val-stride 20 --context-transform pool2 --min-free-gib 20 --seed 0 --resume
+.venv/bin/python -m scripts.video_vam.train_ltx_layer_mix \
+  --context-transform pool2 --layers 8,14,20,26,34,40 --output-dir /home/anton/.cache/video-vam/runs/ltx25-layer-probe-20260826/mix \
+  --max-steps 200000 --max-hours 72 --val-every 300 --patience 20
+.venv/bin/python -m scripts.video_vam.train_ltx_layer_mix \
+  --context-transform pool2 --layers 40 --output-dir /home/anton/.cache/video-vam/runs/ltx25-layer-probe-20260826/top1 --max-steps 30000 --patience 10
+.venv/bin/python -m scripts.video_vam.train_ltx_layer_mix \
+  --context-transform pool2 --layers 34,40 --output-dir /home/anton/.cache/video-vam/runs/ltx25-layer-probe-20260826/top2 \
+  --max-steps 30000 --patience 10
+```
