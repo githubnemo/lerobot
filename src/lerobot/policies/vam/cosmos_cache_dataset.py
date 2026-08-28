@@ -299,7 +299,19 @@ def _validate_payload(
             raise CosmosFeatureCacheManifestError(
                 "manifest provenance.context_grid has invalid dimensions or order"
             )
-        spec = context_transform_spec(transform)
+        input_grid = provenance.get("context_input_grid")
+        if isinstance(input_grid, Mapping) and type(input_grid.get("temporal")) is int:
+            temporal_frames = input_grid["temporal"]
+        elif transform == "gen_frames_pool2":
+            temporal_frames = grid["temporal"] + 2
+        else:
+            temporal_frames = grid["temporal"]
+        try:
+            spec = context_transform_spec(transform, temporal_frames=temporal_frames)
+        except ValueError as exc:
+            raise CosmosFeatureCacheManifestError(
+                "manifest provenance context transform has an invalid input grid"
+            ) from exc
         if (grid["temporal"], grid["height"], grid["width"]) != spec.output_grid or provenance[
             "context_tokens"
         ] != spec.output_tokens:

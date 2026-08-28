@@ -105,6 +105,9 @@ class RPCApplication:
 
             config = VideoVAMConfig.from_pretrained(args.checkpoint)
             config.device = str(self.device)
+            config.cosmos_torch_compile = args.compile
+            if args.compile:
+                config.cosmos_compile_friendly = True
             if args.joint_limits_min is not None:
                 config.joint_limits_min = args.joint_limits_min
                 config.joint_limits_max = args.joint_limits_max
@@ -244,6 +247,12 @@ def main(argv: list[str] | None = None) -> int:
         help="RTC leftover prefix length (overridable per request)",
     )
     parser.add_argument("--max-guidance-weight", type=float, default=10.0)
+    parser.add_argument(
+        "--compile",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="torch.compile the Cosmos DiT with max-autotune (default). Pass --no-compile for eager.",
+    )
     args = parser.parse_args(argv)
     if args.execution_horizon < 1:
         parser.error("--execution-horizon must be >= 1")

@@ -64,6 +64,7 @@ ARM_CHOICES = (
     "compile_regional",
     "compile_regional_max",
     "fp8",
+    "fp8_te_linear",
     "vae_prefix",
     "int8",
     "int8_no_compile",
@@ -368,6 +369,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--sigma", type=float, default=10.0)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument(
+        "--state-t",
+        type=int,
+        choices=(2, 16),
+        default=16,
+        help="Cosmos DiT temporal state: 2 observed-only frames or the default 16-frame state.",
+    )
+    parser.add_argument(
         "--vae-input-mode",
         choices=VAE_INPUT_MODES,
         default=VAE_INPUT_MODE_LEGACY_PADDED,
@@ -404,6 +412,10 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError(f"unknown VAE input mode {args.vae_input_mode!r}")
     if args.arm == "vae_prefix" and args.vae_input_mode != VAE_INPUT_MODE_LEGACY_PADDED:
         raise ValueError("--arm vae_prefix requires --vae-input-mode legacy_padded_vae")
+    if args.arm == "vae_prefix" and args.state_t != 16:
+        raise ValueError("--arm vae_prefix requires --state-t 16")
+    if args.state_t not in (2, 16):
+        raise ValueError("--state-t must be 2 or 16")
     if args.arm == "expert_compile" and args.no_decoder:
         raise ValueError("--arm expert_compile requires the SmolVLA decoder")
     if args.arm == "expert_compile" and args.decoder_steps != EXPERT_COMPILE_STEPS:
@@ -768,6 +780,12 @@ def _prepare_arm_backbone(backbone: nn.Module, arm: str) -> tuple[nn.Module, dic
         }
     if arm == "fp8":
         return _make_fp8_backbone(backbone)
+    if arm == "fp8_te_linear":
+        return backbone, {
+            "implemented": True,
+            "component": "Cosmos DiT Transformer Engine Linear modules",
+            "strategy": "TE Linear replacement with delayed-scaling autocast",
+        }
     if arm in QUANTIZATION_ARMS:
         raise ValueError(f"quantization arm {arm!r} must be prepared before this branch")
     if arm == "cuda_graph":
@@ -2154,6 +2172,7 @@ def _load_extractor(
     *,
     use_cuda_graphs: bool = False,
     compile_friendly: bool = False,
+    fp8_linear: bool = False,
 ) -> tuple[CosmosPredict2Extractor, float]:
     config = CosmosPredict2ExtractorConfig(
         checkpoint_path=args.checkpoint.expanduser(),
@@ -2162,6 +2181,8 @@ def _load_extractor(
         dtype="bfloat16",
         high_noise_sigma=args.sigma,
         seed=args.seed,
+        state_t=args.state_t,
+        fp8_linear=fp8_linear,
         hidden_layer=20,
         stop_after_step=0,
         attention_backend=args.attention_backend,
@@ -2247,6 +2268,7 @@ def _measure_arm(
         args,
         device,
         compile_friendly=arm in COMPILE_ARMS or arm in QUANTIZATION_ARMS,
+        fp8_linear=arm == "fp8_te_linear",
     )
     if arm == "vae_prefix":
         measured = _measure_vae_prefix(
@@ -2421,7 +2443,7 @@ def benchmark(args: argparse.Namespace) -> tuple[dict[str, Any], bool]:
     images = prepared.rgb_history
     state = prepared.state.to(device=device, dtype=torch.float32) if not args.no_decoder else None
     sigma = torch.full((1,), args.sigma, device=device, dtype=torch.float32)
-    correctness_noise = arch_invariant_rand((images.shape[0], 16, 16, 60, 80), args.seed).to(
+    correctness_noise = arch_invariant_rand((images.shape[0], 16, args.state_t, 60, 80), args.seed).to(
         device=device, dtype=torch.bfloat16
     )
     reference_context, reference_load_seconds = _load_eager_te_reference(
@@ -2511,13 +2533,18 @@ def benchmark(args: argparse.Namespace) -> tuple[dict[str, Any], bool]:
         "attention_backend": args.attention_backend,
         "hidden_layer": 20,
         "video_frames": 61,
-        "pool2_shape": [1, 4800, 2048],
+        "pool2_shape": [1, args.state_t * 15 * 20, 2048],
         "sigma": args.sigma,
+        "state_t": args.state_t,
         "vae_input_mode": args.vae_input_mode,
         "semantic_contract": (
-            "5 observed frames -> 2 latent prefix -> zero-expand to 16 -> VAE/DiT layer 20 -> pool2"
-            if args.vae_input_mode == "observed_prefix"
-            else "5 observed frames -> 61 padded frames -> VAE -> DiT layer 20 -> pool2"
+            "5 observed frames -> 2 latent frames -> observed-only DiT state_t=2 -> pool2"
+            if args.state_t == 2
+            else (
+                "5 observed frames -> 2 latent prefix -> zero-expand to 16 -> VAE/DiT layer 20 -> pool2"
+                if args.vae_input_mode == "observed_prefix"
+                else "5 observed frames -> 61 padded frames -> VAE -> DiT layer 20 -> pool2"
+            )
         ),
     }
     configuration = {
@@ -2534,6 +2561,7 @@ def benchmark(args: argparse.Namespace) -> tuple[dict[str, Any], bool]:
         "expert_checkpoint": None if args.no_decoder else args.expert_checkpoint,
         "vlm_config": None if args.no_decoder else args.vlm_config,
         "context_transform": "pool2",
+        "state_t": args.state_t,
         "vae_input_mode": args.vae_input_mode,
         "normalization": "SmolVLA MEAN_STD from train episodes 0-31",
         "cudnn_benchmark": bool(args.cudnn_benchmark),

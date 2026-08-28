@@ -85,8 +85,12 @@ class VideoVAMConfig(PreTrainedConfig):
     cosmos_tokenizer: Path = DEFAULT_COSMOS_TOKENIZER
     cosmos_prompt: Path = DEFAULT_COSMOS_PROMPT
     cosmos_attention_backend: str = "minimal_a2a"
-    cosmos_compile_friendly: bool = False
+    cosmos_compile_friendly: bool = True
+    cosmos_torch_compile: bool = True
+    cosmos_compile_mode: str = "max-autotune"
     cosmos_use_cuda_graphs: bool = False
+    cosmos_state_t: int = 16
+    cosmos_fp8_linear: bool = False
 
     ltx_transformer: Path = DEFAULT_LTX_TRANSFORMER
     ltx_vae: Path = DEFAULT_LTX_VAE
@@ -114,6 +118,23 @@ class VideoVAMConfig(PreTrainedConfig):
         self.ltx_prompt = Path(self.ltx_prompt)
         if self.backend not in {"cosmos", "ltx"}:
             raise ValueError("backend must be 'cosmos' or 'ltx'")
+        if self.cosmos_state_t not in (2, 16):
+            raise ValueError("cosmos_state_t must be 2 (observed-only) or 16")
+        if not isinstance(self.cosmos_fp8_linear, bool):
+            raise ValueError("cosmos_fp8_linear must be a boolean")
+        if not isinstance(self.cosmos_torch_compile, bool):
+            raise ValueError("cosmos_torch_compile must be a boolean")
+        if self.cosmos_compile_mode not in {
+            "default",
+            "reduce-overhead",
+            "max-autotune",
+            "max-autotune-no-cudagraphs",
+        }:
+            raise ValueError("cosmos_compile_mode must be a torch.compile mode")
+        if self.cosmos_torch_compile:
+            self.cosmos_compile_friendly = True
+        if self.cosmos_torch_compile and self.cosmos_fp8_linear:
+            raise ValueError("cosmos_torch_compile is incompatible with cosmos_fp8_linear")
         if self.action_feature_names != list(ACTION_NAMES):
             raise ValueError(f"action_feature_names must preserve the trained order {list(ACTION_NAMES)}")
         if self.action_seed < 0 or self.feature_seed_global < 0:

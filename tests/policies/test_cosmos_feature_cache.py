@@ -47,9 +47,16 @@ def make_sample():
 
 
 def make_provenance(
-    context, state, target_action, action_is_pad=None, context_transform=None, vae_input_mode=None
+    context,
+    state,
+    target_action,
+    action_is_pad=None,
+    context_transform=None,
+    vae_input_mode=None,
+    temporal_frames=16,
 ):
     config = CUBE_OUT_OF_BOX_CONTRACT
+    raw_temporal_frames = 2 if temporal_frames == 2 else 16
     if action_is_pad is None:
         action_is_pad = torch.zeros((1, 30), dtype=torch.bool)
     extractor = {
@@ -91,7 +98,7 @@ def make_provenance(
             "sample_action": [30, 6],
             "rgb_history": [1, 3, 5, 480, 640],
             "prompt_embedding": [1, 512, 1024],
-            "raw_hidden": [1, 16, 30, 40, 2048],
+            "raw_hidden": [1, raw_temporal_frames, 30, 40, 2048],
             "context": list(context.shape),
             "state": list(state.shape),
             "target_action": list(target_action.shape),
@@ -137,9 +144,10 @@ def make_provenance(
         state=state,
         target_action=target_action,
         action_is_pad=action_is_pad,
-        raw_hidden_shape=(1, 16, 30, 40, 2048),
+        raw_hidden_shape=(1, raw_temporal_frames, 30, 40, 2048),
         raw_hidden_dtype=torch.bfloat16,
         context_transform=context_transform,
+        temporal_frames=temporal_frames,
     )
 
 
@@ -155,6 +163,34 @@ def make_artifact():
         action_is_pad,
         make_provenance(context, state, target_action, action_is_pad),
     )
+
+
+def test_observed_only_pool2_provenance_roundtrips_with_600_tokens(tmp_path):
+    context = torch.zeros((1, 600, 2048), dtype=torch.bfloat16)
+    state = torch.zeros((1, 1, 6), dtype=torch.float32)
+    target_action = torch.ones((1, 30, 6), dtype=torch.float32)
+    action_is_pad = torch.zeros((1, 30), dtype=torch.bool)
+    artifact = CosmosFeatureCacheArtifact(
+        context,
+        state,
+        target_action,
+        action_is_pad,
+        make_provenance(
+            context,
+            state,
+            target_action,
+            action_is_pad,
+            context_transform="pool2",
+            temporal_frames=2,
+        ),
+    )
+
+    output = tmp_path / "observed-only.safetensors"
+    save_feature_cache(artifact, output)
+    loaded = load_feature_cache(output)
+    payload = loaded.provenance.to_dict()
+    assert payload["output"]["context_grid"]["temporal"] == 2
+    assert payload["output"]["context_tokens"] == 600
 
 
 def test_fake_dataset_defaults_to_first_non_padded_window():

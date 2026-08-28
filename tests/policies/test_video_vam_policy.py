@@ -62,6 +62,16 @@ def _config(**kwargs) -> VideoVAMConfig:
     )
 
 
+def test_cosmos_torch_compile_defaults_on_and_can_be_disabled() -> None:
+    assert _config().cosmos_torch_compile is True
+    assert _config().cosmos_compile_friendly is True
+    disabled = _config(cosmos_torch_compile=False, cosmos_compile_friendly=False)
+    assert disabled.cosmos_torch_compile is False
+    assert disabled.cosmos_compile_friendly is False
+    with pytest.raises(ValueError, match="incompatible"):
+        _config(cosmos_fp8_linear=True)
+
+
 def test_ltx_checkpoint_contract_selects_pool2_or_unpooled_context() -> None:
     action_semantics = {"action_dim": 6, "horizon": 30, "internal_action_dim": 32, "euler_steps": 10}
     for transform, input_shape, expected_shape in (
@@ -87,6 +97,31 @@ def test_ltx_checkpoint_contract_selects_pool2_or_unpooled_context() -> None:
         context = policy._extract_context(torch.zeros(1, 3, 5, 480, 640, dtype=torch.uint8), 1)
         assert policy._ltx_context_transform == transform
         assert tuple(context.shape) == expected_shape
+
+
+def test_cosmos_observed_only_cached_context_checkpoint_contract() -> None:
+    policy = VideoVAMPolicy(
+        _config(cosmos_state_t=2),
+        decoder=_FakeDecoder(torch.zeros(1, 30, 6)),
+        extractor=_FakeExtractor(),
+        prompt_embedding=torch.zeros(1, 2, 3),
+    )
+
+    policy._validate_checkpoint_contract(
+        {
+            "artifact": "smolexpert_on_cached_context_training_checkpoint",
+            "action_semantics": {
+                "action_dim": 6,
+                "horizon": 30,
+                "internal_action_dim": 32,
+                "euler_steps": 10,
+            },
+            "injection": {
+                "stored_context_transform": "pool2",
+                "input_shape": ["B", 600, 2048],
+            },
+        }
+    )
 
 
 def test_cosmos_cached_context_checkpoint_contract() -> None:

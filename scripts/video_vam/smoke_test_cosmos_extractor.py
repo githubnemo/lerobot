@@ -55,9 +55,14 @@ MIMIC_VIDEO_CONDITIONING = (
 )
 
 
-def conditioning_description(vae_input_mode: str) -> str:
+def conditioning_description(vae_input_mode: str, state_t: int = 16) -> str:
     """Describe the selected pixel-to-latent conditioning contract for provenance."""
     if vae_input_mode == VAE_INPUT_MODE_OBSERVED_PREFIX:
+        if state_t == 2:
+            return (
+                "frame_replace, five observed pixel frames -> two latent frames via prefix-only VAE, "
+                "kept as the complete observed-only state; latent_conditional_frames=2"
+            )
         return MIMIC_VIDEO_CONDITIONING
     if vae_input_mode == VAE_INPUT_MODE_LEGACY_PADDED:
         return (
@@ -269,12 +274,18 @@ def validate_extraction_output(
         raise TypeError("Cosmos hidden output must be floating point")
     if not torch.isfinite(hidden).all().item() or not torch.isfinite(context).all().item():
         raise RuntimeError("Cosmos hidden output must contain only finite values")
-    expected_hidden_shape = (batch_size, 16, 30, 40, 2048)
-    expected_context_shape = (batch_size, 19200, 2048)
+    if hidden.ndim != 5 or tuple(hidden.shape[2:]) != (30, 40, 2048):
+        raise ValueError(f"Cosmos hidden shape must be [B, T, 30, 40, 2048], got {tuple(hidden.shape)}")
+    state_t = hidden.shape[1]
+    if state_t not in (2, 16):
+        raise ValueError(f"Cosmos hidden temporal state must be 2 or 16, got {state_t}")
+    expected_hidden_shape = (batch_size, state_t, 30, 40, 2048)
+    expected_context_shape = (batch_size, state_t * 30 * 40, 2048)
     if tuple(hidden.shape) != expected_hidden_shape or tuple(context.shape) != expected_context_shape:
         raise ValueError(
-            "Cosmos output shapes must be raw [B, 16, 30, 40, 2048] and "
-            f"flattened [B, 19200, 2048]; raw={tuple(hidden.shape)}, flattened={tuple(context.shape)}"
+            f"Cosmos output shapes must be raw [B, {state_t}, 30, 40, 2048] and "
+            f"flattened [B, {state_t * 30 * 40}, 2048]; raw={tuple(hidden.shape)}, "
+            f"flattened={tuple(context.shape)}"
         )
     if context.dtype != torch.bfloat16:
         raise TypeError(f"Cosmos context must be bfloat16, got {context.dtype}")
@@ -494,7 +505,7 @@ def smoke(args: argparse.Namespace) -> CosmosFeatureCacheArtifact:
             "vae_input_mode": config.vae_input_mode,
             "input_shape": list(prepared.rgb_history.shape),
             "preprocess": MIMIC_VIDEO_PREPROCESS,
-            "conditioning": conditioning_description(config.vae_input_mode),
+            "conditioning": conditioning_description(config.vae_input_mode, config.state_t),
             "official_resolution": "480",
             "official_positional_latent_max_h": 240,
             "official_positional_latent_max_w": 240,

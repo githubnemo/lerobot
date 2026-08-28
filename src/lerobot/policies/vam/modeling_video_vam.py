@@ -166,9 +166,10 @@ class VideoVAMPolicy(PreTrainedPolicy):
             ):
                 raise ValueError("Cosmos checkpoint must declare pool2 context")
             if not any(
-                injection.get(key) == ["B", 4800, 2048] for key in ("cosmos_input_shape", "input_shape")
+                injection.get(key) in (["B", 4800, 2048], ["B", 600, 2048])
+                for key in ("cosmos_input_shape", "input_shape")
             ):
-                raise ValueError("Cosmos checkpoint input shape must be [B, 4800, 2048]")
+                raise ValueError("Cosmos checkpoint input shape must be [B, 4800, 2048] or [B, 600, 2048]")
         else:
             transform = injection.get("stored_context_transform")
             expected_shapes = {
@@ -200,7 +201,11 @@ class VideoVAMPolicy(PreTrainedPolicy):
                     seed=0,
                     attention_backend=self.config.cosmos_attention_backend,
                     compile_friendly=self.config.cosmos_compile_friendly,
+                    torch_compile=self.config.cosmos_torch_compile,
+                    compile_mode=self.config.cosmos_compile_mode,
                     use_cuda_graphs=self.config.cosmos_use_cuda_graphs,
+                    state_t=self.config.cosmos_state_t,
+                    fp8_linear=self.config.cosmos_fp8_linear,
                     vae_input_mode="observed_prefix",
                 )
             )
@@ -262,7 +267,7 @@ class VideoVAMPolicy(PreTrainedPolicy):
         extraction = self.extractor.extract(images, prompt, noise_seed=feature_seed)
         if self.config.backend == "cosmos":
             context = apply_context_transform(extraction.tokens, "pool2")
-            expected = (1, 4800, 2048)
+            expected = (1, 600 if self.config.cosmos_state_t == 2 else 4800, 2048)
         else:
             from .ltx_action import pool2_ltx_context
 

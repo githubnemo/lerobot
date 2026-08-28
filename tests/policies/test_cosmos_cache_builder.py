@@ -16,6 +16,13 @@ def test_builder_accepts_episode_zero_and_bounded_subset():
     assert args.episodes == [0]
     assert args.max_samples == 4
     assert args.vae_input_mode == "observed_prefix"
+    assert args.state_t == 16
+
+
+def test_builder_accepts_observed_only_state_t2():
+    args = parse_args(["--episodes", "0", "--state-t", "2"])
+    _validate_args(args)
+    assert args.state_t == 2
 
 
 def test_builder_accepts_explicit_legacy_vae_mode():

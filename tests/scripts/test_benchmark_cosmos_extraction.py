@@ -92,6 +92,9 @@ def test_parse_args_exposes_arms_and_safe_sampling_defaults():
     assert "train-converge" in str(args.normalizer)
     assert args.expert_checkpoint == "lerobot/smolvla_base"
     assert args.vlm_config == "HuggingFaceTB/SmolVLM2-500M-Video-Instruct"
+    fp8_args = parse_args(["--arm", "fp8_te_linear", "--state-t", "2"])
+    validate_args(fp8_args)
+    assert fp8_args.state_t == 2
 
 
 def test_load_decoder_uses_trainer_constructor_and_custom_artifact(tmp_path, monkeypatch):

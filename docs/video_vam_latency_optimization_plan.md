@@ -334,7 +334,13 @@ rounding, while the native RoPE replacement keeps its FP32 multiply-accumulate
 before the final BF16 cast. The extractor exposes this as the opt-in
 `CosmosPredict2ExtractorConfig.compile_friendly=True` variant; the benchmark
 selects it automatically for the four compile arms. Plain linear layers already
-remain ordinary `torch.nn.Linear` modules with checkpoint weights preserved.
+remain ordinary `torch.nn.Linear` modules with checkpoint weights preserved. The historical `fp8` arm
+therefore wrapped ordinary Linear execution in FP8 autocast without converting its GEMMs to TE FP8
+Linear modules; it did not provide real Linear-FP8 acceleration.
+
+The 2–4x path is the observed-only `state_t=2` Cosmos DiT contract: 2,400 tokens instead of 19,200,
+followed by a pool2 context of 600 tokens. This changes the representation, so the Smol expert must be
+retrained on the new 600-token pool2 context before it can be used for rollout.
 
 The winning arm is therefore `compile_max` for the DiT stage: it clears the
 correctness gate and exceeds the `1.15x` target. It is not a `1.15x` whole-pipeline

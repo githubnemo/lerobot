@@ -483,12 +483,17 @@ def _validate_provenance(payload: Mapping[str, Any]) -> dict[str, Any]:
             or grid["flatten_order"] != "T,H,W"
         ):
             raise CosmosFeatureCacheValidationError("output.context_grid has invalid dimensions or order")
-        expected_grid = context_transform_spec(transform).output_grid
+        raw_hidden_shape = output["raw_hidden_shape"]
+        temporal_frames = raw_hidden_shape[1] if len(raw_hidden_shape) >= 2 else grid["temporal"]
+        if temporal_frames not in (2, 16):
+            temporal_frames = grid["temporal"] + 2 if transform == "gen_frames_pool2" else grid["temporal"]
+        expected_spec = context_transform_spec(transform, temporal_frames=temporal_frames)
+        expected_grid = expected_spec.output_grid
         if (grid["temporal"], grid["height"], grid["width"]) != expected_grid:
             raise CosmosFeatureCacheValidationError(
                 "output.context_grid does not match output.context_transform"
             )
-        if output["context_tokens"] != context_transform_spec(transform).output_tokens:
+        if output["context_tokens"] != expected_spec.output_tokens:
             raise CosmosFeatureCacheValidationError(
                 "output.context_tokens does not match output.context_transform"
             )
@@ -569,6 +574,7 @@ def build_feature_cache_provenance(
     raw_hidden_shape: tuple[int, ...] | list[int],
     raw_hidden_dtype: torch.dtype,
     context_transform: str | None = None,
+    temporal_frames: int = 16,
 ) -> CosmosFeatureCacheProvenance:
     """Build output/hash provenance after validating the candidate tensors."""
     validate_cache_tensors(context, state, target_action, action_is_pad)
@@ -594,7 +600,7 @@ def build_feature_cache_provenance(
         "action_is_pad_sha256": tensor_sha256(action_is_pad),
     }
     if context_transform is not None:
-        spec = context_transform_spec(context_transform)
+        spec = context_transform_spec(context_transform, temporal_frames=temporal_frames)
         if context.shape[1] != spec.output_tokens:
             raise CosmosFeatureCacheValidationError("context token count does not match context_transform")
         output.update(

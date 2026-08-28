@@ -45,7 +45,7 @@ class FakeBackbone(nn.Module):
         self.grad_enabled = torch.is_grad_enabled()
         self.seen = kwargs
         x = kwargs["x_B_C_T_H_W"]
-        hidden = torch.zeros(x.shape[0], 16, 30, 40, 2048, device=x.device, dtype=x.dtype)
+        hidden = torch.zeros(x.shape[0], x.shape[2], 30, 40, 2048, device=x.device, dtype=x.dtype)
         hidden.requires_grad_()
         return None, [hidden for _ in range(21)]
 
@@ -143,6 +143,43 @@ def test_extract_contract_layout_and_metadata():
     assert torch.allclose(timesteps[:, :2], torch.full((1, 2), 0.0001 / 1.0001))
     assert torch.allclose(timesteps[:, 2:], torch.full((1, 14), 10.0 / 11.0))
     assert backbone.grad_enabled is False
+
+
+def test_observed_only_state_t2_does_not_pad_future_latents():
+    config = CosmosPredict2ExtractorConfig(
+        checkpoint_path="/not-loaded/backbone.pt",
+        tokenizer_path="/not-loaded/tokenizer.pth",
+        device="cpu",
+        dtype=torch.float32,
+        state_t=2,
+    )
+    extractor = CosmosPredict2Extractor(config, backbone=FakeBackbone(), tokenizer=FakeTokenizer())
+    output = extractor.extract(
+        torch.full((1, 3, 5, 480, 640), 128, dtype=torch.uint8),
+        torch.zeros(1, 512, 1024),
+    )
+
+    assert extractor.tokenizer.seen_shape == (1, 3, 5, 480, 640)
+    assert extractor.backbone.seen["x_B_C_T_H_W"].shape == (1, 16, 2, 60, 80)
+    assert extractor.backbone.seen["x_B_C_T_H_W"].eq(0.25).all()
+    assert extractor.backbone.seen["condition_video_input_mask_B_C_T_H_W"].eq(1).all()
+    timesteps = extractor.backbone.seen["timesteps_B_T"]
+    assert timesteps.shape == (1, 2)
+    assert torch.allclose(timesteps, torch.full((1, 2), 0.0001 / 1.0001))
+    assert output.hidden_grid.shape == (1, 2, 30, 40, 2048)
+    assert output.tokens.shape == (1, 2400, 2048)
+    assert output.grid_shape == (2, 30, 40)
+    assert output.provenance.state_t == 2
+    assert output.provenance.fp8_linear is False
+
+
+def test_state_t_must_be_two_or_sixteen():
+    with pytest.raises(ValueError, match="state_t"):
+        CosmosPredict2ExtractorConfig(
+            checkpoint_path="/not-loaded/backbone.pt",
+            tokenizer_path="/not-loaded/tokenizer.pth",
+            state_t=8,
+        )
 
 
 def test_legacy_padded_vae_restores_full_pixel_input():
@@ -447,3 +484,37 @@ def test_compile_friendly_rmsnorm_matches_torch_reference():
     expected = torch.rms_norm(input_tensor, [8], norm.weight, norm.eps)
 
     assert torch.equal(norm(input_tensor), expected)
+
+
+def test_torch_compile_rejects_fp8_linear() -> None:
+    with pytest.raises(ValueError, match="incompatible"):
+        CosmosPredict2ExtractorConfig(
+            checkpoint_path="/not-loaded/backbone.pt",
+            tokenizer_path="/not-loaded/tokenizer.pth",
+            torch_compile=True,
+            fp8_linear=True,
+        )
+
+
+def test_torch_compile_on_cpu_fakes_does_not_wrap_backbone() -> None:
+    config = CosmosPredict2ExtractorConfig(
+        checkpoint_path="/not-loaded/backbone.pt",
+        tokenizer_path="/not-loaded/tokenizer.pth",
+        device="cpu",
+        dtype=torch.float32,
+        torch_compile=True,
+    )
+    extractor = CosmosPredict2Extractor(config, backbone=FakeBackbone(), tokenizer=FakeTokenizer())
+    assert config.compile_friendly is True
+    assert type(extractor.backbone) is FakeBackbone
+
+
+def test_torch_compile_can_be_disabled() -> None:
+    config = CosmosPredict2ExtractorConfig(
+        checkpoint_path="/not-loaded/backbone.pt",
+        tokenizer_path="/not-loaded/tokenizer.pth",
+        torch_compile=False,
+        compile_friendly=False,
+    )
+    assert config.torch_compile is False
+    assert config.compile_friendly is False

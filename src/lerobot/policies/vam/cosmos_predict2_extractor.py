@@ -64,6 +64,8 @@ class CosmosPredict2ExtractorConfig:
     backend: str = BACKEND_NAME
     attention_backend: str = BACKEND_NAME
     compile_friendly: bool = False
+    torch_compile: bool = False
+    compile_mode: str = "max-autotune"
     use_cuda_graphs: bool = False
     sac_mode: str = "predict2_2b_720"
     vae_input_mode: str = VAE_INPUT_MODE_OBSERVED_PREFIX
@@ -74,6 +76,7 @@ class CosmosPredict2ExtractorConfig:
     latent_channels: int = 16
     latent_conditional_frames: int = 2
     state_t: int = 16
+    fp8_linear: bool = False
     latent_height: int = 60
     latent_width: int = 80
     token_height: int = 30
@@ -104,8 +107,23 @@ class CosmosPredict2ExtractorConfig:
             )
         if not isinstance(self.compile_friendly, bool):
             raise ValueError("compile_friendly must be a boolean")
+        if not isinstance(self.torch_compile, bool):
+            raise ValueError("torch_compile must be a boolean")
+        if self.compile_mode not in {
+            "default",
+            "reduce-overhead",
+            "max-autotune",
+            "max-autotune-no-cudagraphs",
+        }:
+            raise ValueError("compile_mode must be a torch.compile mode")
+        if self.torch_compile:
+            object.__setattr__(self, "compile_friendly", True)
+        if self.torch_compile and self.fp8_linear:
+            raise ValueError("torch_compile is incompatible with fp8_linear")
         if not isinstance(self.use_cuda_graphs, bool):
             raise ValueError("use_cuda_graphs must be a boolean")
+        if not isinstance(self.fp8_linear, bool):
+            raise ValueError("fp8_linear must be a boolean")
         if self.vae_input_mode not in VAE_INPUT_MODES:
             raise ValueError(
                 "vae_input_mode must be one of " + ", ".join(repr(value) for value in VAE_INPUT_MODES)
@@ -118,8 +136,12 @@ class CosmosPredict2ExtractorConfig:
             or (self.input_height, self.input_width) != (480, 640)
         ):
             raise ValueError("The frozen extractor observed input must be T=1 or T=5 at 480x640")
-        if self.latent_conditional_frames != 2 or self.state_t != 16:
-            raise ValueError("The frozen extractor requires two conditional latent frames and state_t=16")
+        if self.latent_conditional_frames != 2:
+            raise ValueError("The frozen extractor requires exactly two conditional latent frames")
+        if self.state_t not in (2, 16):
+            raise ValueError("state_t must be 2 (observed-only) or 16 (observed prefix plus future)")
+        if self.state_t == 2 and self.input_frames != 5:
+            raise ValueError("state_t=2 observed-only extraction requires input_frames=5")
         if self.sigma_data != 1.0 or self.sigma_conditional <= 0:
             raise ValueError("The frozen extractor requires sigma_data=1 and positive sigma_conditional")
 
@@ -139,8 +161,12 @@ class CosmosPredict2Provenance:
     random_init_seed: int | None = None
     attention_backend: str = BACKEND_NAME
     compile_friendly: bool = False
+    torch_compile: bool = False
+    compile_mode: str = "max-autotune"
     use_cuda_graphs: bool = False
     vae_input_mode: str = VAE_INPUT_MODE_OBSERVED_PREFIX
+    state_t: int = 16
+    fp8_linear: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -197,6 +223,48 @@ def _freeze_module(module: Any) -> None:
         if isinstance(candidate, nn.Module):
             candidate.eval()
             candidate.requires_grad_(False)
+
+
+def _load_fp8_linear_components() -> tuple[Any, Any]:
+    """Load the optional TE Linear and delayed-scaling recipe lazily."""
+    try:
+        import transformer_engine.pytorch as te
+        from transformer_engine.common.recipe import DelayedScaling, Format
+
+        if not callable(getattr(te, "Linear", None)):
+            raise ImportError("transformer_engine.pytorch.Linear is unavailable")
+        if not callable(getattr(te, "autocast", None)):
+            raise ImportError("transformer_engine.pytorch.autocast is unavailable")
+        recipe = DelayedScaling(fp8_format=Format.HYBRID, amax_history_len=16, amax_compute_algo="max")
+    except Exception as exc:  # noqa: BLE001 - optional CUDA dependency is machine-specific
+        raise CosmosPredict2BackendError(
+            "fp8_linear=True requires Transformer Engine with pytorch.Linear and "
+            f"autocast; failed to initialize it: {exc}"
+        ) from exc
+    return te, recipe
+
+
+def _replace_linear_modules(module: nn.Module, te: Any) -> int:
+    """Replace every ordinary Linear child with an equivalent TE Linear."""
+    replacements = 0
+    for name, child in list(module.named_children()):
+        if isinstance(child, nn.Linear):
+            replacement = te.Linear(
+                child.in_features,
+                child.out_features,
+                bias=child.bias is not None,
+                params_dtype=child.weight.dtype,
+                device=child.weight.device,
+            )
+            with torch.no_grad():
+                replacement.weight.copy_(child.weight)
+                if child.bias is not None:
+                    replacement.bias.copy_(child.bias)
+            setattr(module, name, replacement)
+            replacements += 1
+        else:
+            replacements += _replace_linear_modules(child, te)
+    return replacements
 
 
 @torch.library.custom_op("lerobot::cosmos_rms_norm", mutates_args=())
@@ -424,6 +492,7 @@ class CosmosPredict2Extractor:
         self.dtype = _resolve_dtype(config.dtype)
         if (backbone is None) != (tokenizer is None):
             raise ValueError("Inject both backbone and tokenizer, or neither")
+        official = backbone is None
         if backbone is None:
             backbone, tokenizer, ignored_metadata_keys = self._build_official_components()
         else:
@@ -431,10 +500,23 @@ class CosmosPredict2Extractor:
         self._checkpoint_ignored_metadata_keys = tuple(ignored_metadata_keys)
         self.backbone = backbone
         self.tokenizer = tokenizer
+        self._fp8_te = None
+        self._fp8_recipe = None
+        if self.config.fp8_linear:
+            self._fp8_te, self._fp8_recipe = _load_fp8_linear_components()
+            _replace_linear_modules(self.backbone, self._fp8_te)
         if self.config.compile_friendly:
             make_compile_friendly_backbone(self.backbone)
         _freeze_module(self.backbone)
         _freeze_module(self.tokenizer)
+        if self.config.torch_compile and official and self.device.type == "cuda":
+            if not hasattr(torch, "compile"):
+                raise CosmosPredict2BackendError("torch.compile is unavailable in this PyTorch build")
+            self.backbone = torch.compile(
+                self.backbone,
+                mode=self.config.compile_mode,
+                fullgraph=True,
+            )
 
     def _build_official_components(self) -> tuple[nn.Module, Any, tuple[str, ...]]:
         if self.device.type != "cuda":
@@ -596,6 +678,10 @@ class CosmosPredict2Extractor:
                 f"{tuple(latent.shape) if isinstance(latent, torch.Tensor) else type(latent)}"
             )
         latent = latent.to(device=self.device, dtype=self.dtype)
+        if self.config.state_t == 2:
+            if observed_latent_frames != self.config.state_t:
+                raise ValueError("state_t=2 observed-only extraction requires two observed latent frames")
+            return latent
         full = torch.zeros(expected_full, device=self.device, dtype=self.dtype)
         full[:, :, :observed_latent_frames] = latent
         return full
@@ -620,13 +706,25 @@ class CosmosPredict2Extractor:
             self.config.latent_height,
             self.config.latent_width,
         )
-        if tuple(latent.shape) not in (expected_prefix, expected_full):
+        legacy_full = (
+            images.shape[0],
+            self.config.latent_channels,
+            1 + (self.config.video_frames - 1) // 4,
+            self.config.latent_height,
+            self.config.latent_width,
+        )
+        accepted_shapes = (expected_prefix, expected_full)
+        if self.config.state_t == 2:
+            accepted_shapes += (legacy_full,)
+        if tuple(latent.shape) not in accepted_shapes:
             raise ValueError(
                 f"tokenizer output must have shape {expected_prefix} or {expected_full}, got {tuple(latent.shape)}"
             )
         latent = latent.to(device=self.device, dtype=self.dtype)
         if tuple(latent.shape) == expected_full:
             return latent
+        if self.config.state_t == 2 and tuple(latent.shape) == legacy_full:
+            return latent[:, :, : self.config.state_t]
         full = torch.zeros(expected_full, device=self.device, dtype=self.dtype)
         full[:, :, : self.config.latent_conditional_frames] = latent
         return full
@@ -692,25 +790,40 @@ class CosmosPredict2Extractor:
         scaling = RectifiedFlowScaling(sigma_data=1.0, t_scaling_factor=1.0)
         _, _, c_in, c_noise = scaling(sigma_b_1_t_1_1)
         network_input = x_sigma_max * c_in.to(self.dtype)
-        condition_mask = torch.zeros(
-            batch_size,
-            1,
-            self.config.state_t,
-            self.config.latent_height,
-            self.config.latent_width,
-            device=self.device,
-            dtype=self.dtype,
-        )
-        conditional_latent_frames = self.config.latent_conditional_frames
-        if self.config.vae_input_mode == VAE_INPUT_MODE_OBSERVED_PREFIX:
-            conditional_latent_frames = 1 + (self.config.input_frames - 1) // 4
-        condition_mask[:, :, :conditional_latent_frames] = 1
-        network_input = (conditional / self.config.sigma_data) * condition_mask
-        network_input = network_input + x_sigma_max * c_in.to(self.dtype) * (1.0 - condition_mask)
         sigma_conditional = torch.full_like(sigma_b_1_t_1_1, self.config.sigma_conditional)
         _, _, _, c_noise_conditional = scaling(sigma_conditional)
-        condition_mask_b_1_t_1_1 = condition_mask.mean(dim=[1, 3, 4], keepdim=True)
-        c_noise = c_noise_conditional * condition_mask_b_1_t_1_1 + c_noise * (1.0 - condition_mask_b_1_t_1_1)
+        if self.config.state_t == 2:
+            condition_mask = torch.ones(
+                batch_size,
+                1,
+                self.config.state_t,
+                self.config.latent_height,
+                self.config.latent_width,
+                device=self.device,
+                dtype=self.dtype,
+            )
+            network_input = conditional / self.config.sigma_data
+            c_noise = c_noise_conditional
+        else:
+            condition_mask = torch.zeros(
+                batch_size,
+                1,
+                self.config.state_t,
+                self.config.latent_height,
+                self.config.latent_width,
+                device=self.device,
+                dtype=self.dtype,
+            )
+            conditional_latent_frames = self.config.latent_conditional_frames
+            if self.config.vae_input_mode == VAE_INPUT_MODE_OBSERVED_PREFIX:
+                conditional_latent_frames = 1 + (self.config.input_frames - 1) // 4
+            condition_mask[:, :, :conditional_latent_frames] = 1
+            network_input = (conditional / self.config.sigma_data) * condition_mask
+            network_input = network_input + x_sigma_max * c_in.to(self.dtype) * (1.0 - condition_mask)
+            condition_mask_b_1_t_1_1 = condition_mask.mean(dim=[1, 3, 4], keepdim=True)
+            c_noise = c_noise_conditional * condition_mask_b_1_t_1_1 + c_noise * (
+                1.0 - condition_mask_b_1_t_1_1
+            )
         padding_mask = torch.zeros(
             batch_size,
             1,
@@ -722,7 +835,13 @@ class CosmosPredict2Extractor:
 
         # Official inference relies on CUDA autocast: timestep sinusoidal inputs
         # remain FP32, while their linear projections execute in the model dtype.
-        with _backbone_autocast_context(self.device, self.dtype):
+        if self.config.fp8_linear:
+            if self._fp8_te is None or self._fp8_recipe is None:
+                raise CosmosPredict2Error("FP8 Linear runtime was not initialized")
+            backbone_context = self._fp8_te.autocast(enabled=True, recipe=self._fp8_recipe)
+        else:
+            backbone_context = _backbone_autocast_context(self.device, self.dtype)
+        with backbone_context:
             result = self.backbone(
                 x_B_C_T_H_W=network_input,
                 timesteps_B_T=c_noise.squeeze(dim=[1, 3, 4]),
@@ -757,6 +876,8 @@ class CosmosPredict2Extractor:
         )
         if tuple(hidden.shape) != expected_grid:
             raise ValueError(f"hidden layer must have shape {expected_grid}, got {tuple(hidden.shape)}")
+        if self.config.fp8_linear and hidden.dtype != self.dtype:
+            hidden = hidden.to(dtype=self.dtype)
         if hidden.dtype != self.dtype:
             raise TypeError(f"hidden layer must have dtype {self.dtype}, got {hidden.dtype}")
         if not torch.isfinite(hidden).all():
@@ -777,8 +898,12 @@ class CosmosPredict2Extractor:
             random_init_seed=self.config.random_init_seed,
             attention_backend=self.config.attention_backend,
             compile_friendly=self.config.compile_friendly,
+            torch_compile=self.config.torch_compile,
+            compile_mode=self.config.compile_mode,
             use_cuda_graphs=self.config.use_cuda_graphs,
             vae_input_mode=self.config.vae_input_mode,
+            state_t=self.config.state_t,
+            fp8_linear=self.config.fp8_linear,
         )
         return CosmosPredict2Extraction(
             hidden_grid=hidden,

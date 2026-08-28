@@ -79,6 +79,44 @@ def test_cache_and_training_use_identical_pool4_transform():
     assert torch.equal(trainer_context_transform(raw, "pool4"), expected)
 
 
+def test_observed_only_pool2_reduces_2400_tokens_to_600():
+    raw = torch.arange(2 * 30 * 40 * 2, dtype=torch.float32).reshape(1, 2400, 2).to(torch.bfloat16)
+    expected_grid = raw.view(1, 2, 30, 40, 2)
+    expected_flat = expected_grid.permute(0, 1, 4, 2, 3).reshape(2, 2, 30, 40)
+    expected = (
+        functional.adaptive_avg_pool2d(expected_flat, (15, 20))
+        .reshape(1, 2, 2, 15, 20)
+        .permute(0, 1, 3, 4, 2)
+        .reshape(1, 600, 2)
+    )
+
+    reduced = apply_context_transform(raw, "pool2")
+
+    assert reduced.shape == (1, 600, 2)
+    assert torch.equal(reduced, expected)
+    metadata = context_transform_metadata("pool2", temporal_frames=2)
+    assert metadata["input_grid"] == {
+        "temporal": 2,
+        "height": 30,
+        "width": 40,
+        "flatten_order": CONTEXT_GRID_FLATTEN_ORDER,
+    }
+    assert metadata["output_grid"] == {
+        "temporal": 2,
+        "height": 15,
+        "width": 20,
+        "flatten_order": CONTEXT_GRID_FLATTEN_ORDER,
+    }
+    assert metadata["output_tokens"] == 600
+
+
+def test_observed_only_context_has_no_future_frame_transform():
+    raw = torch.zeros(1, 2400, 2)
+    assert apply_context_transform(raw, "cond_frames").shape == (1, 2400, 2)
+    with pytest.raises(ValueError, match="future frames"):
+        apply_context_transform(raw, "gen_frames_pool2")
+
+
 def test_context_metadata_declares_pool4_grid_and_tokens():
     metadata = context_transform_metadata("pool4")
     assert metadata["output_tokens"] == 1280
@@ -113,6 +151,23 @@ def test_manifest_accepts_declared_transform_and_rejects_inconsistent_tokens(tmp
     path.write_text(json.dumps(payload))
     with pytest.raises(ValueError, match="inconsistent"):
         load_cache_manifest(path)
+
+
+def test_manifest_accepts_observed_only_pool2_grid(tmp_path):
+    provenance = {
+        "builder": "test",
+        "context_transform": "pool2",
+        "context_tokens": 600,
+        "context_grid": {
+            "temporal": 2,
+            "height": 15,
+            "width": 20,
+            "flatten_order": "T,H,W",
+        },
+    }
+    manifest = load_cache_manifest(_manifest(tmp_path, provenance))
+    assert manifest.context_transform == "pool2"
+    assert manifest.context_tokens == 600
 
 
 def test_manifest_without_transform_remains_legacy_none(tmp_path):

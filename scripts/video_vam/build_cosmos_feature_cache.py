@@ -93,6 +93,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--manifest", type=Path, help="Manifest path; defaults to OUTPUT_DIR/manifest.json.")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument(
+        "--state-t",
+        type=int,
+        choices=(2, 16),
+        default=16,
+        help="Cosmos DiT temporal state: 2 observed-only frames or the default 16-frame state.",
+    )
+    parser.add_argument(
         "--vae-input-mode",
         choices=VAE_INPUT_MODES,
         default=VAE_INPUT_MODE_OBSERVED_PREFIX,
@@ -265,7 +272,7 @@ def _manifest_payload(
     weights: Mapping[str, Any],
     prompt_embedding: Mapping[str, Any],
 ) -> dict[str, Any]:
-    context = context_transform_metadata(args.context_transform)
+    context = context_transform_metadata(args.context_transform, temporal_frames=args.state_t)
     return {
         "schema_version": MANIFEST_SCHEMA_VERSION,
         "cache_schema_version": CACHE_SCHEMA_VERSION,
@@ -300,7 +307,7 @@ def _manifest_payload(
             "extractor_input_keys": ["rgb_history", "prompt_embedding"],
             "excluded_from_extractor": ["state", "target_action", ACTION_IS_PAD_KEY],
             "action_padding_semantics": "action_is_pad=true means padded and excluded from decoder loss/statistics",
-            "raw_context_storage": "detached bfloat16 [B, 19200, 2048]",
+            "raw_context_storage": (f"detached bfloat16 [B, {context['input_tokens']}, 2048]"),
             "status": "diagnostic_only_non_rollout",
             "selection": {
                 "stride": args.stride,
@@ -389,6 +396,7 @@ def build(args: argparse.Namespace) -> Path:
         dtype="bfloat16",
         high_noise_sigma=args.sigma,
         seed=args.seed,
+        state_t=args.state_t,
         hidden_layer=20,
         stop_after_step=0,
         random_init_seed=args.random_init_seed,
@@ -504,7 +512,7 @@ def build(args: argparse.Namespace) -> Path:
                     "vae_input_mode": config.vae_input_mode,
                     "input_shape": list(prepared.rgb_history.shape),
                     "preprocess": MIMIC_VIDEO_PREPROCESS,
-                    "conditioning": conditioning_description(args.vae_input_mode),
+                    "conditioning": conditioning_description(args.vae_input_mode, args.state_t),
                     "official_resolution": "480",
                     "official_positional_latent_max_h": 240,
                     "official_positional_latent_max_w": 240,
@@ -537,6 +545,7 @@ def build(args: argparse.Namespace) -> Path:
                 raw_hidden_shape=tuple(extraction.hidden_grid.shape),
                 raw_hidden_dtype=extraction.hidden_grid.dtype,
                 context_transform=args.context_transform,
+                temporal_frames=args.state_t,
             )
             artifact = CosmosFeatureCacheArtifact(context, state, target_action, action_is_pad, provenance)
             save_feature_cache(artifact, path, overwrite=args.overwrite)
