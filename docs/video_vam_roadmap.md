@@ -55,27 +55,61 @@ Cosmos was worse than frozen features in our one attempt.
    co-training arm (joint losses). Cosmos video-only LoRA (step 6k) + SmolExpert
    is done and is the current offline best. LTX-2.5 video LoRA still open
    (22B will not LoRA-train on a 4090).
-4. Real-robot deployment of best SmolVLA / Cosmos / LTX policies on a freshly
+4. Fast video features for control (pretrained -> LoRA -> short forward ->
+   action expert). Do not start another backbone LoRA until this is measured.
+   Stack:
+   1. Pretrained video model (Cosmos-2B; LTX later if needed).
+   2. Video-only LoRA on our 32 episodes, then freeze. Cosmos step-6k is done
+      (13.06 deg expert). Do not jointly train video+action (already worse).
+   3. Cheap DiT forward, then train a **new** SmolExpert on that cache (train
+      and eval must match). Two options, in this order:
+      - **First: observed-only (`state_t=2`).** DiT on the two VAE latents
+        only (2,400 tokens, pool2 -> 600). Cache build and inference get the
+        2-4x; the expert does not. Closest prior is `cond_frames` (W&B
+        rmcpaxtc): expert on those two frames _after_ a full 16-frame DiT,
+        24.28 deg vs pool2 23.32 at 30 min. That slice does not speed up Cosmos.
+        `state_t=2` never mixes prefix tokens with future noise, so RMSE vs
+        13.81 / 13.06 is the open question. Extractor path is already in
+        tree (`--state-t 2`).
+      - **If T=2 drops quality: one-step future (T=3).** Keep the two cond
+        frames and add one noisy/predicted latent (~4 RGB frames, ~0.4 s at
+        10 Hz). Still ~5x fewer tokens than T=16. Optional extra LoRA for
+        next-latent / short-horizon prediction only (Diffusion Forcing /
+        Dreamer-style next-latent world models), then freeze again. This is
+        not one-denoising-step distillation; we already do a single high-sigma
+        forward. The win is fewer tokens. Do not rerun 16-frame video LoRA
+        for this.
+   4. Action expert on the resulting features. Even a tiny DiT does not
+      reach 10 Hz alone (VAE ~120 ms, expert ~90 ms). T=2 DiT in the
+      80-150 ms band is ~3 Hz per chunk, enough to hide behind a 30-step /
+      3 s buffer. Overlap still needed for true 10 Hz.
+      Details: `video_vam_latency_optimization_plan.md`,
+      `video_vam_connector_ablation_report.md`.
+5. After this `state_t=2` unpooled expert is tested (RMSE vs 13.06 / 13.81),
+   train on the new cube-out-of-box **v2** dataset: video-LoRA cache + SmolExpert
+   on the same short-forward contract. Do not start v2 until v1 T=2 is scored.
+6. Real-robot deployment of best SmolVLA / Cosmos / LTX policies on a freshly
    collected dataset; success-rate is the metric that matters, RMSE is proxy.
-   Real-time gap: video backbones ~1 Hz vs 10 Hz target; RTC + chunking is
-   the mitigation, quantization/compile gains largely exhausted on 4090.
-   Mac can only run SmolVLA locally; Cosmos/LTX go through abakus RPC.
-5. Joint-state / calibration noise during SmolExpert training (not at deploy).
+   Real-time gap: video backbones ~1 Hz vs 10 Hz target; RTC + chunking plus
+   the fast-feature stack in (4) if RMSE holds. `torch.compile` is the rollout
+   default (~1.17x DiT); `--no-compile` disables it. Mac can only run SmolVLA
+   locally; Cosmos/LTX go through abakus RPC.
+7. Joint-state / calibration noise during SmolExpert training (not at deploy).
    Sample a per-window or per-batch bias/scale on the 6 joints in physical
    units, apply the same offset to action targets, then normalize. Val stays
    clean. Isolates SO-101 recalibration mismatch and the episode-24 sign flip
    without rebuilding video caches.
-6. Pregenerate augmented feature caches: apply cheap image augs (photometric
+8. Pregenerate augmented feature caches: apply cheap image augs (photometric
    noise, small shifts/crops) _before_ Cosmos/LTX extract; write extra cache
    entries with aug seed in provenance; mix with the clean 1,572-window cache
    at train time. Val stays unaugmented. Do not replace the clean cache.
    Budget: clean train cache is already ~31 GB / ~30 min; K extra augs costs
    ~K times that. Start with K=2 photometric-only.
-7. Cosmos+LoRA continuation-video comparison vs generic Cosmos on the same
+9. Cosmos+LoRA continuation-video comparison vs generic Cosmos on the same
    windows (episode 0 frame 4, episode 19 frame 2203) using
    preview_cosmos_video_prediction.py --checkpoint fused-step6000.pt.
-8. Cheap high-value ablations if time permits: image-only backbone control,
-   multi-seed random-init, Cosmos-14B scale point.
+10. Cheap high-value ablations if time permits: image-only backbone control,
+    multi-seed random-init, Cosmos-14B scale point.
 
 ## What this argues for a BFL forward-deployed-engineer story
 

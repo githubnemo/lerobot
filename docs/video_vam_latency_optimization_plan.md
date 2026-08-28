@@ -338,9 +338,20 @@ remain ordinary `torch.nn.Linear` modules with checkpoint weights preserved. The
 therefore wrapped ordinary Linear execution in FP8 autocast without converting its GEMMs to TE FP8
 Linear modules; it did not provide real Linear-FP8 acceleration.
 
-The 2–4x path is the observed-only `state_t=2` Cosmos DiT contract: 2,400 tokens instead of 19,200,
-followed by a pool2 context of 600 tokens. This changes the representation, so the Smol expert must be
-retrained on the new 600-token pool2 context before it can be used for rollout.
+The 2–4x path is the observed-only `state_t=2` Cosmos DiT contract: 2,400 tokens
+instead of 19,200, followed by a pool2 context of 600 tokens. Cache construction
+and live extraction get the speedup; the action expert does not, and must be
+retrained on that cache so train and eval match.
+
+This is **not** the same experiment as the 2026-08-20 `cond_frames` connector
+arm (`docs/video_vam_connector_ablation_report.md`, W&B `rmcpaxtc`). That arm
+still ran the full 16-frame DiT (so inference stayed ~1 Hz) and then sliced
+the two clean conditioning frames for the expert: 24.28 deg at 30 min versus
+pool2 23.32. Observed tokens already carried most of the action signal; future
+noise tokens (`gen_frames_pool2`) were worse. `state_t=2` _skips_ those 14
+future slots inside the transformer, so layer-20 features are not the
+`cond_frames` slice of a 16-frame forward. Quality versus the 13.81 / 13.06
+converged pool2 experts is the open measurement.
 
 The winning arm is therefore `compile_max` for the DiT stage: it clears the
 correctness gate and exceeds the `1.15x` target. It is not a `1.15x` whole-pipeline

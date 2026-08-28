@@ -80,6 +80,21 @@ Not applied (documented for later): pre-deriving reduced caches (would cut the
 becomes relevant at larger batch sizes), K/V-reuse across decoder blocks, and
 multi-layer feature taps.
 
+## Follow-up: `cond_frames` vs observed-only DiT (`state_t=2`)
+
+`cond_frames` kept the full 16-frame Cosmos forward and trained the expert only
+on latent frames 0-1 (2,400 tokens). That is why it could not reduce DiT
+latency. The 30-minute result (24.28 vs pool2 23.32) is still the best evidence
+that those two observed frames carry most of the action signal.
+
+`state_t=2` (implemented 2026-08-28) stops the DiT after those two VAE latents:
+2,400 tokens from the transformer itself, pool2 -> 600 for the expert. Cache
+build and inference should be several times faster; RMSE versus converged
+pool2 is unknown because the features are no longer mixed with future-frame
+noise via self-attention. Next training step: rebuild the LoRA-adapted cache
+with `--state-t 2` and train SmolExpert on it. Do not evaluate the 4,800-token
+experts on 600-token context.
+
 ## Deviation from mimic-video
 
 Upstream keeps the full 19,200-token context (documented in
