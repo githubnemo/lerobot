@@ -25,6 +25,7 @@ from lerobot.policies.vam.ltx_feature_cache import (
     CACHE_SCHEMA_VERSION,
     MANIFEST_SCHEMA_VERSION,
     LTXFeatureCacheItem,
+    context_spec,
     load_ltx_cache_manifest,
     save_ltx_feature_cache,
     sha256_file,
@@ -49,11 +50,13 @@ TRAIN_EPISODES = tuple(range(32))
 VAL_EPISODES = tuple(range(32, 40))
 TRAIN_STRIDE = 3
 VAL_STRIDE = 20
-EXPECTED_CONTEXT_BYTES = 640 * 4096 * 2
-EXPECTED_ARTIFACT_BYTES = EXPECTED_CONTEXT_BYTES + (1 * 6 + 1 * 30 * 6) * 4 + 30 + 16_384
-RAW_CONTEXT_BYTES = 2400 * 4096 * 2
-RAW_ARTIFACT_BYTES = RAW_CONTEXT_BYTES + (1 * 6 + 1 * 30 * 6) * 4 + 30 + 16_384
 CHECKPOINT_RESERVE_BYTES = 2 * 2**30
+
+
+def expected_artifact_bytes(state_t: int, context_transform: str) -> int:
+    context_shape, _grid = context_spec(context_transform, state_t)
+    context_bytes = context_shape[1] * context_shape[2] * 2
+    return context_bytes + (1 * 6 + 1 * 30 * 6) * 4 + 30 + 16_384
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -69,6 +72,21 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--train-stride", type=int, default=TRAIN_STRIDE)
     parser.add_argument("--val-stride", type=int, default=VAL_STRIDE)
     parser.add_argument("--context-transform", choices=("pool2", "none"), default="pool2")
+    parser.add_argument("--state-t", type=int, choices=(2, 8), default=8)
+    parser.add_argument(
+        "--train-episodes",
+        type=int,
+        nargs="+",
+        default=None,
+        help="Train episode indices (default: 0-31).",
+    )
+    parser.add_argument(
+        "--val-episodes",
+        type=int,
+        nargs="+",
+        default=None,
+        help="Validation episode indices (default: 32-39).",
+    )
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--overwrite", action="store_true")
     return parser.parse_args(argv)
@@ -79,12 +97,20 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--seed must be non-negative")
     if args.train_stride <= 0 or args.val_stride <= 0:
         raise ValueError("--train-stride and --val-stride must be positive")
+    if args.state_t not in (2, 8):
+        raise ValueError("--state-t must be 2 or 8")
     if not math.isfinite(args.min_free_gib) or args.min_free_gib < 10:
         raise ValueError("--min-free-gib must be finite and at least 10 GiB")
     if args.resume and args.overwrite:
         raise ValueError("--resume and --overwrite are mutually exclusive")
     if args.train_output_dir.expanduser().resolve() == args.val_output_dir.expanduser().resolve():
         raise ValueError("train and validation output directories must differ")
+    args.train_episodes = tuple(TRAIN_EPISODES if args.train_episodes is None else args.train_episodes)
+    args.val_episodes = tuple(VAL_EPISODES if args.val_episodes is None else args.val_episodes)
+    if not args.train_episodes or not args.val_episodes:
+        raise ValueError("--train-episodes and --val-episodes must be non-empty")
+    if set(args.train_episodes) & set(args.val_episodes):
+        raise ValueError("train and validation episodes must be disjoint")
 
 
 def episode_rows(dataset: LeRobotDataset) -> dict[int, tuple[int, int]]:
@@ -101,13 +127,18 @@ def episode_rows(dataset: LeRobotDataset) -> dict[int, tuple[int, int]]:
 
 
 def selected_windows(
-    dataset: LeRobotDataset, *, train_stride: int, val_stride: int
+    dataset: LeRobotDataset,
+    *,
+    train_stride: int,
+    val_stride: int,
+    train_episodes: tuple[int, ...] = TRAIN_EPISODES,
+    val_episodes: tuple[int, ...] = VAL_EPISODES,
 ) -> list[tuple[str, int, int]]:
     rows = episode_rows(dataset)
     selected: list[tuple[str, int, int]] = []
     for split, episodes, stride in (
-        ("train", TRAIN_EPISODES, train_stride),
-        ("validation", VAL_EPISODES, val_stride),
+        ("train", train_episodes, train_stride),
+        ("validation", val_episodes, val_stride),
     ):
         for episode in episodes:
             start, stop = rows[episode]
@@ -122,7 +153,7 @@ def artifact_path(output_dir: Path, episode: int, frame: int) -> Path:
 def disk_guard(args: argparse.Namespace, selected: list[tuple[str, int, int]]) -> dict[str, Any]:
     free = shutil.disk_usage(args.train_output_dir.expanduser().resolve().parent).free
     min_free = int(args.min_free_gib * 2**30)
-    artifact_bytes = EXPECTED_ARTIFACT_BYTES if args.context_transform == "pool2" else RAW_ARTIFACT_BYTES
+    artifact_bytes = expected_artifact_bytes(args.state_t, args.context_transform)
     missing = sum(
         not artifact_path(
             args.train_output_dir.expanduser().resolve()
@@ -200,10 +231,13 @@ def sidecar_payload(
     stage_seconds: dict[str, float],
 ) -> dict[str, Any]:
     provenance = extraction.provenance.to_dict()
+    state_t = extraction.provenance.token_geometry[0]
+    raw_tokens = state_t * 15 * 20
+    _context_shape, context_grid = context_spec(context_transform, state_t)
     transform_definition = (
         "per-latent-frame adaptive_avg_pool2d 15x20 -> 8x10"
         if context_transform == "pool2"
-        else "none; flatten exact 8x15x20 hidden grid in T,H,W,C order"
+        else f"none; flatten exact {state_t}x15x20 hidden grid in T,H,W,C order"
     )
     return {
         "schema_version": CACHE_SCHEMA_VERSION,
@@ -241,13 +275,17 @@ def sidecar_payload(
             "vae_input_frames": 9,
             "vae_padding": "repeat latest observed frame four times",
             "clean_latent_frames": 2,
-            "sigma1_noise_latent_frames": 6,
+            "sigma1_noise_latent_frames": max(state_t - 2, 0),
             "future_pixels_used": False,
-            "target_frame_count": 57,
+            "state_t": state_t,
+            "target_frame_count": extraction.provenance.target_frame_count,
         },
         "output": {
-            "raw_context_shape": [1, 2400, 4096],
+            "raw_context_shape": [1, raw_tokens, 4096],
             "raw_context_dtype": "bfloat16",
+            "context_grid": context_grid,
+            "context_tokens": context.shape[1],
+            "state_t": state_t,
             "context_transform": context_transform,
             "transform_definition": transform_definition,
             "context_shape": list(context.shape),
@@ -277,9 +315,9 @@ def manifest_payload(
     disk: dict[str, Any],
     runtime: dict[str, Any],
 ) -> dict[str, Any]:
-    episodes = TRAIN_EPISODES if split == "train" else VAL_EPISODES
-    context_tokens = 640 if args.context_transform == "pool2" else 2400
-    context_grid = [8, 8, 10] if args.context_transform == "pool2" else [8, 15, 20]
+    episodes = args.train_episodes if split == "train" else args.val_episodes
+    _context_shape, context_grid = context_spec(args.context_transform, args.state_t)
+    context_tokens = _context_shape[1]
     return {
         "schema_version": MANIFEST_SCHEMA_VERSION,
         "cache_schema_version": CACHE_SCHEMA_VERSION,
@@ -297,6 +335,8 @@ def manifest_payload(
             "model_revision": producer["model_revision"],
             "hidden_layer": 34,
             "num_blocks": 48,
+            "state_t": args.state_t,
+            "target_frame_count": 1 + 8 * (args.state_t - 1),
             "high_noise_sigma": 1.0,
             "noise_parameterization": "normalized_rectified_flow_sigma",
             "global_seed": args.seed,
@@ -313,6 +353,13 @@ def manifest_payload(
             },
             "split_contract": "train episodes 0-31; validation episodes 32-39; no overlap",
             "action_contract": "causal target [30,6], masks preserved; state [1,6]",
+            "temporal_contract": {
+                "observed_rgb_frames": 5,
+                "vae_input_frames": 9,
+                "clean_latent_frames": 2,
+                "state_t": args.state_t,
+                "target_frame_count": 1 + 8 * (args.state_t - 1),
+            },
         },
         "global_seed": args.seed,
         "entries": entries,
@@ -373,7 +420,13 @@ def build(args: argparse.Namespace) -> tuple[Path, Path]:
     validate_metadata(dataset.meta, CUBE_OUT_OF_BOX_CONTRACT).raise_if_invalid()
     if dataset.revision != CUBE_OUT_OF_BOX_CONTRACT.revision:
         raise ValueError("dataset revision does not match the canonical cube-out-of-box contract")
-    selected = selected_windows(dataset, train_stride=args.train_stride, val_stride=args.val_stride)
+    selected = selected_windows(
+        dataset,
+        train_stride=args.train_stride,
+        val_stride=args.val_stride,
+        train_episodes=args.train_episodes,
+        val_episodes=args.val_episodes,
+    )
     expected_train = sum(1 for split, _, _ in selected if split == "train")
     expected_val = sum(1 for split, _, _ in selected if split == "validation")
     if not expected_train or not expected_val:
@@ -396,6 +449,7 @@ def build(args: argparse.Namespace) -> tuple[Path, Path]:
         seed=args.seed,
         input_frames=5,
         padded_input_frames=9,
+        state_t=args.state_t,
         offload_mode="cpu",
         quantization="fp8-cast",
         persistent_transformer=True,
@@ -425,9 +479,7 @@ def build(args: argparse.Namespace) -> tuple[Path, Path]:
                 if (path.exists() or path.with_suffix(".json").exists()) and not args.overwrite:
                     raise FileExistsError(f"refusing existing partial artifact without --overwrite: {path}")
                 required_floor = int(args.min_free_gib * 2**30) + CHECKPOINT_RESERVE_BYTES
-                artifact_bytes = (
-                    EXPECTED_ARTIFACT_BYTES if args.context_transform == "pool2" else RAW_ARTIFACT_BYTES
-                )
+                artifact_bytes = expected_artifact_bytes(args.state_t, args.context_transform)
                 free_now = shutil.disk_usage(output_dir).free
                 if free_now - artifact_bytes < required_floor:
                     raise RuntimeError(
@@ -449,7 +501,8 @@ def build(args: argparse.Namespace) -> tuple[Path, Path]:
                 seconds = time.perf_counter() - extraction_started
                 if extraction.provenance.prompt_source != "embedding":
                     raise RuntimeError("LTX extraction did not use the prompt embedding artifact")
-                if tuple(extraction.tokens.shape) != (1, 2400, 4096):
+                expected_raw_shape = (1, args.state_t * 15 * 20, 4096)
+                if tuple(extraction.tokens.shape) != expected_raw_shape:
                     raise RuntimeError(f"unexpected raw LTX shape: {tuple(extraction.tokens.shape)}")
                 context = (
                     (

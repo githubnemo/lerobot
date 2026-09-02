@@ -36,13 +36,14 @@ class FakeBackbone(nn.Module):
                 "layer_index": layer_index,
             }
         )
-        assert latent.shape == (1, 2400, 128)
+        expected_tokens = latent.shape[1]
+        assert latent.shape == (1, expected_tokens, 128)
         assert prompt_embedding.shape == (1, 4, 4096)
         assert sigma.tolist() == [1.0]
         assert denoise_mask[:, : 2 * 15 * 20].eq(0).all()
         assert denoise_mask[:, 2 * 15 * 20 :].eq(1).all()
-        assert positions.shape == (1, 3, 2400, 2)
-        return torch.full((1, 2400, 4096), 0.5, dtype=latent.dtype)
+        assert positions.shape == (1, 3, expected_tokens, 2)
+        return torch.full((1, expected_tokens, 4096), 0.5, dtype=latent.dtype)
 
 
 def test_noise_matches_cosmos_numpy_random_state_and_window_formula():
@@ -62,6 +63,15 @@ def test_layer_and_noise_selection_match_relative_cosmos_point():
     assert matched_ltx_layer() == 34
     assert matched_ltx_layer(10, 28, 48) == 17
     assert matched_ltx_noise_level() == 1.0
+
+
+def test_state_t_derives_target_frame_count_and_rejects_invalid_values():
+    assert LTXExtractorConfig(device="cpu", state_t=2).target_frame_count == 9
+    assert LTXExtractorConfig(device="cpu", state_t=8).target_frame_count == 57
+    with pytest.raises(ValueError, match="state_t"):
+        LTXExtractorConfig(device="cpu", state_t=16)
+    with pytest.raises(ValueError, match="target_frame_count"):
+        LTXExtractorConfig(device="cpu", state_t=2, target_frame_count=57)
 
 
 def test_extractor_pads_causal_window_and_records_full_provenance():

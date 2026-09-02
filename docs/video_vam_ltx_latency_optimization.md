@@ -188,6 +188,57 @@ The fourth fixed window was excluded from optimization and scored 27.88 degrees
 not evidence of generalization. No feature cache or decoder checkpoint was
 written. The metrics are in `~/.cache/video-vam/runs/ltx25-tiny-overfit/result.json`; the tmux harness log, exit code, and exact run script are beside it.
 
+## GPU-resident INT4 (parked, 2026-08-29)
+
+T=2 vs T=8 did **not** speed up the production FP8 CPU-offload extractor
+(1228 vs 1243 ms). The 22B transformer streams block weights from CPU; token
+count is not the bottleneck. Official LTX 4-bit is NVFP4 via `ltx-kernels`
+(Blackwell `sm_100`); those kernels are not built here and are not an Ada path.
+
+What did work on the 4090: torchao **INT4 weight-only** tinygemm
+(`Int4PackingFormat.TILE_PACKED_TO_4D`), `offload_mode=none`, `state_t=2`.
+Load 22B BF16 on CPU, quantize each `nn.Linear` on CUDA, keep the packed weights
+resident. 1660 Linears converted, **10.67 GiB** peak during extract. Hidden
+tokens remain **BF16** `[1, 600, 4096]` — INT4 is the DiT weights, not the
+expert inputs.
+
+Same 5-frame window as the T=2/T=8 bench (episode 0, production prompt,
+prefix through block 34, 2 warmup + 5 timed):
+
+| Path                      | tokens |          extract p50 |     DiT |   VAE |              VRAM |
+| ------------------------- | -----: | -------------------: | ------: | ----: | ----------------: |
+| T=8 FP8 CPU-offload       |   2400 |    1243 ms (0.80 Hz) | 1154 ms | 71 ms | ~5.2 GiB streamed |
+| T=2 FP8 CPU-offload       |    600 |    1228 ms (0.81 Hz) | 1144 ms | 71 ms | ~5.2 GiB streamed |
+| **T=2 INT4 GPU-resident** |    600 | **780 ms (1.28 Hz)** |  698 ms | 71 ms |      **10.7 GiB** |
+
+~1.57x vs the T=2 offload path. VAE is unchanged. Not Cosmos T=2 (204 ms).
+
+Code: `LTXExtractorConfig.quantization="int4"` requires `offload_mode="none"`.
+Reproduce:
+
+```bash
+source scripts/video_vam/cosmos_cuda_env.sh
+source scripts/video_vam/gpu_lock.sh
+acquire_gpu_lock ltx-int4-resident
+.venv/bin/python -m scripts.video_vam.bench_ltx_int4_resident --overwrite
+```
+
+JSON: `~/.cache/video-vam/ltx-int4-resident-latency/ltx_int4_resident_latency.json`.
+
+**Not done — required before using this as a training cache:**
+
+- Cosine / max-abs drift of INT4-weight extract vs FP8-offload extract on the
+  same windows (the existing T=2 cache is FP8).
+- Retrain SmolExpert on an INT4-extracted cache (or confirm an FP8-trained
+  expert still scores on INT4 features). Train and eval must match.
+- `dispose()` uses `empty_like(..., device=meta)`, which INT4 packed tensors do
+  not implement; the extractor skips dispose on this arm. Fine for a bench,
+  not a long-lived server.
+
+Do not switch the overnight LTX expert cache to INT4 until that expert
+retrain is scored. This is a live-extract / later-cache option, not a quality
+result.
+
 ## Limitations
 
 - The overfit establishes trainability and strong context sensitivity, not data

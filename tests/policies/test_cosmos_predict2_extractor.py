@@ -109,6 +109,37 @@ def make_extractor():
     return CosmosPredict2Extractor(config, backbone=FakeBackbone(), tokenizer=FakeTokenizer())
 
 
+def test_hidden_layers_are_sorted_unique_and_stop_at_the_deepest_layer():
+    with pytest.raises(ValueError, match="sorted tuple"):
+        CosmosPredict2ExtractorConfig(
+            checkpoint_path="/not-loaded/backbone.pt",
+            tokenizer_path="/not-loaded/tokenizer.pth",
+            hidden_layers=(8, 4, 20),
+        )
+    with pytest.raises(ValueError, match="end|stop layer"):
+        CosmosPredict2ExtractorConfig(
+            checkpoint_path="/not-loaded/backbone.pt",
+            tokenizer_path="/not-loaded/tokenizer.pth",
+            hidden_layers=(4, 8, 12),
+        )
+    config = CosmosPredict2ExtractorConfig(
+        checkpoint_path="/not-loaded/backbone.pt",
+        tokenizer_path="/not-loaded/tokenizer.pth",
+        device="cpu",
+        dtype=torch.float32,
+        hidden_layers=(4, 8, 12, 16, 18, 20),
+    )
+    extractor = CosmosPredict2Extractor(config, backbone=FakeBackbone(), tokenizer=FakeTokenizer())
+    output = extractor.extract(
+        torch.full((1, 3, 5, 480, 640), 128, dtype=torch.uint8),
+        torch.zeros(1, 512, 1024),
+    )
+    assert extractor.backbone.seen["return_only_hidden_states_up_to"] == 20
+    assert tuple(output.layer_tokens) == (4, 8, 12, 16, 18, 20)
+    assert output.layer_tokens[4].shape == (1, 19200, 2048)
+    assert torch.equal(output.layer_tokens[20], output.tokens)
+
+
 def test_extract_contract_layout_and_metadata():
     extractor = make_extractor()
     images = torch.full((1, 3, 5, 480, 640), 128, dtype=torch.uint8)

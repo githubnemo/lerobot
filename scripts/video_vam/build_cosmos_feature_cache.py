@@ -10,10 +10,13 @@ import platform
 import sys
 import time
 from collections.abc import Mapping
+from dataclasses import asdict
 from pathlib import Path
 from typing import Any
 
 import torch
+from safetensors import safe_open
+from safetensors.torch import load_file
 
 from lerobot.datasets.vam import CUBE_OUT_OF_BOX_CONTRACT, validate_metadata
 from lerobot.policies.vam.context_transform import (
@@ -36,7 +39,20 @@ from lerobot.policies.vam.cosmos_feature_cache import (
     save_feature_cache,
     verify_feature_cache,
 )
-from lerobot.policies.vam.cosmos_lora import inject_lora, load_lora_state_dict
+from lerobot.policies.vam.cosmos_layer_mix_cache import (
+    COSMOS_LAYER_PROBE_DEPTHS,
+    CosmosLayerMixCacheItem,
+    layer_mix_artifact_name,
+    load_layer_mix_manifest,
+    save_layer_mix_feature_cache,
+    verify_layer_mix_feature_cache,
+    write_layer_mix_manifest,
+)
+from lerobot.policies.vam.cosmos_lora import (
+    inject_lora,
+    load_lora_state_dict,
+    merge_lora_file_into_base,
+)
 from lerobot.policies.vam.cosmos_predict2_extractor import (
     UPSTREAM_COMMIT,
     VAE_INPUT_MODE_LEGACY_PADDED,
@@ -68,6 +84,38 @@ from scripts.video_vam.smoke_test_cosmos_extractor import (
 DEFAULT_OUTPUT_DIR = Path("/home/anton/.cache/video-vam/cosmos-features")
 
 
+def _parse_hidden_layers(value: str) -> tuple[int, ...]:
+    try:
+        layers = tuple(int(part.strip()) for part in value.split(",") if part.strip())
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("hidden layers must be comma-separated integers") from exc
+    if not layers:
+        raise argparse.ArgumentTypeError("hidden layers must not be empty")
+    return layers
+
+
+def _parse_lora_blocks(value: str) -> tuple[int, ...]:
+    blocks: set[int] = set()
+    try:
+        for part in value.split(","):
+            part = part.strip()
+            if not part:
+                continue
+            if "-" in part:
+                start_text, end_text = part.split("-", 1)
+                start, end = int(start_text), int(end_text)
+                if end < start:
+                    raise ValueError
+                blocks.update(range(start, end + 1))
+            else:
+                blocks.add(int(part))
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("LoRA blocks must be comma-separated indices/ranges") from exc
+    if not blocks or any(block < 0 or block >= 28 for block in blocks):
+        raise argparse.ArgumentTypeError("LoRA blocks must select at least one block in [0, 27]")
+    return tuple(sorted(blocks))
+
+
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--root", type=Path, default=DEFAULT_DATASET_ROOT)
@@ -88,6 +136,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--prompt", type=Path, default=DEFAULT_PROMPT_PATH)
     parser.add_argument("--checkpoint", type=Path, default=DEFAULT_CHECKPOINT_PATH)
     parser.add_argument("--lora-weights", type=Path, help="Adapter-only Cosmos LoRA safetensors checkpoint.")
+    parser.add_argument(
+        "--merge-lora-weights",
+        type=Path,
+        help="Full-backbone adapter merged into the base before --lora-weights is applied.",
+    )
+    parser.add_argument(
+        "--lora-blocks",
+        type=_parse_lora_blocks,
+        help="Restrict --lora-weights injection, for example 0-19.",
+    )
     parser.add_argument("--tokenizer", type=Path, default=DEFAULT_TOKENIZER_PATH)
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
     parser.add_argument("--manifest", type=Path, help="Manifest path; defaults to OUTPUT_DIR/manifest.json.")
@@ -95,9 +153,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--state-t",
         type=int,
-        choices=(2, 16),
+        choices=(2, 3, 4, 6, 8, 12, 16),
         default=16,
         help="Cosmos DiT temporal state: 2 observed-only frames or the default 16-frame state.",
+    )
+    parser.add_argument(
+        "--hidden-layers",
+        type=_parse_hidden_layers,
+        help="Optional comma-separated sorted Cosmos layers for a multi-depth state_t=2 cache.",
     )
     parser.add_argument(
         "--vae-input-mode",
@@ -107,6 +170,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "VAE input contract for new artifacts: observed_prefix encodes only the five "
             "observed pixels; legacy_padded_vae restores 5->61 padding."
         ),
+    )
+    parser.add_argument(
+        "--self-attn-scale", type=float, default=1.0, help="Scaling factor applied to self-attention output."
     )
     parser.add_argument(
         "--sigma",
@@ -131,6 +197,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "pool4 stores all 16 latent frames at an adaptive 8x10 spatial grid "
             "([B, 1280, 2048])."
         ),
+    )
+    parser.add_argument(
+        "--readout-head-weights",
+        type=Path,
+        help="Auxiliary TemporalReadoutHead weights to project state_t=2 to 16 frames before context transform.",
     )
     parser.add_argument("--resume", action="store_true", help="Strictly verify and skip existing artifacts.")
     parser.add_argument("--overwrite", action="store_true")
@@ -164,9 +235,35 @@ def _validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--resume and --overwrite are mutually exclusive")
     if args.lora_weights is not None and args.random_init_seed is not None:
         raise ValueError("--lora-weights cannot be combined with --random-init-seed")
+    if args.lora_blocks is not None and args.lora_weights is None:
+        raise ValueError("--lora-blocks requires --lora-weights")
+    if args.readout_head_weights is not None:
+        if args.state_t != 2:
+            raise ValueError("--readout-head-weights requires --state-t 2")
+        if not args.readout_head_weights.is_file():
+            raise FileNotFoundError(f"--readout-head-weights not found: {args.readout_head_weights}")
+    if args.hidden_layers is not None:
+        if args.state_t != 2:
+            raise ValueError("--hidden-layers requires --state-t 2")
+        if (
+            args.hidden_layers != tuple(sorted(set(args.hidden_layers)))
+            or any(layer < 0 for layer in args.hidden_layers)
+            or args.hidden_layers[-1] != 20
+        ):
+            raise ValueError("--hidden-layers must be sorted, unique, non-negative, and end at layer 20")
+        if args.hidden_layers != COSMOS_LAYER_PROBE_DEPTHS:
+            raise ValueError(f"--hidden-layers must be the canonical cache taps {COSMOS_LAYER_PROBE_DEPTHS}")
+        if args.context_transform not in {"none", "pool2"}:
+            raise ValueError("multi-depth Cosmos caches support only --context-transform none or pool2")
+        if args.sigma != 80.0:
+            raise ValueError("multi-depth Cosmos caches require --sigma 80")
 
 
-def _lora_checkpoint_provenance(path: Path) -> dict[str, Any]:
+def _lora_checkpoint_provenance(
+    path: Path,
+    *,
+    expected_blocks: tuple[int, ...] | None = None,
+) -> dict[str, Any]:
     path = path.expanduser().resolve()
     if not path.is_file():
         raise FileNotFoundError(f"LoRA weights not found: {path}")
@@ -178,6 +275,8 @@ def _lora_checkpoint_provenance(path: Path) -> dict[str, Any]:
     except (OSError, json.JSONDecodeError) as exc:
         raise ValueError(f"could not read LoRA provenance sidecar {metadata_path}: {exc}") from exc
     lora = payload.get("lora")
+    if lora is None:
+        lora = payload.get("new_lora")
     if not isinstance(lora, dict):
         raise ValueError(f"LoRA provenance sidecar has no lora object: {metadata_path}")
     rank = lora.get("rank")
@@ -191,7 +290,37 @@ def _lora_checkpoint_provenance(path: Path) -> dict[str, Any]:
         or alpha <= 0
     ):
         raise ValueError(f"LoRA provenance alpha must be finite and positive: {metadata_path}")
-    return {
+    declared_blocks = lora.get("block_indices")
+    if declared_blocks is None and isinstance(payload.get("new_lora"), dict):
+        declared_blocks = payload["new_lora"].get("block_indices")
+    if declared_blocks is not None:
+        try:
+            declared_blocks = tuple(sorted({int(value) for value in declared_blocks}))
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"LoRA provenance block_indices are malformed: {metadata_path}") from exc
+    checkpoint_blocks: tuple[int, ...] = ()
+    if expected_blocks is not None or declared_blocks is not None:
+        with safe_open(str(path), framework="pt", device="cpu") as handle:
+            checkpoint_keys = tuple(handle.keys())
+        checkpoint_blocks = tuple(
+            sorted(
+                {
+                    int(parts[1])
+                    for key in checkpoint_keys
+                    if len(parts := key.split(".")) > 2 and parts[0] == "blocks" and parts[1].isdigit()
+                }
+            )
+        )
+    if declared_blocks is not None and declared_blocks != checkpoint_blocks:
+        raise ValueError(
+            f"LoRA sidecar block_indices {declared_blocks} do not match checkpoint keys "
+            f"{checkpoint_blocks}: {metadata_path}"
+        )
+    if expected_blocks is not None and checkpoint_blocks != expected_blocks:
+        raise ValueError(
+            f"LoRA checkpoint blocks {checkpoint_blocks} do not match --lora-blocks {expected_blocks}: {path}"
+        )
+    provenance = {
         "path": str(path),
         "sha256": sha256_file(path),
         "size_bytes": path.stat().st_size,
@@ -201,6 +330,9 @@ def _lora_checkpoint_provenance(path: Path) -> dict[str, Any]:
         "metadata_sha256": sha256_file(metadata_path),
         "adapters_applied": True,
     }
+    if checkpoint_blocks:
+        provenance["block_indices"] = list(checkpoint_blocks)
+    return provenance
 
 
 def _selected_frames(dataset: Any, args: argparse.Namespace):
@@ -235,6 +367,9 @@ def _existing_entry(
     expected_random_init_seed: int | None,
     expected_vae_input_mode: str,
     expected_lora_sha256: str | None,
+    expected_merged_lora: Mapping[str, Any] | None,
+    expected_lora_blocks: tuple[int, ...] | None,
+    expected_readout_head: str | None = None,
 ):
     path = _artifact_path(output_dir, episode, frame)
     artifact = verify_feature_cache(path)
@@ -260,7 +395,206 @@ def _existing_entry(
     stored_lora_sha256 = stored_lora.get("sha256") if isinstance(stored_lora, dict) else None
     if stored_lora_sha256 != expected_lora_sha256:
         raise ValueError(f"existing cache LoRA provenance does not match request: {path}")
+    stored_merged_lora = extractor.get("merged_lora_weights")
+    if stored_merged_lora != expected_merged_lora:
+        raise ValueError(f"existing cache merged-LoRA provenance does not match request: {path}")
+    stored_lora_blocks = extractor.get("lora_block_indices")
+    if stored_lora_blocks != (list(expected_lora_blocks) if expected_lora_blocks is not None else None):
+        raise ValueError(f"existing cache LoRA block restriction does not match request: {path}")
+    stored_weights = artifact.provenance.payload.get("weights", {})
+    if expected_readout_head is not None and stored_weights.get("readout_head") != expected_readout_head:
+        raise ValueError(f"existing cache readout head does not match request: {path}")
     return artifact
+
+
+def _layer_mix_sidecar_payload(
+    *,
+    split: str,
+    dataset: Any,
+    episode: int,
+    frame: int,
+    prepared: Any,
+    prompt_embedding: Mapping[str, Any],
+    extraction: Any,
+    contexts: Mapping[int, torch.Tensor],
+    context_transform: str,
+    seconds: float,
+    runtime: Mapping[str, Any],
+    weights: Mapping[str, Any],
+) -> dict[str, Any]:
+    metadata = context_transform_metadata(context_transform, temporal_frames=2)
+    return {
+        "schema_version": 1,
+        "artifact": layer_mix_artifact_name(context_transform),
+        "dataset": {
+            "repo_id": dataset.repo_id,
+            "revision": dataset.revision,
+            "episode_index": episode,
+            "frame_index": frame,
+            "window_indices": list(prepared.window_indices),
+            "window_offsets": list(CUBE_OUT_OF_BOX_CONTRACT.history_offsets),
+            "fps": CUBE_OUT_OF_BOX_CONTRACT.fps,
+        },
+        "split": {
+            "name": split,
+            "train_episodes": list(range(32)),
+            "validation_episodes": list(range(32, 40)),
+        },
+        "prompt": dict(prompt_embedding),
+        "backbone": asdict(extraction.provenance),
+        "weights": dict(weights),
+        "extraction": {
+            "noise_seed": extraction.provenance.noise_seed,
+            "sigma": float(extraction.sigma[0].item()),
+            "state_t": 2,
+            "tapped_layers": list(COSMOS_LAYER_PROBE_DEPTHS),
+            "deepest_layer": COSMOS_LAYER_PROBE_DEPTHS[-1],
+            "raw_shapes": {str(layer): [1, 2, 30, 40, 2048] for layer in COSMOS_LAYER_PROBE_DEPTHS},
+            "seconds": seconds,
+            "runtime": dict(runtime),
+            "extractor_inputs": ["five_causal_rgb_frames", "t5_prompt_embedding"],
+            "excluded_inputs": ["state", "target_action", "action_is_pad"],
+        },
+        "temporal_contract": {
+            "observed_rgb_frames": 5,
+            "clean_latent_frames": 2,
+            "state_t": 2,
+            "future_pixels_used": False,
+        },
+        "output": {
+            "backbone": "Cosmos-Predict2-2B",
+            "tapped_layers": list(COSMOS_LAYER_PROBE_DEPTHS),
+            "deepest_layer": COSMOS_LAYER_PROBE_DEPTHS[-1],
+            "state_t": 2,
+            "high_noise_sigma": 80.0,
+            "one_forward_pass": True,
+            "raw_context_shape_per_layer": [1, 2400, 2048],
+            "context_transform": context_transform,
+            "context_tokens_per_layer": metadata["output_tokens"],
+            "context_channels": 2048,
+            "context_grid": [
+                metadata["output_grid"]["temporal"],
+                metadata["output_grid"]["height"],
+                metadata["output_grid"]["width"],
+            ],
+            "context_dtype": "bfloat16",
+            "flatten_order": "T,H,W,C",
+        },
+        "tensors": {
+            "contexts": {str(layer): list(contexts[layer].shape) for layer in COSMOS_LAYER_PROBE_DEPTHS},
+            "state": list(prepared.state.shape),
+            "target_action": list(prepared.target_action.shape),
+            "action_is_pad": list(prepared.action_is_pad.shape),
+            "action_padding_semantics": "true means padded; excluded from loss, normalization, and RMSE",
+        },
+    }
+
+
+def _layer_mix_manifest_payload(
+    *,
+    dataset: Any,
+    args: argparse.Namespace,
+    entries: list[dict[str, Any]],
+    runtime: dict[str, Any],
+    weights: Mapping[str, Any],
+    prompt_embedding: Mapping[str, Any],
+) -> dict[str, Any]:
+    metadata = context_transform_metadata(args.context_transform, temporal_frames=2)
+    return {
+        "schema_version": 1,
+        "cache_schema_version": 1,
+        "artifact": layer_mix_artifact_name(args.context_transform, manifest=True),
+        "dataset": {"repo_id": dataset.repo_id, "revision": dataset.revision},
+        "subset": {
+            "episodes": list(args.episodes),
+            "frame_start": args.frame_start,
+            "frame_end": args.frame_end,
+            "max_samples": args.max_samples,
+            "stride": args.stride,
+        },
+        "provenance": {
+            "builder": "scripts/video_vam/build_cosmos_feature_cache.py",
+            "backbone": "Cosmos-Predict2-2B",
+            "checkpoint_path": weights["checkpoint_path"],
+            "checkpoint_sha256": weights["checkpoint_sha256"],
+            "tokenizer_path": weights["tokenizer_path"],
+            "tokenizer_sha256": weights["tokenizer_sha256"],
+            "hidden_layer": 20,
+            "deepest_layer": 20,
+            "tapped_layers": list(COSMOS_LAYER_PROBE_DEPTHS),
+            "state_t": 2,
+            "vae_input_mode": args.vae_input_mode,
+            "high_noise_sigma": args.sigma,
+            "global_seed": args.seed,
+            "one_forward_pass": True,
+            "context_transform": args.context_transform,
+            "context_tokens_per_layer": metadata["output_tokens"],
+            "context_channels": 2048,
+            "context_grid": [
+                metadata["output_grid"]["temporal"],
+                metadata["output_grid"]["height"],
+                metadata["output_grid"]["width"],
+            ],
+            "context_dtype": "bfloat16",
+            "prompt": dict(prompt_embedding),
+            "weights": dict(weights),
+            "lora_weights": weights.get("lora"),
+            "adapters_applied": bool(weights.get("adapters_applied", False)),
+            **({"merged_lora": weights["merged_lora"]} if "merged_lora" in weights else {}),
+            **(
+                {"lora_block_indices": weights["lora_block_indices"]}
+                if "lora_block_indices" in weights
+                else {}
+            ),
+            "selection": {
+                "stride": args.stride,
+                "ordered_pairs": [
+                    [int(entry["episode_index"]), int(entry["frame_index"])] for entry in entries
+                ],
+            },
+            "split_contract": "selected episodes; no train/validation overlap is permitted by queue",
+            "action_contract": "causal target [30,6], masks preserved; state [1,6]",
+        },
+        "global_seed": args.seed,
+        "entries": entries,
+        "total_bytes": sum(int(entry["bytes"]) for entry in entries),
+        "runtime": runtime,
+    }
+
+
+def _layer_mix_existing_entry(
+    output_dir: Path,
+    episode: int,
+    frame: int,
+    *,
+    expected_seed: int,
+    expected_transform: str,
+) -> Any:
+    path = _artifact_path(output_dir, episode, frame)
+    artifact = verify_layer_mix_feature_cache(path)
+    dataset = artifact.provenance["dataset"]
+    extraction = artifact.provenance["extraction"]
+    if (
+        dataset["episode_index"] != episode
+        or dataset["frame_index"] != frame
+        or dataset["window_indices"] != list(range(frame - 4, frame + 1))
+        or extraction["noise_seed"] != expected_seed
+        or artifact.provenance["output"]["context_transform"] != expected_transform
+    ):
+        raise ValueError(f"existing multi-depth cache provenance does not match request: {path}")
+    sidecar_path = path.with_suffix(".json")
+    return {
+        "sample_id": f"episode-{episode:04d}-frame-{frame:06d}",
+        "episode_index": episode,
+        "frame_index": frame,
+        "window_indices": list(range(frame - 4, frame + 1)),
+        "noise_seed": expected_seed,
+        "safetensors": path.name,
+        "sidecar": sidecar_path.name,
+        "safetensors_sha256": sha256_file(path),
+        "sidecar_sha256": sha256_file(sidecar_path),
+        "bytes": path.stat().st_size + sidecar_path.stat().st_size,
+    }
 
 
 def _manifest_payload(
@@ -272,7 +606,8 @@ def _manifest_payload(
     weights: Mapping[str, Any],
     prompt_embedding: Mapping[str, Any],
 ) -> dict[str, Any]:
-    context = context_transform_metadata(args.context_transform, temporal_frames=args.state_t)
+    effective_state_t = 16 if getattr(args, "readout_head_weights", None) is not None else args.state_t
+    context = context_transform_metadata(args.context_transform, temporal_frames=effective_state_t)
     return {
         "schema_version": MANIFEST_SCHEMA_VERSION,
         "cache_schema_version": CACHE_SCHEMA_VERSION,
@@ -303,6 +638,12 @@ def _manifest_payload(
             "weights": dict(weights),
             "lora_weights": weights.get("lora"),
             "adapters_applied": bool(weights.get("adapters_applied", False)),
+            **({"merged_lora": weights["merged_lora"]} if "merged_lora" in weights else {}),
+            **(
+                {"lora_block_indices": weights["lora_block_indices"]}
+                if "lora_block_indices" in weights
+                else {}
+            ),
             "prompt_embedding": dict(prompt_embedding),
             "extractor_input_keys": ["rgb_history", "prompt_embedding"],
             "excluded_from_extractor": ["state", "target_action", ACTION_IS_PAD_KEY],
@@ -337,7 +678,11 @@ def build(args: argparse.Namespace) -> Path:
         raise FileExistsError(
             f"Refusing to overwrite existing manifest; pass --resume or --overwrite: {manifest_path}"
         )
-    old_manifest = load_cache_manifest(manifest_path) if args.resume and manifest_path.exists() else None
+    old_manifest = (
+        (load_layer_mix_manifest if args.hidden_layers is not None else load_cache_manifest)(manifest_path)
+        if args.resume and manifest_path.exists()
+        else None
+    )
 
     os.environ.setdefault("HF_HUB_OFFLINE", "1")
     os.environ.setdefault("HF_DATASETS_OFFLINE", "1")
@@ -345,7 +690,11 @@ def build(args: argparse.Namespace) -> Path:
 
     checkpoint_path = args.checkpoint.expanduser().resolve()
     tokenizer_path = args.tokenizer.expanduser().resolve()
-    lora_info = _lora_checkpoint_provenance(args.lora_weights) if args.lora_weights is not None else None
+    lora_info = (
+        _lora_checkpoint_provenance(args.lora_weights, expected_blocks=args.lora_blocks)
+        if args.lora_weights is not None
+        else None
+    )
     if lora_info is not None and "bridge" in checkpoint_path.name:
         raise ValueError(
             "--lora-weights requires the generic Cosmos checkpoint, not a fused bridge checkpoint"
@@ -397,7 +746,9 @@ def build(args: argparse.Namespace) -> Path:
         high_noise_sigma=args.sigma,
         seed=args.seed,
         state_t=args.state_t,
+        self_attn_scale=args.self_attn_scale,
         hidden_layer=20,
+        hidden_layers=args.hidden_layers,
         stop_after_step=0,
         random_init_seed=args.random_init_seed,
         vae_input_mode=args.vae_input_mode,
@@ -406,19 +757,44 @@ def build(args: argparse.Namespace) -> Path:
     torch.cuda.reset_peak_memory_stats(device)
     load_start = time.perf_counter()
     extractor = CosmosPredict2Extractor(config)
+    merged_lora_info = None
+    if args.merge_lora_weights is not None:
+        merged_lora_info = merge_lora_file_into_base(
+            extractor.backbone,
+            args.merge_lora_weights.expanduser().resolve(),
+        )
     if lora_info is not None:
         adapter_names = inject_lora(
             extractor.backbone,
             rank=int(lora_info["rank"]),
             alpha=float(lora_info["alpha"]),
+            block_indices=args.lora_blocks,
         )
         load_lora_state_dict(extractor.backbone, args.lora_weights.expanduser().resolve())
         extractor.backbone.eval()
         lora_info["adapter_modules"] = list(adapter_names)
         lora_info["adapters_applied"] = True
+    readout_head = None
+    if args.readout_head_weights is not None:
+        from scripts.video_vam.train_cosmos_t2_distillation import TemporalReadoutHead
+
+        readout_head = TemporalReadoutHead(in_frames=2, out_frames=16, channels=2048).to(
+            device=device, dtype=torch.bfloat16
+        )
+        head_state = load_file(str(args.readout_head_weights.expanduser().resolve()))
+        readout_head.load_state_dict(head_state)
+        readout_head.eval()
+        weights["readout_head"] = str(args.readout_head_weights.expanduser().resolve())
+
     weights = dict(weights)
     weights["lora"] = lora_info
     weights["adapters_applied"] = lora_info is not None
+    if merged_lora_info is not None:
+        weights["merged_lora"] = merged_lora_info
+    if args.lora_blocks is not None:
+        weights["lora_block_indices"] = list(args.lora_blocks)
+    if readout_head is not None:
+        weights["readout_head"] = str(args.readout_head_weights.expanduser().resolve())
     _synchronize(device)
     load_seconds = time.perf_counter() - load_start
     load_peak = _cuda_peak(device)
@@ -434,17 +810,33 @@ def build(args: argparse.Namespace) -> Path:
         noise_seed = derive_window_seed(dataset.revision, episode, frame, args.seed)
         path = _artifact_path(output_dir, episode, frame)
         if args.resume and path.exists():
-            artifact = _existing_entry(
-                output_dir,
-                episode,
-                frame,
-                expected_seed=noise_seed,
-                expected_transform=args.context_transform,
-                expected_sigma=args.sigma,
-                expected_random_init_seed=args.random_init_seed,
-                expected_vae_input_mode=args.vae_input_mode,
-                expected_lora_sha256=None if lora_info is None else str(lora_info["sha256"]),
-            )
+            if args.hidden_layers is not None:
+                _layer_mix_existing_entry(
+                    output_dir,
+                    episode,
+                    frame,
+                    expected_seed=noise_seed,
+                    expected_transform=args.context_transform,
+                )
+                print(f"resume verified {episode}/{frame}: {path}")
+                artifact = verify_layer_mix_feature_cache(path)
+            else:
+                artifact = _existing_entry(
+                    output_dir,
+                    episode,
+                    frame,
+                    expected_seed=noise_seed,
+                    expected_transform=args.context_transform,
+                    expected_sigma=args.sigma,
+                    expected_random_init_seed=args.random_init_seed,
+                    expected_vae_input_mode=args.vae_input_mode,
+                    expected_lora_sha256=None if lora_info is None else str(lora_info["sha256"]),
+                    expected_merged_lora=merged_lora_info,
+                    expected_lora_blocks=args.lora_blocks,
+                    expected_readout_head=None
+                    if args.readout_head_weights is None
+                    else str(args.readout_head_weights.expanduser().resolve()),
+                )
             print(f"resume verified {episode}/{frame}: {path}")
         else:
             if (path.exists() or path.with_suffix(".json").exists()) and not args.overwrite:
@@ -461,98 +853,177 @@ def build(args: argparse.Namespace) -> Path:
             )
             validate_extraction_output(timing.extraction, batch_size=1, sigma=args.sigma)
             extraction = timing.extraction
-            context = (
-                apply_context_transform(extraction.tokens, args.context_transform)
-                .detach()
-                .to(device="cpu", dtype=torch.bfloat16)
-                .contiguous()
-            )
             state = prepared.state.detach().cpu().contiguous()
             target_action = prepared.target_action.detach().cpu().contiguous()
             action_is_pad = prepared.action_is_pad.detach().cpu().contiguous()
-            provenance = build_feature_cache_provenance(
-                dataset={
-                    "repo_id": dataset.repo_id,
-                    "revision": dataset.revision,
-                    "episode_index": episode,
-                    "frame_index": frame,
-                    "window_indices": list(prepared.window_indices),
-                    "window_offsets": list(CUBE_OUT_OF_BOX_CONTRACT.history_offsets),
-                    "fps": CUBE_OUT_OF_BOX_CONTRACT.fps,
-                },
-                source_shapes={
-                    "sample_camera": list(prepared.sample[CUBE_OUT_OF_BOX_CONTRACT.camera_key].shape),
-                    "sample_state": list(prepared.sample[CUBE_OUT_OF_BOX_CONTRACT.state_key].shape),
-                    "sample_action": list(prepared.sample[CUBE_OUT_OF_BOX_CONTRACT.action_key].shape),
-                    "rgb_history": list(prepared.rgb_history.shape),
-                    "prompt_embedding": list(prompt_artifact.embedding.shape),
-                    "raw_hidden": list(extraction.hidden_grid.shape),
-                    "context": list(context.shape),
-                    "state": list(state.shape),
-                    "target_action": list(target_action.shape),
-                    ACTION_IS_PAD_KEY: list(action_is_pad.shape),
-                },
-                weights=weights,
-                prompt_embedding={
-                    "artifact_path": str(args.prompt.expanduser().resolve()),
-                    "output_sha256": prompt_artifact.provenance.output_sha256,
-                    "token_ids_sha256": prompt_artifact.provenance.token_ids_sha256,
-                    "shape": list(prompt_artifact.embedding.shape),
-                    "dtype": str(prompt_artifact.embedding.dtype).removeprefix("torch."),
-                },
-                extractor={
-                    "device": str(device),
-                    "dtype": "bfloat16",
-                    "backend": config.backend,
-                    "high_noise_sigma": config.high_noise_sigma,
-                    "seed": config.seed,
-                    "noise_seed": extraction.provenance.noise_seed,
-                    "hidden_layer": config.hidden_layer,
-                    "stop_after_step": config.stop_after_step,
-                    "vae_input_mode": config.vae_input_mode,
-                    "input_shape": list(prepared.rgb_history.shape),
-                    "preprocess": MIMIC_VIDEO_PREPROCESS,
-                    "conditioning": conditioning_description(args.vae_input_mode, args.state_t),
-                    "official_resolution": "480",
-                    "official_positional_latent_max_h": 240,
-                    "official_positional_latent_max_w": 240,
-                    "bridge_lora": weights.get("bridge_lora"),
-                    "lora_weights": weights.get("lora"),
-                    "adapters_applied": bool(weights.get("adapters_applied", False)),
-                    "extractor_input_keys": ["rgb_history", "prompt_embedding"],
-                    "excluded_from_extractor": ["state", "target_action"],
-                    "checkpoint_ignored_metadata_keys": list(
-                        extraction.provenance.checkpoint_ignored_metadata_keys
-                    ),
-                    "checkpoint_ignored_metadata_count": extraction.provenance.checkpoint_ignored_metadata_count,
-                    "random_init_seed": extraction.provenance.random_init_seed,
-                },
-                upstream_commits={
-                    "lerobot": _git_commit(),
-                    "mimic_video": UPSTREAM_COMMIT,
-                    "vendor_manifest": UPSTREAM_COMMIT,
-                },
-                runtime=_runtime(
-                    load_seconds=load_seconds,
-                    prompt_load_seconds=prompt_load_seconds,
-                    extraction_timing=timing,
-                    load_peak=load_peak,
-                ),
-                context=context,
-                state=state,
-                target_action=target_action,
-                action_is_pad=action_is_pad,
-                raw_hidden_shape=tuple(extraction.hidden_grid.shape),
-                raw_hidden_dtype=extraction.hidden_grid.dtype,
-                context_transform=args.context_transform,
-                temporal_frames=args.state_t,
+            contexts = (
+                {
+                    layer: apply_context_transform(extraction.layer_tokens[layer], args.context_transform)
+                    .detach()
+                    .to(device="cpu", dtype=torch.bfloat16)
+                    .contiguous()
+                    for layer in args.hidden_layers
+                }
+                if args.hidden_layers is not None
+                else None
             )
-            artifact = CosmosFeatureCacheArtifact(context, state, target_action, action_is_pad, provenance)
-            save_feature_cache(artifact, path, overwrite=args.overwrite)
+            if contexts is None:
+                if readout_head is not None:
+                    raw_tokens = extraction.tokens.to(device=device, dtype=torch.bfloat16)
+                    with torch.no_grad():
+                        expanded_tokens = readout_head(raw_tokens)
+                    context = (
+                        apply_context_transform(expanded_tokens, args.context_transform)
+                        .detach()
+                        .to(device="cpu", dtype=torch.bfloat16)
+                        .contiguous()
+                    )
+                else:
+                    context = (
+                        apply_context_transform(extraction.tokens, args.context_transform)
+                        .detach()
+                        .to(device="cpu", dtype=torch.bfloat16)
+                        .contiguous()
+                    )
+            else:
+                context = None
+            if contexts is not None:
+                provenance = _layer_mix_sidecar_payload(
+                    split="train" if episode < 32 else "validation",
+                    dataset=dataset,
+                    episode=episode,
+                    frame=frame,
+                    prepared=prepared,
+                    prompt_embedding={
+                        "artifact_path": str(args.prompt.expanduser().resolve()),
+                        "output_sha256": prompt_artifact.provenance.output_sha256,
+                        "token_ids_sha256": prompt_artifact.provenance.token_ids_sha256,
+                        "shape": list(prompt_artifact.embedding.shape),
+                        "dtype": str(prompt_artifact.embedding.dtype).removeprefix("torch."),
+                    },
+                    extraction=extraction,
+                    contexts=contexts,
+                    context_transform=args.context_transform,
+                    seconds=timing.seconds,
+                    runtime=_runtime(
+                        load_seconds=load_seconds,
+                        prompt_load_seconds=prompt_load_seconds,
+                        extraction_timing=timing,
+                        load_peak=load_peak,
+                    ),
+                    weights=weights,
+                )
+                artifact = CosmosLayerMixCacheItem(contexts, state, target_action, action_is_pad, provenance)
+            else:
+                assert context is not None
+                provenance = build_feature_cache_provenance(
+                    dataset={
+                        "repo_id": dataset.repo_id,
+                        "revision": dataset.revision,
+                        "episode_index": episode,
+                        "frame_index": frame,
+                        "window_indices": list(prepared.window_indices),
+                        "window_offsets": list(CUBE_OUT_OF_BOX_CONTRACT.history_offsets),
+                        "fps": CUBE_OUT_OF_BOX_CONTRACT.fps,
+                    },
+                    source_shapes={
+                        "sample_camera": list(prepared.sample[CUBE_OUT_OF_BOX_CONTRACT.camera_key].shape),
+                        "sample_state": list(prepared.sample[CUBE_OUT_OF_BOX_CONTRACT.state_key].shape),
+                        "sample_action": list(prepared.sample[CUBE_OUT_OF_BOX_CONTRACT.action_key].shape),
+                        "rgb_history": list(prepared.rgb_history.shape),
+                        "prompt_embedding": list(prompt_artifact.embedding.shape),
+                        "raw_hidden": list(
+                            (1, 16, 30, 40, 2048)
+                            if readout_head is not None
+                            else extraction.hidden_grid.shape
+                        ),
+                        "context": list(context.shape),
+                        "state": list(state.shape),
+                        "target_action": list(target_action.shape),
+                        ACTION_IS_PAD_KEY: list(action_is_pad.shape),
+                    },
+                    weights=weights,
+                    prompt_embedding={
+                        "artifact_path": str(args.prompt.expanduser().resolve()),
+                        "output_sha256": prompt_artifact.provenance.output_sha256,
+                        "token_ids_sha256": prompt_artifact.provenance.token_ids_sha256,
+                        "shape": list(prompt_artifact.embedding.shape),
+                        "dtype": str(prompt_artifact.embedding.dtype).removeprefix("torch."),
+                    },
+                    extractor={
+                        "device": str(device),
+                        "dtype": "bfloat16",
+                        "backend": config.backend,
+                        "high_noise_sigma": config.high_noise_sigma,
+                        "seed": config.seed,
+                        "noise_seed": extraction.provenance.noise_seed,
+                        "hidden_layer": config.hidden_layer,
+                        "stop_after_step": config.stop_after_step,
+                        "vae_input_mode": config.vae_input_mode,
+                        "input_shape": list(prepared.rgb_history.shape),
+                        "preprocess": MIMIC_VIDEO_PREPROCESS,
+                        "conditioning": conditioning_description(args.vae_input_mode, args.state_t),
+                        "official_resolution": "480",
+                        "official_positional_latent_max_h": 240,
+                        "official_positional_latent_max_w": 240,
+                        "bridge_lora": weights.get("bridge_lora"),
+                        "lora_weights": weights.get("lora"),
+                        **(
+                            {"merged_lora_weights": weights["merged_lora"]}
+                            if "merged_lora" in weights
+                            else {}
+                        ),
+                        **(
+                            {"lora_block_indices": weights["lora_block_indices"]}
+                            if "lora_block_indices" in weights
+                            else {}
+                        ),
+                        "adapters_applied": bool(weights.get("adapters_applied", False)),
+                        "extractor_input_keys": ["rgb_history", "prompt_embedding"],
+                        "excluded_from_extractor": ["state", "target_action"],
+                        "checkpoint_ignored_metadata_keys": list(
+                            extraction.provenance.checkpoint_ignored_metadata_keys
+                        ),
+                        "checkpoint_ignored_metadata_count": extraction.provenance.checkpoint_ignored_metadata_count,
+                        "random_init_seed": extraction.provenance.random_init_seed,
+                    },
+                    upstream_commits={
+                        "lerobot": _git_commit(),
+                        "mimic_video": UPSTREAM_COMMIT,
+                        "vendor_manifest": UPSTREAM_COMMIT,
+                    },
+                    runtime=_runtime(
+                        load_seconds=load_seconds,
+                        prompt_load_seconds=prompt_load_seconds,
+                        extraction_timing=timing,
+                        load_peak=load_peak,
+                    ),
+                    context=context,
+                    state=state,
+                    target_action=target_action,
+                    action_is_pad=action_is_pad,
+                    raw_hidden_shape=(1, 16, 30, 40, 2048)
+                    if readout_head is not None
+                    else tuple(extraction.hidden_grid.shape),
+                    raw_hidden_dtype=extraction.hidden_grid.dtype,
+                    context_transform=args.context_transform,
+                    temporal_frames=16 if readout_head is not None else args.state_t,
+                )
+                artifact = CosmosFeatureCacheArtifact(
+                    context, state, target_action, action_is_pad, provenance
+                )
+            if contexts is not None:
+                save_layer_mix_feature_cache(artifact, path, overwrite=args.overwrite)
+            else:
+                save_feature_cache(artifact, path, overwrite=args.overwrite)
             total_extract_seconds += timing.seconds
             total_extract_allocated = max(total_extract_allocated, timing.peak_allocated_bytes)
             total_extract_reserved = max(total_extract_reserved, timing.peak_reserved_bytes)
-            artifact = verify_feature_cache(path)
+            artifact = (
+                verify_layer_mix_feature_cache(path)
+                if args.hidden_layers is not None
+                else verify_feature_cache(path)
+            )
             print(f"cached {episode}/{frame}: {path}")
         tensor_path = path
         sidecar_path = path.with_suffix(".json")
@@ -588,8 +1059,16 @@ def build(args: argparse.Namespace) -> Path:
         if old_manifest.context_transform != args.context_transform:
             raise ValueError("resume manifest context transform does not match the request")
         old_provenance = old_manifest.payload["provenance"]
+        if args.hidden_layers is not None and old_provenance.get("tapped_layers") != list(args.hidden_layers):
+            raise ValueError("resume manifest tapped layers do not match the request")
+        if args.hidden_layers is not None and old_provenance.get("state_t") != args.state_t:
+            raise ValueError("resume manifest state_t does not match the request")
         if old_provenance.get("lora_weights") != weights.get("lora"):
             raise ValueError("resume manifest LoRA provenance does not match the request")
+        if old_provenance.get("merged_lora") != weights.get("merged_lora"):
+            raise ValueError("resume manifest merged-LoRA provenance does not match the request")
+        if old_provenance.get("lora_block_indices") != weights.get("lora_block_indices"):
+            raise ValueError("resume manifest LoRA block restriction does not match the request")
         if bool(old_provenance.get("adapters_applied", False)) != bool(
             weights.get("adapters_applied", False)
         ):
@@ -640,7 +1119,7 @@ def build(args: argparse.Namespace) -> Path:
         "shape": list(prompt_artifact.embedding.shape),
         "dtype": str(prompt_artifact.embedding.dtype).removeprefix("torch."),
     }
-    payload = _manifest_payload(
+    payload = (_layer_mix_manifest_payload if args.hidden_layers is not None else _manifest_payload)(
         dataset=dataset,
         args=args,
         entries=entries,
@@ -648,7 +1127,10 @@ def build(args: argparse.Namespace) -> Path:
         weights=weights,
         prompt_embedding=prompt_payload,
     )
-    write_cache_manifest(payload, manifest_path, overwrite=bool(args.resume or args.overwrite))
+    if args.hidden_layers is not None:
+        write_layer_mix_manifest(payload, manifest_path, overwrite=bool(args.resume or args.overwrite))
+    else:
+        write_cache_manifest(payload, manifest_path, overwrite=bool(args.resume or args.overwrite))
     print(f"manifest: {manifest_path}")
     print(f"samples: {len(entries)} total_bytes: {payload['total_bytes']}")
     print("status: diagnostic_only_non_rollout")

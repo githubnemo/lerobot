@@ -51,12 +51,13 @@ def main() -> int:
         }
     )
 
-    lora, cosmos, ltx, smol = (_load(n) for n in ("lora", "cosmos", "ltx", "smolvla"))
+    lora, cosmos, ltx, smol, statet2 = (_load(n) for n in ("lora", "cosmos", "ltx", "smolvla", "statet2"))
     colors = {
         "lora": "#1b7f4e",
         "cosmos": "#2f6fbf",
         "ltx": "#5c6570",
         "smol": "#c47b16",
+        "statet2": "#9b3d9b",
     }
 
     fig, axes = plt.subplots(1, 2, figsize=(11.2, 4.7))
@@ -68,6 +69,13 @@ def main() -> int:
         color=colors["lora"],
         lw=2.1,
         label="Cosmos LoRA + SmolExpert",
+    )
+    ax.plot(
+        [r["step"] / 1000 for r in statet2],
+        [r["rmse"] for r in statet2],
+        color=colors["statet2"],
+        lw=2.1,
+        label="Cosmos LoRA T=2 unpooled + SmolExpert",
     )
     ax.plot(
         [r["step"] / 1000 for r in cosmos],
@@ -93,6 +101,7 @@ def main() -> int:
         label="SmolVLA train-only",
     )
     ax.scatter([38], [13.06], color=colors["lora"], s=32, zorder=5)
+    ax.scatter([27], [13.74], color=colors["statet2"], s=32, zorder=5)
     ax.scatter([36], [13.81], color=colors["cosmos"], s=32, zorder=5)
     ax.scatter([45], [13.84], color=colors["ltx"], s=32, zorder=5)
     ax.scatter([29.2], [14.93], color=colors["smol"], s=32, zorder=5)
@@ -110,6 +119,13 @@ def main() -> int:
         color=colors["lora"],
         lw=2.1,
         label="Cosmos LoRA + SmolExpert",
+    )
+    ax.plot(
+        [r["hours"] for r in statet2],
+        [r["rmse"] for r in statet2],
+        color=colors["statet2"],
+        lw=2.1,
+        label="Cosmos LoRA T=2 unpooled + SmolExpert",
     )
     ax.plot(
         [r["hours"] for r in cosmos],
@@ -135,6 +151,7 @@ def main() -> int:
         label="SmolVLA train-only",
     )
     ax.scatter([1.91], [13.06], color=colors["lora"], s=32, zorder=5)
+    ax.scatter([0.77], [13.74], color=colors["statet2"], s=32, zorder=5)
     ax.scatter([1.67], [13.81], color=colors["cosmos"], s=32, zorder=5)
     ax.scatter([2.99], [13.84], color=colors["ltx"], s=32, zorder=5)
     ax.scatter([1.45], [14.93], color=colors["smol"], s=32, zorder=5)

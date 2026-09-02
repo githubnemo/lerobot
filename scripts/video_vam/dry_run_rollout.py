@@ -341,7 +341,17 @@ class CosmosSmolExpertBackend(SmolExpertRolloutBackend):
         checkpoint: Path,
         tokenizer: Path,
         prompt: Path,
+        state_t: int = 2,
+        context_transform: str = "none",
+        lora_weights: Path | None = None,
+        merge_lora_weights: Path | None = None,
+        compile: bool = True,
     ) -> None:
+        from lerobot.policies.vam.cosmos_lora import (
+            inject_lora,
+            load_lora_state_dict,
+            merge_lora_file_into_base,
+        )
         from lerobot.policies.vam.cosmos_predict2_extractor import (
             CosmosPredict2Extractor,
             CosmosPredict2ExtractorConfig,
@@ -349,20 +359,33 @@ class CosmosSmolExpertBackend(SmolExpertRolloutBackend):
         from lerobot.policies.vam.cosmos_prompt_embedding import load_prompt_embedding
 
         super().__init__(run_dir, device)
+        self.state_t = state_t
+        self.context_transform = context_transform
+        self.compile = compile
         self.prompt = load_prompt_embedding(prompt).embedding
-        self.extractor = CosmosPredict2Extractor(
-            CosmosPredict2ExtractorConfig(
-                checkpoint_path=checkpoint,
-                tokenizer_path=tokenizer,
-                device=str(device),
-                dtype="bfloat16",
-                hidden_layer=20,
-                stop_after_step=0,
-                high_noise_sigma=80.0,
-                seed=0,
-                vae_input_mode="observed_prefix",
-            )
+        config = CosmosPredict2ExtractorConfig(
+            checkpoint_path=checkpoint,
+            tokenizer_path=tokenizer,
+            device=str(device),
+            dtype="bfloat16",
+            hidden_layer=20,
+            stop_after_step=0,
+            high_noise_sigma=80.0,
+            seed=0,
+            state_t=state_t,
+            vae_input_mode="observed_prefix",
+            torch_compile=compile,
+            compile_friendly=compile,
+            compile_mode="max-autotune" if compile else "default",
+            use_cuda_graphs=compile,
         )
+        self.extractor = CosmosPredict2Extractor(config)
+        if merge_lora_weights is not None:
+            merge_lora_file_into_base(self.extractor.backbone, merge_lora_weights)
+        if lora_weights is not None:
+            inject_lora(self.extractor.backbone, rank=16, alpha=16.0, block_indices=range(20))
+            load_lora_state_dict(self.extractor.backbone, lora_weights)
+            self.extractor.backbone.eval()
 
     def extract_context(self, observation: ReplayObservation) -> Tensor:
         from lerobot.policies.vam.cosmos_feature_cache import derive_window_seed
@@ -374,10 +397,14 @@ class CosmosSmolExpertBackend(SmolExpertRolloutBackend):
             0,
         )
         extraction = self.extractor.extract(observation.rgb_history, self.prompt, noise_seed=feature_seed)
-        context = apply_context_transform(extraction.tokens, "pool2")
-        if tuple(context.shape) != (1, 4800, 2048):
-            raise ValueError(f"Cosmos pool2 context has unexpected shape {tuple(context.shape)}")
+        context = apply_context_transform(extraction.tokens, self.context_transform)
         return context.to(device=self.device, dtype=torch.bfloat16)
+
+    def predict_chunk(self, observation: ReplayObservation, seed: int) -> Tensor:
+        context = self.extract_context(observation)
+        state = observation.state[None, None].to(device=self.device, dtype=torch.float32)
+        actions = self.decoder.sample_actions(state, context, seed=seed, use_cuda_graph=self.compile)
+        return _finite_chunk(actions[0], self.name)
 
     def close(self) -> None:
         del self.extractor
@@ -734,6 +761,11 @@ def _make_backend(
             args.cosmos_checkpoint,
             args.cosmos_tokenizer,
             args.cosmos_prompt,
+            state_t=args.cosmos_state_t,
+            context_transform=args.cosmos_context_transform,
+            lora_weights=args.cosmos_lora,
+            merge_lora_weights=args.cosmos_merge_lora,
+            compile=args.compile,
         )
     if args.policy == "ltx-smolexpert":
         return LTXSmolExpertBackend(
@@ -927,6 +959,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--cosmos-checkpoint", type=Path, default=DEFAULT_COSMOS_CHECKPOINT)
     parser.add_argument("--cosmos-tokenizer", type=Path, default=DEFAULT_COSMOS_TOKENIZER)
     parser.add_argument("--cosmos-prompt", type=Path, default=DEFAULT_COSMOS_PROMPT)
+    parser.add_argument("--cosmos-state-t", type=int, choices=(2, 16), default=2)
+    parser.add_argument("--cosmos-context-transform", choices=("none", "pool2"), default="none")
+    parser.add_argument("--cosmos-lora", type=Path)
+    parser.add_argument("--cosmos-merge-lora", type=Path)
+    parser.add_argument(
+        "--compile",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Compile Cosmos DiT with max-autotune and use CUDA graph for SmolExpert decoder.",
+    )
     parser.add_argument("--ltx-run", type=Path, default=DEFAULT_LTX_RUN)
     parser.add_argument("--ltx-transformer", type=Path, default=DEFAULT_LTX_TRANSFORMER)
     parser.add_argument("--ltx-vae", type=Path, default=DEFAULT_LTX_VAE)

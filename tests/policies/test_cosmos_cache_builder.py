@@ -19,6 +19,14 @@ def test_builder_accepts_episode_zero_and_bounded_subset():
     assert args.state_t == 16
 
 
+def test_builder_accepts_canonical_multidepth_layers():
+    args = parse_args(
+        ["--episodes", "0", "--state-t", "2", "--sigma", "80", "--hidden-layers", "4,8,12,16,18,20"]
+    )
+    _validate_args(args)
+    assert args.hidden_layers == (4, 8, 12, 16, 18, 20)
+
+
 def test_builder_accepts_observed_only_state_t2():
     args = parse_args(["--episodes", "0", "--state-t", "2"])
     _validate_args(args)

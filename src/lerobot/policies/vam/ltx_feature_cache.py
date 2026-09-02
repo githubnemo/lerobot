@@ -25,10 +25,37 @@ STATE_KEY = "state"
 TARGET_ACTION_KEY = "target_action"
 ACTION_IS_PAD_KEY = "action_is_pad"
 TENSOR_KEYS = frozenset({CONTEXT_KEY, STATE_KEY, TARGET_ACTION_KEY, ACTION_IS_PAD_KEY})
-CONTEXT_SPECS = {
-    "pool2": ((1, 640, 4096), [8, 8, 10]),
-    "none": ((1, 2400, 4096), [8, 15, 20]),
+LTX_STATE_T = (2, 8)
+CONTEXT_SPATIAL_GRIDS = {
+    "pool2": (8, 10),
+    "none": (15, 20),
 }
+# Retain the original state_t=8 constants for callers that imported them.
+CONTEXT_SPECS = {
+    transform: ((1, state_t * height * width, 4096), [state_t, height, width])
+    for transform, (height, width) in CONTEXT_SPATIAL_GRIDS.items()
+    for state_t in (8,)
+}
+
+
+def context_spec(context_transform: str, state_t: int) -> tuple[tuple[int, int, int], list[int]]:
+    if state_t not in LTX_STATE_T:
+        raise ValueError(f"state_t must be one of {LTX_STATE_T}")
+    try:
+        height, width = CONTEXT_SPATIAL_GRIDS[context_transform]
+    except KeyError as exc:
+        raise ValueError(f"unsupported LTX context transform: {context_transform!r}") from exc
+    grid = [state_t, height, width]
+    return (1, state_t * height * width, 4096), grid
+
+
+def state_t_from_context_shape(context_transform: str, shape: tuple[int, ...]) -> int:
+    matches = [state_t for state_t in LTX_STATE_T if context_spec(context_transform, state_t)[0] == shape]
+    if len(matches) != 1:
+        raise ValueError(f"context shape {shape} is invalid for transform {context_transform!r}")
+    return matches[0]
+
+
 STATE_SHAPE = (1, 1, 6)
 ACTION_SHAPE = (1, 30, 6)
 PADDING_SHAPE = (1, 30)
@@ -131,7 +158,9 @@ def validate_tensors(tensors: Mapping[str, torch.Tensor]) -> None:
         ACTION_IS_PAD_KEY: PADDING_SHAPE,
     }
     context_shape = tuple(tensors[CONTEXT_KEY].shape)
-    allowed_context_shapes = {spec[0] for spec in CONTEXT_SPECS.values()}
+    allowed_context_shapes = {
+        context_spec(transform, state_t)[0] for transform in CONTEXT_SPATIAL_GRIDS for state_t in LTX_STATE_T
+    }
     if context_shape not in allowed_context_shapes:
         raise LTXFeatureCacheError(
             f"context shape must be one of {sorted(allowed_context_shapes)}, got {context_shape}"
@@ -208,11 +237,33 @@ def verify_ltx_feature_cache(
     transform = output.get("context_transform")
     if transform not in CONTEXT_SPECS:
         raise LTXFeatureCacheError(f"unsupported LTX context transform: {transform!r}")
-    expected_context_shape, _grid = CONTEXT_SPECS[transform]
+    context_shape = tuple(tensors[CONTEXT_KEY].shape)
+    declared_grid = output.get("context_grid")
+    if declared_grid is not None:
+        if (
+            not isinstance(declared_grid, list)
+            or len(declared_grid) != 3
+            or any(type(value) is not int or value <= 0 for value in declared_grid)
+        ):
+            raise LTXFeatureCacheError("LTX context grid is malformed")
+        state_t = declared_grid[0]
+        try:
+            expected_context_shape, expected_grid = context_spec(transform, state_t)
+        except ValueError as exc:
+            raise LTXFeatureCacheError("LTX context grid is invalid") from exc
+        if declared_grid != expected_grid:
+            raise LTXFeatureCacheError("LTX context grid does not match its transform")
+    else:
+        try:
+            state_t = state_t_from_context_shape(transform, context_shape)
+            expected_context_shape, expected_grid = context_spec(transform, state_t)
+        except ValueError as exc:
+            raise LTXFeatureCacheError("LTX context shape is invalid") from exc
     if (
         output.get("context_shape") != list(expected_context_shape)
         or output.get("context_dtype") != "bfloat16"
         or tuple(tensors[CONTEXT_KEY].shape) != expected_context_shape
+        or ("context_tokens" in output and output["context_tokens"] != expected_context_shape[1])
     ):
         raise LTXFeatureCacheError("LTX context tensor does not match its sidecar representation")
     if expected_entry is not None and (
@@ -259,15 +310,19 @@ def load_ltx_cache_manifest(path: Path) -> CacheManifest:
         raise LTXFeatureCacheError("manifest schema or artifact identity is invalid")
     provenance = payload["provenance"]
     transform = provenance.get("context_transform")
-    expected = CONTEXT_SPECS.get(transform)
+    declared_grid = provenance.get("context_grid")
+    try:
+        state_t = declared_grid[0]
+        expected_shape, expected_grid = context_spec(transform, state_t)
+    except (TypeError, IndexError, ValueError) as exc:
+        raise LTXFeatureCacheError("manifest LTX producer contract is invalid") from exc
     if (
         provenance.get("backbone") != "LTX-2.5-22B-distilled"
         or provenance.get("hidden_layer") != 34
         or provenance.get("high_noise_sigma") != 1.0
-        or expected is None
-        or provenance.get("context_tokens") != expected[0][1]
+        or provenance.get("context_tokens") != expected_shape[1]
         or provenance.get("context_channels") != 4096
-        or provenance.get("context_grid") != expected[1]
+        or declared_grid != expected_grid
         or provenance.get("context_dtype") != "bfloat16"
     ):
         raise LTXFeatureCacheError("manifest LTX producer contract is invalid")

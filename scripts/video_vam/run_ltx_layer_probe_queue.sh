@@ -47,7 +47,7 @@ for attempt in 1 2; do
         break
     fi
     status=${PIPESTATUS[0]}
-    if rg -q "deleted [0-9]+ corrupt cache tensor/sidecar pairs" "$cache_log"; then
+    if grep -Eq "deleted [0-9]+ corrupt cache tensor/sidecar pairs" "$cache_log"; then
         printf "[%s] cache hash audit found corruption; retrying with --resume\n" \
             "$(date --iso-8601=seconds)"
     else
@@ -95,7 +95,7 @@ for setup in "2 2 4" "2 2 2" "2 2 1" "1 4 1"; do
         break
     fi
     status=${PIPESTATUS[0]}
-    if rg -q "CUDA OOM" "$attempt_log"; then
+    if grep -Eq "CUDA OOM" "$attempt_log"; then
         printf "[%s] pool2 OOM with batch=%s grad_accum=%s chunk=%s; trying lower-memory setup\n" \
             "$(date --iso-8601=seconds)" "$batch_size" "$grad_accum" "$flow_chunk"
     else

@@ -165,6 +165,23 @@ def make_artifact():
     )
 
 
+def test_observed_only_unpooled_provenance_roundtrips_with_2400_tokens(tmp_path):
+    context = torch.zeros((1, 2_400, 2_048), dtype=torch.bfloat16)
+    state = torch.zeros((1, 1, 6), dtype=torch.float32)
+    target_action = torch.ones((1, 30, 6), dtype=torch.float32)
+    action_is_pad = torch.zeros((1, 30), dtype=torch.bool)
+    artifact = CosmosFeatureCacheArtifact(
+        context,
+        state,
+        target_action,
+        action_is_pad,
+        make_provenance(context, state, target_action, action_is_pad, temporal_frames=2),
+    )
+    output = tmp_path / "observed-only-unpooled.safetensors"
+    save_feature_cache(artifact, output)
+    assert load_feature_cache(output).context.shape == (1, 2_400, 2_048)
+
+
 def test_observed_only_pool2_provenance_roundtrips_with_600_tokens(tmp_path):
     context = torch.zeros((1, 600, 2048), dtype=torch.bfloat16)
     state = torch.zeros((1, 1, 6), dtype=torch.float32)

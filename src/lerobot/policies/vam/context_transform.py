@@ -12,6 +12,7 @@ CONTEXT_GRID_T, CONTEXT_GRID_H, CONTEXT_GRID_W = 16, 30, 40
 CONTEXT_CONDITIONING_FRAMES = 2
 CONTEXT_TRANSFORMS = (
     "none",
+    "cosmos3_edge_none",
     "cond_frames",
     "gen_frames_pool2",
     "pool2",
@@ -37,19 +38,19 @@ class ContextTransformSpec:
 
 
 def _validate_temporal_frames(temporal_frames: int) -> int:
-    if temporal_frames not in (2, 16):
-        raise ValueError("temporal_frames must be 2 or 16")
+    if temporal_frames not in (2, 3, 4, 6, 8, 12, 16):
+        raise ValueError(f"temporal_frames must be in (2, 3, 4, 6, 8, 12, 16), got {temporal_frames}")
     return temporal_frames
 
 
 def _input_grid_from_tokens(tokens: int) -> tuple[int, int, int]:
-    if tokens == 16 * 30 * 40:
-        return 16, 30, 40
-    if tokens == 2 * 30 * 40:
-        return 2, 30, 40
+    for t in (2, 3, 4, 6, 8, 12, 16):
+        if tokens == t * 30 * 40:
+            return t, 30, 40
+        if tokens == t * 15 * 20:
+            return t, 15, 20
     raise ValueError(
-        "Cosmos context must contain 19200 tokens for a 16-frame grid or "
-        f"2400 tokens for a 2-frame grid, got {tokens}"
+        f"Cosmos context must contain T*1200 or T*300 tokens for T in (2, 3, 4, 6, 8, 12, 16), got {tokens}"
     )
 
 
@@ -72,6 +73,8 @@ def context_transform_spec(transform: str, temporal_frames: int = 16) -> Context
         grid = (temporal_frames, 1, 1)
     elif transform == "global_mean":
         grid = (1, 1, 1)
+    elif transform == "cosmos3_edge_none":
+        grid = (temporal_frames, 15, 20)
     else:
         grid = (temporal_frames, CONTEXT_GRID_H, CONTEXT_GRID_W)
     return ContextTransformSpec(transform, grid)

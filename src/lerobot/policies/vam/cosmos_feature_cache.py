@@ -70,6 +70,26 @@ _WEIGHT_KEYS = frozenset(
     }
 )
 _WEIGHT_KEYS_WITH_LORA = _WEIGHT_KEYS | frozenset({"lora", "adapters_applied"})
+_WEIGHT_KEYS_WITH_MERGED_LORA = _WEIGHT_KEYS_WITH_LORA | frozenset({"merged_lora"})
+_WEIGHT_KEYS_WITH_LORA_BLOCKS = _WEIGHT_KEYS_WITH_LORA | frozenset({"lora_block_indices"})
+_WEIGHT_KEYS_WITH_MERGED_AND_BLOCKS = _WEIGHT_KEYS_WITH_LORA | frozenset(
+    {"merged_lora", "lora_block_indices"}
+)
+_WEIGHT_KEYS_WITH_READOUT_HEAD = _WEIGHT_KEYS_WITH_MERGED_AND_BLOCKS | frozenset({"readout_head"})
+_MERGED_LORA_PROVENANCE_KEYS = frozenset(
+    {
+        "path",
+        "sha256",
+        "size_bytes",
+        "rank",
+        "alpha",
+        "sidecar_path",
+        "sidecar_sha256",
+        "sidecar_metadata",
+        "adapter_modules",
+        "merged",
+    }
+)
 _LORA_PROVENANCE_KEYS = frozenset(
     {
         "path",
@@ -112,6 +132,7 @@ _EXTRACTOR_KEYS_WITH_VAE_INPUT_MODE = _EXTRACTOR_KEYS | frozenset({"vae_input_mo
 _EXTRACTOR_KEYS_WITH_VAE_INPUT_MODE_AND_LORA = _EXTRACTOR_KEYS_WITH_VAE_INPUT_MODE | frozenset(
     {"lora_weights", "adapters_applied"}
 )
+_EXTRACTOR_DUAL_ADAPTER_EXTRAS = frozenset({"merged_lora_weights", "lora_block_indices"})
 _RUNTIME_KEYS = frozenset(
     {
         "load_seconds",
@@ -281,7 +302,15 @@ def _validate_provenance(payload: Mapping[str, Any]) -> dict[str, Any]:
     if not isinstance(weights, Mapping):
         raise CosmosFeatureCacheValidationError("weights provenance must be an object")
     weight_keys = set(weights)
-    if weight_keys not in {_WEIGHT_KEYS, _WEIGHT_KEYS_WITH_LORA}:
+    allowed_weight_keys = {
+        _WEIGHT_KEYS,
+        _WEIGHT_KEYS_WITH_LORA,
+        _WEIGHT_KEYS_WITH_MERGED_LORA,
+        _WEIGHT_KEYS_WITH_LORA_BLOCKS,
+        _WEIGHT_KEYS_WITH_MERGED_AND_BLOCKS,
+        _WEIGHT_KEYS_WITH_READOUT_HEAD,
+    }
+    if weight_keys not in allowed_weight_keys:
         _strict_keys(weights, _WEIGHT_KEYS, "weights")
     for name in ("checkpoint_path", "tokenizer_path", "checkpoint_kind"):
         _non_empty_string(weights[name], f"weights.{name}")
@@ -294,7 +323,9 @@ def _validate_provenance(payload: Mapping[str, Any]) -> dict[str, Any]:
         raise CosmosFeatureCacheValidationError("weights.checkpoint_kind is unsupported")
     if weights["bridge_lora"] is not None and not isinstance(weights["bridge_lora"], Mapping):
         raise CosmosFeatureCacheValidationError("weights.bridge_lora must be null or an object")
-    if weight_keys == _WEIGHT_KEYS_WITH_LORA:
+    if "readout_head" in weights and weights["readout_head"] is not None:
+        _non_empty_string(weights["readout_head"], "weights.readout_head")
+    if "adapters_applied" in weights:
         adapters_applied = weights["adapters_applied"]
         lora = weights["lora"]
         if not isinstance(adapters_applied, bool):
@@ -304,7 +335,9 @@ def _validate_provenance(payload: Mapping[str, Any]) -> dict[str, Any]:
         if lora is not None:
             if not isinstance(lora, Mapping):
                 raise CosmosFeatureCacheValidationError("weights.lora must be null or an object")
-            _strict_keys(lora, _LORA_PROVENANCE_KEYS, "weights.lora")
+            lora_keys = set(lora)
+            if lora_keys not in {_LORA_PROVENANCE_KEYS, _LORA_PROVENANCE_KEYS | {"block_indices"}}:
+                _strict_keys(lora, _LORA_PROVENANCE_KEYS, "weights.lora")
             for name in ("path", "metadata_path"):
                 _non_empty_string(lora[name], f"weights.lora.{name}")
             for name in ("size_bytes", "rank"):
@@ -326,6 +359,56 @@ def _validate_provenance(payload: Mapping[str, Any]) -> dict[str, Any]:
                 raise CosmosFeatureCacheValidationError(
                     "weights.lora.adapter_modules must be non-empty strings"
                 )
+            if "block_indices" in lora:
+                block_indices = lora["block_indices"]
+                if (
+                    not isinstance(block_indices, list)
+                    or not block_indices
+                    or any(type(index) is not int or index < 0 or index > 27 for index in block_indices)
+                ):
+                    raise CosmosFeatureCacheValidationError(
+                        "weights.lora.block_indices must be integers in [0, 27]"
+                    )
+
+    if "merged_lora" in weights:
+        merged_lora = weights["merged_lora"]
+        if not isinstance(merged_lora, Mapping):
+            raise CosmosFeatureCacheValidationError("weights.merged_lora must be an object")
+        _strict_keys(merged_lora, _MERGED_LORA_PROVENANCE_KEYS, "weights.merged_lora")
+        for name in ("path", "sidecar_path"):
+            _non_empty_string(merged_lora[name], f"weights.merged_lora.{name}")
+        if type(merged_lora["size_bytes"]) is not int or merged_lora["size_bytes"] <= 0:
+            raise CosmosFeatureCacheValidationError(
+                "weights.merged_lora.size_bytes must be a positive integer"
+            )
+        if type(merged_lora["rank"]) is not int or merged_lora["rank"] <= 0:
+            raise CosmosFeatureCacheValidationError("weights.merged_lora.rank must be a positive integer")
+        for name in ("sha256", "sidecar_sha256"):
+            _sha256(merged_lora[name], f"weights.merged_lora.{name}")
+        if not isinstance(merged_lora["alpha"], (int, float)) or isinstance(merged_lora["alpha"], bool):
+            raise CosmosFeatureCacheValidationError("weights.merged_lora.alpha must be numeric")
+        if not math.isfinite(float(merged_lora["alpha"])) or float(merged_lora["alpha"]) <= 0:
+            raise CosmosFeatureCacheValidationError("weights.merged_lora.alpha must be finite and positive")
+        if merged_lora["merged"] is not True:
+            raise CosmosFeatureCacheValidationError("weights.merged_lora.merged must be true")
+        if not isinstance(merged_lora["sidecar_metadata"], Mapping):
+            raise CosmosFeatureCacheValidationError("weights.merged_lora.sidecar_metadata must be an object")
+        if (
+            not isinstance(merged_lora["adapter_modules"], list)
+            or not merged_lora["adapter_modules"]
+            or any(not isinstance(name, str) or not name for name in merged_lora["adapter_modules"])
+        ):
+            raise CosmosFeatureCacheValidationError(
+                "weights.merged_lora.adapter_modules must be non-empty strings"
+            )
+    if "lora_block_indices" in weights:
+        block_indices = weights["lora_block_indices"]
+        if (
+            not isinstance(block_indices, list)
+            or not block_indices
+            or any(type(index) is not int or index < 0 or index > 27 for index in block_indices)
+        ):
+            raise CosmosFeatureCacheValidationError("weights.lora_block_indices must be integers in [0, 27]")
 
     prompt = payload["prompt_embedding"]
     if not isinstance(prompt, Mapping):
@@ -352,6 +435,14 @@ def _validate_provenance(payload: Mapping[str, Any]) -> dict[str, Any]:
         _EXTRACTOR_KEYS_WITH_LORA | {"random_init_seed"},
         _EXTRACTOR_KEYS_WITH_VAE_INPUT_MODE_AND_LORA,
         _EXTRACTOR_KEYS_WITH_VAE_INPUT_MODE_AND_LORA | {"random_init_seed"},
+        _EXTRACTOR_KEYS_WITH_LORA | _EXTRACTOR_DUAL_ADAPTER_EXTRAS,
+        _EXTRACTOR_KEYS_WITH_LORA | _EXTRACTOR_DUAL_ADAPTER_EXTRAS | {"random_init_seed"},
+        _EXTRACTOR_KEYS_WITH_VAE_INPUT_MODE_AND_LORA | _EXTRACTOR_DUAL_ADAPTER_EXTRAS,
+        _EXTRACTOR_KEYS_WITH_VAE_INPUT_MODE_AND_LORA | _EXTRACTOR_DUAL_ADAPTER_EXTRAS | {"random_init_seed"},
+        _EXTRACTOR_KEYS_WITH_VAE_INPUT_MODE_AND_LORA | {"merged_lora_weights"},
+        _EXTRACTOR_KEYS_WITH_VAE_INPUT_MODE_AND_LORA | {"merged_lora_weights", "random_init_seed"},
+        _EXTRACTOR_KEYS_WITH_VAE_INPUT_MODE_AND_LORA | {"lora_block_indices"},
+        _EXTRACTOR_KEYS_WITH_VAE_INPUT_MODE_AND_LORA | {"lora_block_indices", "random_init_seed"},
     }
     if extractor_keys not in allowed_extractor_keys:
         raise CosmosFeatureCacheValidationError("extractor provenance keys are malformed")

@@ -13,6 +13,7 @@ from scripts.video_vam.train_smolexpert_on_cosmos import (
     LTX_PROMPT_ARTIFACT,
     context_spec_from_manifest,
     load_joint_checkpoint,
+    prepare_model_context,
     save_checkpoint,
 )
 
@@ -25,6 +26,37 @@ def _manifest(provenance: dict, *, artifact: str | None = None) -> CacheManifest
     if artifact is not None:
         payload["artifact"] = artifact
     return CacheManifest(Path("/cache/manifest.json"), payload, ())
+
+
+def test_cosmos_multidepth_manifest_sets_attention_layers_and_width() -> None:
+    manifest = _manifest(
+        {
+            "backbone": "Cosmos-Predict2-2B",
+            "hidden_layer": 20,
+            "deepest_layer": 20,
+            "state_t": 2,
+            "high_noise_sigma": 80.0,
+            "tapped_layers": [4, 8, 12, 16, 18, 20],
+            "context_transform": "none",
+            "context_tokens_per_layer": 2_400,
+            "context_channels": 2_048,
+            "context_grid": [2, 30, 40],
+            "context_dtype": "bfloat16",
+        },
+        artifact="cosmos_multidepth_statet2_none_feature_manifest",
+    )
+    spec = context_spec_from_manifest(manifest)
+    assert (spec.stored_tokens, spec.model_tokens, spec.channels) == (2_400, 2_400, 2_048)
+    assert spec.tapped_layers == (4, 8, 12, 16, 18, 20)
+    mixer = LTXLayerAttentionMix(
+        spec.tapped_layers, hidden_width=spec.channels, attn_width=2_048, num_heads=8
+    )
+    mixed = prepare_model_context(
+        torch.zeros(1, len(spec.tapped_layers), spec.stored_tokens, spec.channels, dtype=torch.bfloat16),
+        spec,
+        mixer,
+    )
+    assert mixed.shape == (1, spec.stored_tokens, spec.channels)
 
 
 def test_cosmos_manifest_preserves_default_pool2_contract() -> None:

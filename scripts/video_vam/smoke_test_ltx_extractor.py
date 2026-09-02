@@ -36,7 +36,7 @@ class SmokeEncoder(nn.Module):
 class SmokeBackbone(nn.Module):
     def forward(self, *, latent: torch.Tensor, **_: Any) -> torch.Tensor:
         return torch.full(
-            (latent.shape[0], 2400, 4096),
+            (latent.shape[0], latent.shape[1], 4096),
             0.5,
             device=latent.device,
             dtype=latent.dtype,
@@ -53,6 +53,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--prompt-embedding", type=Path, required=False)
     parser.add_argument("--dataset-revision", default="243370c3c08bcbd860133c4a0d658ea7c1d2e77e")
     parser.add_argument("--global-seed", type=int, default=0)
+    parser.add_argument("--state-t", type=int, choices=(2, 8), default=8)
     parser.add_argument(
         "--fake", action="store_true", help="Run the injected contract backend instead of LTX weights."
     )
@@ -109,6 +110,7 @@ def main(argv: list[str] | None = None) -> int:
         video_vae_path=args.video_vae,
         device="cuda",
         dtype="bfloat16",
+        state_t=args.state_t,
     )
     if args.fake:
         extractor = LTXExtractor(config, backbone=SmokeBackbone(), latent_encoder=SmokeEncoder())

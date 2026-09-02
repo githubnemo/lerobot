@@ -18,8 +18,9 @@ from lerobot.policies.vam.ltx_feature_cache import (
 )
 
 
-def provenance(context_transform: str = "pool2") -> dict:
-    context_shape = [1, 640, 4096] if context_transform == "pool2" else [1, 2400, 4096]
+def provenance(context_transform: str = "pool2", state_t: int = 8) -> dict:
+    spatial_tokens = 80 if context_transform == "pool2" else 300
+    context_shape = [1, state_t * spatial_tokens, 4096]
     return {
         "schema_version": 1,
         "artifact": "ltx25_frozen_feature_cache",
@@ -38,26 +39,31 @@ def provenance(context_transform: str = "pool2") -> dict:
             "observed_rgb_frames": 5,
             "vae_input_frames": 9,
             "clean_latent_frames": 2,
-            "sigma1_noise_latent_frames": 6,
+            "sigma1_noise_latent_frames": max(state_t - 2, 0),
             "future_pixels_used": False,
+            "state_t": state_t,
+            "target_frame_count": 1 + 8 * (state_t - 1),
         },
         "output": {
             "context_transform": context_transform,
             "context_shape": context_shape,
             "context_dtype": "bfloat16",
+            "context_grid": [state_t, 8, 10] if context_transform == "pool2" else [state_t, 15, 20],
+            "context_tokens": context_shape[1],
         },
         "tensors": {"action_padding_semantics": "true means padded"},
     }
 
 
-def cache_item(context_transform: str = "pool2") -> LTXFeatureCacheItem:
-    tokens = 640 if context_transform == "pool2" else 2400
+def cache_item(context_transform: str = "pool2", state_t: int = 8) -> LTXFeatureCacheItem:
+    tokens_per_frame = 80 if context_transform == "pool2" else 300
+    tokens = state_t * tokens_per_frame
     return LTXFeatureCacheItem(
         context=torch.zeros(1, tokens, 4096, dtype=torch.bfloat16),
         state=torch.arange(6, dtype=torch.float32).view(1, 1, 6),
         target_action=torch.zeros(1, 30, 6, dtype=torch.float32),
         action_is_pad=torch.zeros(1, 30, dtype=torch.bool),
-        provenance=provenance(context_transform),
+        provenance=provenance(context_transform, state_t),
     )
 
 
@@ -67,6 +73,23 @@ def test_pool2_ltx_context_shape_order_and_constant_preservation() -> None:
     assert pooled.shape == (1, 640, 4096)
     assert torch.equal(pooled[:, :80], torch.zeros_like(pooled[:, :80]))
     assert torch.equal(pooled[:, -80:], torch.full_like(pooled[:, -80:], 7))
+
+
+def test_pool2_ltx_context_supports_two_latent_frames() -> None:
+    grid = torch.arange(2, dtype=torch.float32).view(1, 2, 1, 1, 1).expand(1, 2, 15, 20, 4096)
+    pooled = pool2_ltx_context(grid)
+    assert pooled.shape == (1, 160, 4096)
+    assert torch.equal(pooled[:, :80], torch.zeros_like(pooled[:, :80]))
+    assert torch.equal(pooled[:, -80:], torch.ones_like(pooled[:, -80:]))
+
+
+def test_state_t2_ltx_cache_supports_unpooled_and_pool2_token_counts(tmp_path: Path) -> None:
+    for transform, tokens in (("none", 600), ("pool2", 160)):
+        tensor_path = tmp_path / f"state-t2-{transform}.safetensors"
+        save_ltx_feature_cache(cache_item(transform, state_t=2), tensor_path)
+        loaded = verify_ltx_feature_cache(tensor_path)
+        assert loaded.context.shape == (1, tokens, 4096)
+        assert loaded.provenance["output"]["context_tokens"] == tokens
 
 
 def test_ltx_cache_round_trip_and_manifest(tmp_path: Path) -> None:

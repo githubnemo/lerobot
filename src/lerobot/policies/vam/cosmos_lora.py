@@ -8,8 +8,10 @@ video/action training.
 
 from __future__ import annotations
 
+import hashlib
+import json
 import math
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -101,8 +103,14 @@ def _is_lora_target(name: str, module: nn.Module) -> bool:
     return pieces[-1] in MLP_TARGET_SUFFIXES and "mlp" in pieces
 
 
-def inject_lora(model: nn.Module, *, rank: int = 16, alpha: float | None = None) -> tuple[str, ...]:
-    """Wrap every intended attention/MLP projection in all 28 blocks.
+def inject_lora(
+    model: nn.Module,
+    *,
+    rank: int = 16,
+    alpha: float | None = None,
+    block_indices: Sequence[int] | None = None,
+) -> tuple[str, ...]:
+    """Wrap intended attention/MLP projections in selected Cosmos blocks.
 
     Wrapping is performed from the LeRobot-owned module, so the vendored source
     and its manifest are not modified.  Existing base weights retain their
@@ -110,9 +118,21 @@ def inject_lora(model: nn.Module, *, rank: int = 16, alpha: float | None = None)
     """
     if not hasattr(model, "blocks") or len(model.blocks) != 28:
         raise ValueError("Cosmos Predict2 LoRA injection requires exactly 28 DiT blocks")
-    candidates = [(name, module) for name, module in model.named_modules() if _is_lora_target(name, module)]
+    if block_indices is None:
+        selected_blocks = set(range(28))
+    else:
+        selected_blocks = set(block_indices)
+        if not selected_blocks or any(
+            type(index) is not int or not 0 <= index < 28 for index in selected_blocks
+        ):
+            raise ValueError("block_indices must contain at least one integer in [0, 27]")
+    candidates = [
+        (name, module)
+        for name, module in model.named_modules()
+        if _is_lora_target(name, module) and int(name.split(".")[1]) in selected_blocks
+    ]
     if not candidates:
-        raise ValueError("no intended Cosmos attention/MLP projections were found")
+        raise ValueError("no intended Cosmos attention/MLP projections were found in selected blocks")
     wrapped: list[str] = []
     for name, module in candidates:
         parent_name, attribute = name.rsplit(".", 1)
@@ -125,6 +145,61 @@ def inject_lora(model: nn.Module, *, rank: int = 16, alpha: float | None = None)
         raise ValueError("LoRA injection did not wrap any modules")
     freeze_base_parameters(model)
     return tuple(wrapped)
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(16 * 1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def merge_lora_file_into_base(model: nn.Module, lora_path: str | Path) -> dict[str, Any]:
+    """Load a full-backbone adapter checkpoint and merge it into ``model``.
+
+    The adapter's sidecar is part of the load contract: its rank and alpha are
+    used to construct the exact wrappers before the strict adapter load.
+    """
+    path = Path(lora_path).expanduser().resolve()
+    if not path.is_file():
+        raise FileNotFoundError(f"LoRA weights not found: {path}")
+    sidecar_path = path.with_suffix(".json")
+    if not sidecar_path.is_file():
+        raise FileNotFoundError(f"LoRA provenance sidecar not found: {sidecar_path}")
+    try:
+        sidecar = json.loads(sidecar_path.read_text())
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(f"could not read LoRA provenance sidecar {sidecar_path}: {exc}") from exc
+    lora = sidecar.get("lora")
+    if not isinstance(lora, Mapping):
+        raise ValueError(f"LoRA provenance sidecar has no lora object: {sidecar_path}")
+    rank = lora.get("rank")
+    alpha = lora.get("alpha")
+    if type(rank) is not int or rank <= 0:
+        raise ValueError(f"LoRA provenance rank must be a positive integer: {sidecar_path}")
+    if (
+        isinstance(alpha, bool)
+        or not isinstance(alpha, (int, float))
+        or not math.isfinite(float(alpha))
+        or float(alpha) <= 0
+    ):
+        raise ValueError(f"LoRA provenance alpha must be finite and positive: {sidecar_path}")
+    adapter_names = inject_lora(model, rank=rank, alpha=float(alpha))
+    load_lora_state_dict(model, path)
+    merge_lora_into_base(model)
+    return {
+        "path": str(path),
+        "sha256": _sha256_file(path),
+        "size_bytes": path.stat().st_size,
+        "rank": rank,
+        "alpha": float(alpha),
+        "sidecar_path": str(sidecar_path),
+        "sidecar_sha256": _sha256_file(sidecar_path),
+        "sidecar_metadata": sidecar,
+        "adapter_modules": list(adapter_names),
+        "merged": True,
+    }
 
 
 def freeze_base_parameters(model: nn.Module) -> None:

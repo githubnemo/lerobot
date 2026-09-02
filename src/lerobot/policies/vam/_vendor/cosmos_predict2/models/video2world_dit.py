@@ -37,6 +37,7 @@ class MinimalV1LVGDiT(MiniTrainDIT):
         data_type: DataType | None = DataType.VIDEO,
         use_cuda_graphs: bool = False,
         return_only_hidden_states_up_to: int | None = None,
+        detach_hidden_states: bool = True,
         **kwargs,
     ) -> torch.Tensor | list[torch.Tensor] | tuple[torch.Tensor, list[torch.Tensor]]:
         del kwargs
@@ -71,4 +72,5 @@ class MinimalV1LVGDiT(MiniTrainDIT):
             data_type=data_type,
             use_cuda_graphs=use_cuda_graphs,
             return_only_hidden_states_up_to=return_only_hidden_states_up_to,
+            detach_hidden_states=detach_hidden_states,
         )

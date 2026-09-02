@@ -1,5 +1,7 @@
 # Video-VAM roadmap and open ablations
 
+Entry point: [Video-VAM index](video_vam_index.md).
+
 Written 2026-08-26. Companion docs: research diary (journey), cube-out-of-box
 leaderboard (numbers), world-model usage comparison (architecture survey),
 mimic-video reference (upstream fidelity).
@@ -45,11 +47,15 @@ Cosmos was worse than frozen features in our one attempt.
 
 ## Next steps (priority order)
 
+Tonight's overnight queue is smoke-first Cosmos `state_t=2` video-LoRA with layer attention, followed by LTX-2.5 `state_t=2` observed-only unpooled features; both queues stop after smoke when passed `--smoke-only`.
+
 1. LTX layer probe -> retrain best LTX configuration to plateau (no wall-clock
    cap; cap only as safety net).
 2. Cosmos to plateau under the same stopping rule, so converged-vs-converged.
-   Done for generic prefix-pool2 (13.81 deg at 36k) and video-LoRA expert
-   (13.06 deg at 38k, W&B ixzworl4, stopped on patience 10).
+   Done for generic prefix-pool2 (13.81 deg at 36k), video-LoRA T=16 pool2
+   (13.06 deg at 38k, W&B ixzworl4, stopped on patience 10), and video-LoRA
+   `state_t=2` unpooled (13.74 deg at 27k / 46 min, W&B jri7vehq, stopped
+   37k / 1.06 h on patience 10).
 3. LoRA fine-tune of the backbone on our 32 training episodes, video loss
    only, then freeze and retrain the action expert. Distinct from the failed
    co-training arm (joint losses). Cosmos video-only LoRA (step 6k) + SmolExpert
@@ -63,15 +69,18 @@ Cosmos was worse than frozen features in our one attempt.
       (13.06 deg expert). Do not jointly train video+action (already worse).
    3. Cheap DiT forward, then train a **new** SmolExpert on that cache (train
       and eval must match). Two options, in this order:
-      - **First: observed-only (`state_t=2`).** DiT on the two VAE latents
-        only (2,400 tokens, pool2 -> 600). Cache build and inference get the
-        2-4x; the expert does not. Closest prior is `cond_frames` (W&B
-        rmcpaxtc): expert on those two frames _after_ a full 16-frame DiT,
-        24.28 deg vs pool2 23.32 at 30 min. That slice does not speed up Cosmos.
-        `state_t=2` never mixes prefix tokens with future noise, so RMSE vs
-        13.81 / 13.06 is the open question. Extractor path is already in
-        tree (`--state-t 2`).
-      - **If T=2 drops quality: one-step future (T=3).** Keep the two cond
+      - **Observed-only (`state_t=2`): done.** Same video-LoRA as 13.06,
+        unpooled 2,400 tokens (no pool2). Trainer val **13.74 deg** at 27k /
+        46 min (W&B jri7vehq; h1 4.78, first-5 6.55). Cache extract 5.7x vs
+        T=16 LoRA pool2. Quality held: +0.68 vs 13.06, still better than
+        prefix-pool2 13.81. T=3 is optional if we want to chase that 0.68;
+        not required to proceed.
+      - **Parked (do not start now):** LTX-2.5 GPU-resident INT4 weight-only
+        extract at T=2. Fits the 4090 (10.7 GiB), 780 ms vs 1228 ms FP8
+        CPU-offload (~1.57x). Hidden states are still BF16. Needed before use:
+        feature drift vs FP8 extract, then a **new** SmolExpert on an INT4
+        cache. See `video_vam_ltx_latency_optimization.md`.
+      - **Optional: one-step future (T=3).** Keep the two cond
         frames and add one noisy/predicted latent (~4 RGB frames, ~0.4 s at
         10 Hz). Still ~5x fewer tokens than T=16. Optional extra LoRA for
         next-latent / short-horizon prediction only (Diffusion Forcing /
@@ -85,9 +94,20 @@ Cosmos was worse than frozen features in our one attempt.
       3 s buffer. Overlap still needed for true 10 Hz.
       Details: `video_vam_latency_optimization_plan.md`,
       `video_vam_connector_ablation_report.md`.
-5. After this `state_t=2` unpooled expert is tested (RMSE vs 13.06 / 13.81),
-   train on the new cube-out-of-box **v2** dataset: video-LoRA cache + SmolExpert
-   on the same short-forward contract. Do not start v2 until v1 T=2 is scored.
+      4b. **cosmos-t2-we (world expert), implemented + smoke-tested 2026-08-29,
+      full run not started.** Merge old video LoRA into the trunk at load,
+      fresh LoRA on blocks 0-19, SmolExpert-shaped 115M diffusion expert
+      denoises the 14 future latents from layer-20 T=2 features via prefix
+      K/V (same Cosmos rectified-flow objective). Goal: recover the 0.68
+      T=2 gap by putting future-prediction pressure back on the layer-20
+      interface; trunk runs once at inference, only the expert iterates.
+      Smoke: 2.2 s/step, 13.7 GiB, merge bit-identical to fused-step6000.
+      Run: `scripts/video_vam/run_cosmos_t2_we.sh` (train + anchor previews),
+      then 3-arm video eval vs base/LoRA Cosmos, then T=2 cache rebuild +
+      SmolExpert retrain. Details: `video_vam_world_expert.md`.
+5. Train on the new cube-out-of-box **v2** dataset next: video-LoRA cache +
+   SmolExpert on the same `state_t=2` short-forward contract. v1 T=2 is scored
+   (13.74 vs 13.06 T=16 LoRA).
 6. Real-robot deployment of best SmolVLA / Cosmos / LTX policies on a freshly
    collected dataset; success-rate is the metric that matters, RMSE is proxy.
    Real-time gap: video backbones ~1 Hz vs 10 Hz target; RTC + chunking plus

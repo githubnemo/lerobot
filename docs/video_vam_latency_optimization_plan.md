@@ -350,8 +350,15 @@ the two clean conditioning frames for the expert: 24.28 deg at 30 min versus
 pool2 23.32. Observed tokens already carried most of the action signal; future
 noise tokens (`gen_frames_pool2`) were worse. `state_t=2` _skips_ those 14
 future slots inside the transformer, so layer-20 features are not the
-`cond_frames` slice of a 16-frame forward. Quality versus the 13.81 / 13.06
-converged pool2 experts is the open measurement.
+`cond_frames` slice of a 16-frame forward. Measured: video-LoRA `state_t=2`
+unpooled SmolExpert is **13.74 deg** at 27k / 46 min (W&B jri7vehq) versus
+13.06 T=16 pool2 and 13.81 prefix-pool2. Cache extract 5.7x (204 vs 1163 ms).
+
+LTX-2.5 is the opposite: T=2 vs T=8 under FP8 CPU-offload is ~1.01x (1228 vs
+1243 ms). GPU-resident **INT4 weight-only** at T=2 is a parked later path:
+780 ms p50 (1.28 Hz, 10.7 GiB) vs 1228 ms offload, ~1.57x. Hidden tokens stay
+BF16; the open check is whether SmolExpert can train on INT4-weight extracts.
+Details: `video_vam_ltx_latency_optimization.md` (GPU-resident INT4).
 
 The winning arm is therefore `compile_max` for the DiT stage: it clears the
 correctness gate and exceeds the `1.15x` target. It is not a `1.15x` whole-pipeline

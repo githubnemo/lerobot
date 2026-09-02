@@ -277,7 +277,7 @@ def validate_extraction_output(
     if hidden.ndim != 5 or tuple(hidden.shape[2:]) != (30, 40, 2048):
         raise ValueError(f"Cosmos hidden shape must be [B, T, 30, 40, 2048], got {tuple(hidden.shape)}")
     state_t = hidden.shape[1]
-    if state_t not in (2, 16):
+    if state_t not in (2, 3, 4, 6, 8, 12, 16):
         raise ValueError(f"Cosmos hidden temporal state must be 2 or 16, got {state_t}")
     expected_hidden_shape = (batch_size, state_t, 30, 40, 2048)
     expected_context_shape = (batch_size, state_t * 30 * 40, 2048)

@@ -64,7 +64,7 @@ class LTXExtractorConfig:
     latent_channels: int = LTX_LATENT_CHANNELS
     latent_conditional_frames: int = 2
     state_t: int = 8
-    target_frame_count: int = 57
+    target_frame_count: int | None = None
     latent_height: int = 15
     latent_width: int = 20
     hidden_dim: int = LTX_HIDDEN_WIDTH
@@ -93,18 +93,26 @@ class LTXExtractorConfig:
             raise ValueError("The frozen extractor input is [B, 3, 5, 480, 640]")
         if self.padded_input_frames != 9:
             raise ValueError("The causal LTX VAE requires nine frames for two latent frames")
-        if self.latent_conditional_frames != 2 or self.state_t != 8:
-            raise ValueError("The frozen extractor requires two conditional latent frames and state_t=8")
-        if self.target_frame_count != 57 or 1 + 8 * (self.state_t - 1) != self.target_frame_count:
-            raise ValueError("The matched LTX state represents 57 frames with eight latent frames")
+        if self.latent_conditional_frames != 2:
+            raise ValueError("The frozen extractor requires exactly two conditional latent frames")
+        if self.state_t not in (2, 8):
+            raise ValueError("state_t must be 2 (observed-only) or 8 (observed prefix plus future)")
+        expected_target_frame_count = 1 + 8 * (self.state_t - 1)
+        if self.target_frame_count is not None and self.target_frame_count != expected_target_frame_count:
+            raise ValueError(
+                f"target_frame_count must be {expected_target_frame_count} for state_t={self.state_t}"
+            )
+        object.__setattr__(self, "target_frame_count", expected_target_frame_count)
         if (self.latent_height, self.latent_width) != (15, 20):
             raise ValueError("480x640 at 32x32 spatial compression produces a 15x20 latent grid")
         if self.hidden_dim != LTX_HIDDEN_WIDTH or self.prompt_width != LTX_HIDDEN_WIDTH:
             raise ValueError("The LTX-2.5 22B video and prompt widths are both fixed at 4096")
         if self.offload_mode not in {"none", "cpu", "disk"}:
             raise ValueError("offload_mode must be one of 'none', 'cpu', or 'disk'")
-        if self.quantization not in {"none", "fp8-cast"}:
-            raise ValueError("quantization must be 'none' or 'fp8-cast'")
+        if self.quantization not in {"none", "fp8-cast", "int4"}:
+            raise ValueError("quantization must be 'none', 'fp8-cast', or 'int4'")
+        if self.quantization == "int4" and self.offload_mode != "none":
+            raise ValueError("int4 weight-only requires offload_mode='none' so weights stay GPU-resident")
         if self.vae_compile_mode not in {None, "default", "reduce-overhead", "max-autotune"}:
             raise ValueError("vae_compile_mode must be None, 'default', 'reduce-overhead', or 'max-autotune'")
 
@@ -335,19 +343,87 @@ class _LTXEarlyExitError(Exception):
         self.value = value
 
 
+def _apply_int4_weight_only(model: nn.Module, device: torch.device) -> nn.Module:
+    """Quantize Linear weights to int4 on CUDA, one module at a time.
+
+    22B BF16 cannot reside on a 24 GiB GPU. Load the shell on CPU, then
+    move/quantize each Linear so peak GPU memory is one BF16 layer plus the
+    growing int4 payload (~11 GiB).
+    """
+    from torchao.quantization.quant_api import Int4WeightOnlyConfig, quantize_
+    from torchao.quantization.quantize_.workflows.int4.int4_packing_format import Int4PackingFormat
+
+    # PLAIN packing needs mslk; TILE_PACKED_TO_4D is the tinygemm path that works on sm_89.
+    config = Int4WeightOnlyConfig(
+        group_size=128,
+        set_inductor_config=False,
+        int4_packing_format=Int4PackingFormat.TILE_PACKED_TO_4D,
+    )
+    converted = 0
+    skipped: list[str] = []
+    for name, module in list(model.named_modules()):
+        if not isinstance(module, nn.Linear) or module.weight.ndim != 2:
+            continue
+        module.to(device)
+        try:
+            quantize_(module, config)
+            converted += 1
+        except Exception as exc:  # noqa: BLE001 - keep unsupported Linears in BF16 on CPU
+            skipped.append(f"{name}:{type(exc).__name__}:{exc}")
+            if len(skipped) <= 5:
+                print(f"int4 skip {name}: {type(exc).__name__}: {exc}", flush=True)
+            module.to("cpu")
+        if converted % 32 == 0:
+            torch.cuda.empty_cache()
+            print(
+                f"int4 converted={converted} skipped={len(skipped)} "
+                f"alloc_gib={torch.cuda.memory_allocated(device) / 2**30:.2f}",
+                flush=True,
+            )
+    for module in model.modules():
+        if isinstance(module, nn.Linear):
+            continue
+        for key, param in list(module._parameters.items()):
+            if param is not None and param.device != device:
+                module._parameters[key] = nn.Parameter(param.to(device), requires_grad=False)
+        for key, buf in list(module._buffers.items()):
+            if buf is not None and buf.device != device:
+                module._buffers[key] = buf.to(device)
+    torch.cuda.empty_cache()
+    print(
+        f"int4 done converted={converted} skipped={len(skipped)} "
+        f"first_skips={skipped[:8]} alloc_gib={torch.cuda.memory_allocated(device) / 2**30:.2f}",
+        flush=True,
+    )
+    return model
+
+
 class _DirectLTXStage:
     """Small official-loader stage that avoids optional media pipeline imports."""
 
-    def __init__(self, builder: Any, device: torch.device, dtype: torch.dtype) -> None:
+    def __init__(
+        self,
+        builder: Any,
+        device: torch.device,
+        dtype: torch.dtype,
+        *,
+        int4_resident: bool = False,
+    ) -> None:
         self._builder = builder
         self._device = device
         self._dtype = dtype
+        self._int4_resident = int4_resident
 
     @contextmanager
     def _transformer_ctx(self):
         from ltx_core.model.transformer import X0Model
 
-        model = self._builder.build(device=self._device, dtype=self._dtype).eval()
+        if self._int4_resident:
+            print("int4: loading 22B BF16 transformer onto CPU, then quantizing Linears on CUDA", flush=True)
+            model = self._builder.build(device=torch.device("cpu"), dtype=torch.bfloat16).eval()
+            model = _apply_int4_weight_only(model, self._device).eval()
+        else:
+            model = self._builder.build(device=self._device, dtype=self._dtype).eval()
         wrapped = X0Model(model).eval()
         try:
             yield wrapped
@@ -356,7 +432,8 @@ class _DirectLTXStage:
             if teardown is not None:
                 teardown()
             dispose = getattr(model, "dispose", None)
-            if dispose is not None:
+            # torchao int4 tensors do not implement empty_like(device=meta).
+            if dispose is not None and not self._int4_resident:
                 dispose()
             del wrapped, model
             if self._device.type == "cuda":
@@ -752,7 +829,10 @@ class LTXExtractor:
                 f"or set LTX_SOURCE_ROOT (checked {source_root or 'no local source root'})"
             ) from exc
 
+        from ltx_core.loader.sd_ops import SDOps
+
         quantization = None
+        int4_resident = self.config.quantization == "int4"
         if self.config.quantization == "fp8-cast":
             try:
                 from ltx_core.quantization.fp8_cast import build_policy
@@ -762,13 +842,23 @@ class LTXExtractor:
                 raise LTXBackendError("LTX fp8-cast quantization is unavailable on this runtime") from exc
         registry = ModelRegistry(cache_models=True, cache_weights=False)
         fuse_rule = quantization.fuse_rule if quantization is not None else bf16_fuse_rule
+        model_sd_ops = LTXV_MODEL_COMFY_RENAMING_MAP
+        module_ops: tuple[Any, ...] = ()
+        if quantization is not None:
+            if quantization.sd_ops is not None:
+                model_sd_ops = SDOps(
+                    name=f"{model_sd_ops.name}+{quantization.sd_ops.name}",
+                    mapping=(*model_sd_ops.mapping, *quantization.sd_ops.mapping),
+                )
+            module_ops = tuple(quantization.module_ops)
         if self.config.offload_mode == "none":
             transformer_builder = SingleGPUModelBuilder(
                 model_path=str(self.config.checkpoint_path),
                 model_class_configurator=quantization.model_configurator
                 if quantization is not None and quantization.model_configurator is not None
                 else LTXModelConfigurator,
-                model_sd_ops=LTXV_MODEL_COMFY_RENAMING_MAP,
+                model_sd_ops=model_sd_ops,
+                module_ops=module_ops,
                 registry=registry,
                 fuse_rule=fuse_rule,
             )
@@ -778,14 +868,14 @@ class LTXExtractor:
                 model_class_configurator=quantization.model_configurator
                 if quantization is not None and quantization.model_configurator is not None
                 else LTXModelConfigurator,
-                model_sd_ops=LTXV_MODEL_COMFY_RENAMING_MAP,
+                model_sd_ops=model_sd_ops,
                 registry=registry,
                 fuse_rule=fuse_rule,
                 blocks_attr="transformer_blocks",
                 blocks_prefix="transformer_blocks",
                 cpu_slots_count=DISK_CPU_SLOTS if self.config.offload_mode == "disk" else None,
             )
-        stage = _DirectLTXStage(transformer_builder, self.device, self.dtype)
+        stage = _DirectLTXStage(transformer_builder, self.device, self.dtype, int4_resident=int4_resident)
         try:
             encoder_builder = SingleGPUModelBuilder(
                 model_path=str(self.config.video_vae_path),

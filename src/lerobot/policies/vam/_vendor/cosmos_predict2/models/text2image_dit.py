@@ -1489,6 +1489,7 @@ class MiniTrainDIT(WeightTrainingStat):
         data_type: DataType | None = DataType.VIDEO,
         use_cuda_graphs: bool = False,
         return_only_hidden_states_up_to: int | None = None,
+        detach_hidden_states: bool = True,
     ) -> torch.Tensor | tuple[torch.Tensor, list[torch.Tensor]]:
         """
         Args:
@@ -1550,7 +1551,9 @@ class MiniTrainDIT(WeightTrainingStat):
         }
         hidden_states = []
         if return_hidden_states:
-            hidden_states.append(x_B_T_H_W_D.detach().clone())
+            hidden_states.append(
+                x_B_T_H_W_D.detach().clone() if detach_hidden_states else x_B_T_H_W_D
+            )
 
         for i, block in enumerate(blocks, 1):
             if return_hidden_states and i > return_only_hidden_states_up_to:
@@ -1563,7 +1566,9 @@ class MiniTrainDIT(WeightTrainingStat):
                 **block_kwargs,
             )
             if return_hidden_states:
-                hidden_states.append(x_B_T_H_W_D.detach().clone())
+                hidden_states.append(
+                    x_B_T_H_W_D.detach().clone() if detach_hidden_states else x_B_T_H_W_D
+                )
 
         x_B_T_H_W_O = self.final_layer(x_B_T_H_W_D, t_embedding_B_T_D, adaln_lora_B_T_3D=adaln_lora_B_T_3D)
         x_B_C_Tt_Hp_Wp = self.unpatchify(x_B_T_H_W_O)

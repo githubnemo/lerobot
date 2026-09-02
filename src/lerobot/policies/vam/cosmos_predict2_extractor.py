@@ -11,7 +11,7 @@ import json
 import re
 from collections.abc import Mapping
 from contextlib import nullcontext
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from importlib import import_module
 from pathlib import Path
 from typing import Any
@@ -58,6 +58,7 @@ class CosmosPredict2ExtractorConfig:
     device: str = "cuda"
     dtype: str | torch.dtype = "bfloat16"
     hidden_layer: int = 20
+    hidden_layers: tuple[int, ...] | None = None
     stop_after_step: int = 0
     high_noise_sigma: float = 10.0
     seed: int = 0
@@ -77,6 +78,7 @@ class CosmosPredict2ExtractorConfig:
     latent_conditional_frames: int = 2
     state_t: int = 16
     fp8_linear: bool = False
+    self_attn_scale: float = 1.0
     latent_height: int = 60
     latent_width: int = 80
     token_height: int = 30
@@ -86,6 +88,7 @@ class CosmosPredict2ExtractorConfig:
     random_init_seed: int | None = None
     sigma_data: float = 1.0
     sigma_conditional: float = 0.0001
+    self_attn_scale: float = 1.0
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "checkpoint_path", Path(self.checkpoint_path))
@@ -94,6 +97,18 @@ class CosmosPredict2ExtractorConfig:
             raise ValueError("random_init_seed must be non-negative")
         if self.hidden_layer < 0:
             raise ValueError("hidden_layer must be non-negative")
+        if self.hidden_layers is not None:
+            if (
+                type(self.hidden_layers) is not tuple
+                or not self.hidden_layers
+                or any(type(layer) is not int or layer < 0 for layer in self.hidden_layers)
+                or tuple(sorted(set(self.hidden_layers))) != self.hidden_layers
+            ):
+                raise ValueError(
+                    "hidden_layers must be a non-empty sorted tuple of unique non-negative integers"
+                )
+            if self.hidden_layers[-1] != self.hidden_layer:
+                raise ValueError("hidden_layers[-1] must equal hidden_layer, the stop layer")
         if self.stop_after_step != 0:
             raise ValueError("Only stop_after_step=0 (the first high-noise forward) is implemented")
         if self.high_noise_sigma <= 0:
@@ -138,7 +153,7 @@ class CosmosPredict2ExtractorConfig:
             raise ValueError("The frozen extractor observed input must be T=1 or T=5 at 480x640")
         if self.latent_conditional_frames != 2:
             raise ValueError("The frozen extractor requires exactly two conditional latent frames")
-        if self.state_t not in (2, 16):
+        if self.state_t not in (2, 3, 4, 6, 8, 12, 16):
             raise ValueError("state_t must be 2 (observed-only) or 16 (observed prefix plus future)")
         if self.state_t == 2 and self.input_frames != 5:
             raise ValueError("state_t=2 observed-only extraction requires input_frames=5")
@@ -167,6 +182,7 @@ class CosmosPredict2Provenance:
     vae_input_mode: str = VAE_INPUT_MODE_OBSERVED_PREFIX
     state_t: int = 16
     fp8_linear: bool = False
+    self_attn_scale: float = 1.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -179,6 +195,7 @@ class CosmosPredict2Extraction:
     grid_shape: tuple[int, int, int]
     layer: int
     provenance: CosmosPredict2Provenance
+    layer_tokens: dict[int, torch.Tensor] = field(default_factory=dict)
 
 
 _DTYPE_NAMES = {
@@ -729,8 +746,7 @@ class CosmosPredict2Extractor:
         full[:, :, : self.config.latent_conditional_frames] = latent
         return full
 
-    @torch.no_grad()
-    def extract(
+    def forward_features(
         self,
         images: torch.Tensor,
         prompt_embedding: torch.Tensor,
@@ -739,7 +755,11 @@ class CosmosPredict2Extractor:
         sigma: torch.Tensor | None = None,
         noise: torch.Tensor | None = None,
     ) -> CosmosPredict2Extraction:
-        """Run one frozen high-noise forward with an optional per-window seed."""
+        """Run the high-noise forward while preserving gradients to the backbone.
+
+        This is the differentiable core of :meth:`extract`.  Callers that need
+        the frozen representation contract should use ``extract`` instead.
+        """
 
         seed = self.config.seed if noise_seed is None else noise_seed
         if type(seed) is not int or seed < 0 or seed >= 2**32 - 1:
@@ -851,22 +871,29 @@ class CosmosPredict2Extractor:
                 padding_mask=padding_mask,
                 data_type=self._data_type(),
                 use_cuda_graphs=self.config.use_cuda_graphs,
-                return_only_hidden_states_up_to=self.config.hidden_layer,
+                return_only_hidden_states_up_to=(
+                    self.config.hidden_layers[-1]
+                    if self.config.hidden_layers is not None
+                    else self.config.hidden_layer
+                ),
+                detach_hidden_states=False,
             )
         if not isinstance(result, tuple) or len(result) != 2:
             raise CosmosPredict2Error(
                 "Cosmos backbone must return (prediction, hidden_states) for extraction"
             )
         _, hidden_states = result
-        if not isinstance(hidden_states, (list, tuple)) or self.config.hidden_layer >= len(hidden_states):
+        requested_layers = (
+            self.config.hidden_layers
+            if self.config.hidden_layers is not None
+            else (self.config.hidden_layer,)
+        )
+        stop_layer = requested_layers[-1]
+        if not isinstance(hidden_states, (list, tuple)) or stop_layer >= len(hidden_states):
             count = len(hidden_states) if isinstance(hidden_states, (list, tuple)) else type(hidden_states)
             raise CosmosPredict2Error(
-                f"Cosmos backbone returned {count} hidden states; "
-                f"layer {self.config.hidden_layer} is unavailable"
+                f"Cosmos backbone returned {count} hidden states; stop layer {stop_layer} is unavailable"
             )
-        hidden = hidden_states[self.config.hidden_layer]
-        if not isinstance(hidden, torch.Tensor):
-            raise TypeError("Cosmos hidden state must be a tensor")
         expected_grid = (
             batch_size,
             self.config.state_t,
@@ -874,16 +901,24 @@ class CosmosPredict2Extractor:
             self.config.token_width,
             self.config.hidden_dim,
         )
-        if tuple(hidden.shape) != expected_grid:
-            raise ValueError(f"hidden layer must have shape {expected_grid}, got {tuple(hidden.shape)}")
-        if self.config.fp8_linear and hidden.dtype != self.dtype:
-            hidden = hidden.to(dtype=self.dtype)
-        if hidden.dtype != self.dtype:
-            raise TypeError(f"hidden layer must have dtype {self.dtype}, got {hidden.dtype}")
-        if not torch.isfinite(hidden).all():
-            raise ValueError("hidden layer must contain only finite values")
-        hidden = hidden.detach()
-        tokens = hidden.reshape(batch_size, -1, self.config.hidden_dim).contiguous()
+        layer_tokens: dict[int, torch.Tensor] = {}
+        for layer in requested_layers:
+            hidden = hidden_states[layer]
+            if not isinstance(hidden, torch.Tensor):
+                raise TypeError(f"Cosmos hidden state at layer {layer} must be a tensor")
+            if tuple(hidden.shape) != expected_grid:
+                raise ValueError(
+                    f"hidden layer {layer} must have shape {expected_grid}, got {tuple(hidden.shape)}"
+                )
+            if self.config.fp8_linear and hidden.dtype != self.dtype:
+                hidden = hidden.to(dtype=self.dtype)
+            if hidden.dtype != self.dtype:
+                raise TypeError(f"hidden layer {layer} must have dtype {self.dtype}, got {hidden.dtype}")
+            if not torch.isfinite(hidden).all():
+                raise ValueError(f"hidden layer {layer} must contain only finite values")
+            layer_tokens[layer] = hidden.reshape(batch_size, -1, self.config.hidden_dim).contiguous()
+        hidden = layer_tokens[self.config.hidden_layer].reshape(expected_grid).contiguous()
+        tokens = layer_tokens[self.config.hidden_layer]
         provenance = CosmosPredict2Provenance(
             repository=UPSTREAM_REPOSITORY,
             upstream_commit=UPSTREAM_COMMIT,
@@ -904,6 +939,7 @@ class CosmosPredict2Extractor:
             vae_input_mode=self.config.vae_input_mode,
             state_t=self.config.state_t,
             fp8_linear=self.config.fp8_linear,
+            self_attn_scale=self.config.self_attn_scale,
         )
         return CosmosPredict2Extraction(
             hidden_grid=hidden,
@@ -912,6 +948,35 @@ class CosmosPredict2Extractor:
             grid_shape=(self.config.state_t, self.config.token_height, self.config.token_width),
             layer=self.config.hidden_layer,
             provenance=provenance,
+            layer_tokens=layer_tokens if self.config.hidden_layers is not None else {},
+        )
+
+    @torch.no_grad()
+    def extract(
+        self,
+        images: torch.Tensor,
+        prompt_embedding: torch.Tensor,
+        *,
+        noise_seed: int | None = None,
+        sigma: torch.Tensor | None = None,
+        noise: torch.Tensor | None = None,
+    ) -> CosmosPredict2Extraction:
+        """Run one frozen high-noise forward with an optional per-window seed."""
+        result = self.forward_features(
+            images,
+            prompt_embedding,
+            noise_seed=noise_seed,
+            sigma=sigma,
+            noise=noise,
+        )
+        return CosmosPredict2Extraction(
+            hidden_grid=result.hidden_grid.detach(),
+            tokens=result.tokens.detach(),
+            sigma=result.sigma.detach(),
+            grid_shape=result.grid_shape,
+            layer=result.layer,
+            provenance=result.provenance,
+            layer_tokens={layer: value.detach() for layer, value in result.layer_tokens.items()},
         )
 
     def _data_type(self) -> Any:

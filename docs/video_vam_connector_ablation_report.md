@@ -88,12 +88,11 @@ latency. The 30-minute result (24.28 vs pool2 23.32) is still the best evidence
 that those two observed frames carry most of the action signal.
 
 `state_t=2` (implemented 2026-08-28) stops the DiT after those two VAE latents:
-2,400 tokens from the transformer itself, pool2 -> 600 for the expert. Cache
-build and inference should be several times faster; RMSE versus converged
-pool2 is unknown because the features are no longer mixed with future-frame
-noise via self-attention. Next training step: rebuild the LoRA-adapted cache
-with `--state-t 2` and train SmolExpert on it. Do not evaluate the 4,800-token
-experts on 600-token context.
+2,400 tokens from the transformer itself. This run trained the expert **unpooled**
+on those 2,400 tokens (not pool2 -> 600). Same video-LoRA as the 13.06 T=16
+expert. Result: **13.74 deg** at 27k / 46 min (W&B jri7vehq), +0.68 vs 13.06,
+h1 4.78 vs 4.76. Cache extract 204 ms/entry vs 1163 ms for T=16 LoRA pool2
+(5.7x). Do not evaluate the 4,800-token experts on 2,400-token context.
 
 ## Deviation from mimic-video
 

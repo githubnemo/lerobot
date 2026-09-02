@@ -27,6 +27,11 @@ from lerobot.policies.vam.cosmos_cache_dataset import (
     CosmosFeatureCacheDataset,
     load_cache_manifest,
 )
+from lerobot.policies.vam.cosmos_layer_mix_cache import (
+    COSMOS_LAYER_PROBE_DEPTHS,
+    CosmosLayerMixCacheDataset,
+    load_layer_mix_manifest as load_cosmos_layer_mix_manifest,
+)
 from lerobot.policies.vam.ltx_feature_cache import (
     LTXFeatureCacheDataset,
     load_ltx_cache_manifest,
@@ -103,7 +108,31 @@ def context_spec_from_manifest(manifest: CacheManifest, *, requested_transform: 
         raise ValueError("cache manifest provenance must be an object")
     artifact = str(payload.get("artifact") or "cosmos_feature_manifest")
     tapped_layers: tuple[int, ...] = ()
-    if artifact == "ltx25_multidepth_pool2_feature_manifest":
+    if artifact.startswith("cosmos_multidepth_"):
+        stored_transform = str(provenance.get("context_transform"))
+        stored_tokens = provenance.get("context_tokens_per_layer")
+        channels = provenance.get("context_channels")
+        dtype = provenance.get("context_dtype")
+        model_transform = stored_transform if requested_transform == "auto" else requested_transform
+        if model_transform != stored_transform:
+            raise ValueError("multidepth Cosmos training must consume the cache-declared representation")
+        if (
+            artifact
+            not in {
+                f"cosmos_multidepth_statet2_{transform}_feature_manifest" for transform in ("none", "pool2")
+            }
+            or provenance.get("backbone") != "Cosmos-Predict2-2B"
+            or provenance.get("hidden_layer") != 20
+            or provenance.get("deepest_layer") != 20
+            or provenance.get("state_t") != 2
+            or provenance.get("high_noise_sigma") != 80.0
+            or provenance.get("tapped_layers") != list(COSMOS_LAYER_PROBE_DEPTHS)
+        ):
+            raise ValueError("multidepth Cosmos cache has incompatible producer provenance")
+        tapped_layers = COSMOS_LAYER_PROBE_DEPTHS
+        backbone = provenance.get("backbone", "Cosmos-Predict2-2B")
+        model_tokens = stored_tokens
+    elif artifact == "ltx25_multidepth_pool2_feature_manifest":
         stored_transform = str(provenance.get("context_transform"))
         stored_tokens = provenance.get("context_tokens_per_layer")
         channels = provenance.get("context_channels")
@@ -154,16 +183,23 @@ def context_spec_from_manifest(manifest: CacheManifest, *, requested_transform: 
         stored_tokens, channels = (int(value) for value in match.groups())
         dtype = "bfloat16"
         stored_transform = manifest.context_transform
-        model_transform = CONTEXT_TRANSFORM if requested_transform == "auto" else requested_transform
+        if requested_transform == "auto":
+            model_transform = (
+                stored_transform if stored_transform == "cosmos3_edge_none" else CONTEXT_TRANSFORM
+            )
+        else:
+            model_transform = requested_transform
         if stored_transform == "none" and model_transform == "pool2" and stored_tokens == 19_200:
             model_tokens = 4_800
+        elif stored_transform == "none" and model_transform == "cond_frames" and stored_tokens == 19_200:
+            model_tokens = 2_400
         elif stored_transform == model_transform:
             model_tokens = stored_tokens
         else:
             raise ValueError(
                 f"unsupported Cosmos context transform {stored_transform!r} -> {model_transform!r}"
             )
-        backbone = "Cosmos-Predict2-2B"
+        backbone = provenance.get("backbone", "Cosmos-Predict2-2B")
     if (
         type(stored_tokens) is not int
         or stored_tokens <= 0
@@ -172,8 +208,8 @@ def context_spec_from_manifest(manifest: CacheManifest, *, requested_transform: 
         or type(channels) is not int
         or channels <= 0
         or dtype != "bfloat16"
-        or stored_transform not in {"none", "pool2"}
-        or model_transform not in {"none", "pool2"}
+        or stored_transform not in {"none", "pool2", "cond_frames", "cosmos3_edge_none"}
+        or model_transform not in {"none", "pool2", "cond_frames", "cosmos3_edge_none"}
     ):
         raise ValueError("cache context tokens, channels, dtype, or transform are invalid")
     return ContextSpec(
@@ -191,6 +227,8 @@ def context_spec_from_manifest(manifest: CacheManifest, *, requested_transform: 
 
 def load_context_manifest(path: Path) -> CacheManifest:
     payload = json.loads(path.read_text())
+    if str(payload.get("artifact", "")).startswith("cosmos_multidepth_"):
+        return load_cosmos_layer_mix_manifest(path)
     if str(payload.get("artifact", "")).startswith("ltx25_multidepth_"):
         return load_layer_mix_manifest(path)
     if payload.get("artifact") == "ltx25_frozen_feature_manifest":
@@ -199,6 +237,8 @@ def load_context_manifest(path: Path) -> CacheManifest:
 
 
 def build_context_dataset(manifest: CacheManifest):
+    if str(manifest.payload.get("artifact", "")).startswith("cosmos_multidepth_"):
+        return CosmosLayerMixCacheDataset(manifest)
     if str(manifest.payload.get("artifact", "")).startswith("ltx25_multidepth_"):
         return LTXLayerMixCacheDataset(manifest)
     if manifest.payload.get("artifact") == "ltx25_frozen_feature_manifest":
@@ -232,7 +272,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--grad-clip", type=float, default=DEFAULT_GRAD_CLIP)
     parser.add_argument("--warmup-steps", type=int, default=DEFAULT_WARMUP_STEPS)
     parser.add_argument("--num-steps", type=int, default=DEFAULT_NUM_STEPS)
-    parser.add_argument("--context-transform", choices=("auto", "none", "pool2"), default="auto")
+    parser.add_argument(
+        "--context-transform", choices=("auto", "none", "pool2", "cond_frames"), default="auto"
+    )
     parser.add_argument("--mixer", choices=("none", "attention"), default="none")
     parser.add_argument("--attn-width", type=int, default=DEFAULT_ATTN_WIDTH)
     parser.add_argument("--attn-heads", type=int, default=DEFAULT_ATTN_HEADS)
@@ -317,8 +359,8 @@ def prepare_cached_context(context: torch.Tensor, spec: ContextSpec) -> torch.Te
         raise ValueError(f"cached context dtype must be bfloat16, got {context.dtype}")
     if spec.stored_transform == spec.model_transform:
         transformed = context
-    elif spec.stored_transform == "none" and spec.model_transform == "pool2":
-        transformed = apply_context_transform(context, "pool2")
+    elif spec.stored_transform == "none" and spec.model_transform in ("pool2", "cond_frames"):
+        transformed = apply_context_transform(context, spec.model_transform)
     else:
         raise ValueError(
             f"unsupported cached context transform: {spec.stored_transform!r} -> {spec.model_transform!r}"
@@ -339,7 +381,7 @@ def prepare_model_context(
             raise ValueError("multidepth cache requires --mixer attention")
         return prepare_cached_context(context, spec)
     if not spec.tapped_layers:
-        raise ValueError("--mixer attention requires a multidepth LTX cache")
+        raise ValueError("--mixer attention requires a multidepth cache")
     expected = (len(spec.tapped_layers), spec.stored_tokens, spec.channels)
     if tuple(context.shape[1:]) != expected or context.dtype != torch.bfloat16:
         raise ValueError(
