@@ -28,18 +28,19 @@ _Core Infrastructure: Remote Server `abakus` (Ubuntu, RTX 4090 24GB VRAM), Local
 
 ## 3. Quantitative Benchmark Scoreboard (Held-Out Episodes 32–39)
 
-| Model / Architecture                       | Latency     | Tokens to Policy                 | Representation Loss / CosSim | Action RMSE (Overall) | Immediate Action (H=1) | First-5 Actions Mean | Status / Role                    |
-| :----------------------------------------- | :---------- | :------------------------------- | :--------------------------- | :-------------------- | :--------------------- | :------------------- | :------------------------------- |
-| **Cosmos $T=16$ Gold Standard**            | ~1,200 ms   | 4,800 ($16 \times 15 \times 20$) | - / 1.0000                   | **`13.06°`**          | `4.76°`                | `6.19°`              | Offline Gold Standard            |
-| **Teacher $T=16$ `cond_frames` Oracle**    | -           | 2,400 ($2 \times 30 \times 40$)  | - / 1.0000                   | **`13.08°`**          | `4.97°`                | `6.40°`              | **Theoretical Oracle Ceiling**   |
-| **Cosmos $T=2$ Direct Distilled (Ours)**   | **~204 ms** | 2,400 ($2 \times 30 \times 40$)  | **1.21 / 0.9732**            | **`13.15°`**          | **`4.58°`** (Best)     | **`6.04°`** (Best)   | **Matches Oracle within 0.07°!** |
-| **Cosmos $T=2$ Undistilled Baseline**      | **~204 ms** | 2,400 ($2 \times 30 \times 40$)  | - / 0.6092                   | **`13.74°`**          | `4.92°`                | `6.34°`              | Fast Baseline (0.68° gap)        |
-| **LTX-2.5 22B (Unpooled Layer 34)**        | ~1,400 ms   | 2,400 ($15 \times 20$ / frame)   | -                            | **`13.84°`**          | `5.21°`                | `6.72°`              | Limited by 32× spatial VAE       |
-| _V2 Distillation (Lag Bug + Linear Head)_  | ~204 ms     | 2,400                            | 8.88 / 0.6809                | `13.99°`              | `5.18°`                | `6.83°`              | Scrambled latent space           |
-| _V1 Distillation (Lag Bug)_                | ~204 ms     | 2,400                            | 8.26 / 0.8056                | `14.08°`              | `5.02°`                | `6.58°`              | Degraded by 400 ms lag           |
-| _Failed: Action Backprop into Blocks 0–19_ | ~204 ms     | 2,400                            | exploded variance            | `14.51° – 14.74°`     | -                      | -                    | Catastrophic feature collapse    |
-| _SmolVLA 450M Baseline_                    | ~80 ms      | 64                               | -                            | **`14.83°`**          | -                      | -                    | Pure VLA Baseline                |
-| _Failed: $T=4$ Noise Slots_                | ~340 ms     | 4,800                            | unstable                     | `17.92°`              | -                      | -                    | Attended to Gaussian noise       |
+| Model / Architecture                       | Latency     | Tokens to Policy                  | Representation Loss / CosSim | Action RMSE (Overall) | Immediate Action (H=1) | First-5 Actions Mean | Status / Role                    |
+| :----------------------------------------- | :---------- | :-------------------------------- | :--------------------------- | :-------------------- | :--------------------- | :------------------- | :------------------------------- |
+| **Cosmos $T=16$ Gold Standard**            | ~1,200 ms   | 4,800 ($16 \times 15 \times 20$)  | - / 1.0000                   | **`13.06°`**          | `4.76°`                | `6.19°`              | Offline Gold Standard            |
+| **Teacher $T=16$ `cond_frames` Oracle**    | -           | 2,400 ($2 \times 30 \times 40$)   | - / 1.0000                   | **`13.08°`**          | `4.97°`                | `6.40°`              | **Theoretical Oracle Ceiling**   |
+| **Cosmos $T=2$ Direct Distilled (Ours)**   | **~204 ms** | 2,400 ($2 \times 30 \times 40$)   | **1.21 / 0.9732**            | **`13.15°`**          | **`4.58°`** (Best)     | **`6.04°`** (Best)   | **Matches Oracle within 0.07°!** |
+| **Cosmos $T=2$ Undistilled Baseline**      | **~204 ms** | 2,400 ($2 \times 30 \times 40$)   | - / 0.6092                   | **`13.74°`**          | `4.92°`                | `6.34°`              | Fast Baseline (0.68° gap)        |
+| **LTX-2.5 22B (Unpooled Layer 34)**        | ~1,400 ms   | 2,400 ($15 \times 20$ / frame)    | -                            | **`13.84°`**          | `5.21°`                | `6.72°`              | Limited by 32× spatial VAE       |
+| _V2 Distillation (Lag Bug + Linear Head)_  | ~204 ms     | 2,400                             | 8.88 / 0.6809                | `13.99°`              | `5.18°`                | `6.83°`              | Scrambled latent space           |
+| _V1 Distillation (Lag Bug)_                | ~204 ms     | 2,400                             | 8.26 / 0.8056                | `14.08°`              | `5.02°`                | `6.58°`              | Degraded by 400 ms lag           |
+| _Failed: Action Backprop into Blocks 0–19_ | ~204 ms     | 2,400                             | exploded variance            | `14.51° – 14.74°`     | -                      | -                    | Catastrophic feature collapse    |
+| **Cosmos 3 Edge Pure 600 (Zero-Shot)**     | **~100 ms** | **600** ($2 \times 15 \times 20$) | -                            | **`14.26°`**          | **`4.67°`**            | **`6.34°`**          | **Zero-shot base model (92ms)**  |
+| _SmolVLA 450M Baseline_                    | ~80 ms      | 64                                | -                            | **`14.83°`**          | -                      | -                    | Pure VLA Baseline                |
+| _Failed: $T=4$ Noise Slots_                | ~340 ms     | 4,800                             | unstable                     | `17.92°`              | -                      | -                    | Attended to Gaussian noise       |
 
 ---
 

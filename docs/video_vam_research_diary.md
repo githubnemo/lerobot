@@ -1776,3 +1776,13 @@ An architectural probe into `Cosmos3OmniPipeline` and `Cosmos3OmniTransformer` r
 - **Train & Val Caching**: Successfully extracted all 1,572 train samples and 88 val samples in under 2 minutes (~12 samples/s).
 - **Policy Training**: Launched `cosmos3-edge-pure600-smolexpert-20260903` on the clean 600-token representations.
 - **Video LoRA Adaptation Queued**: Prepared `schedule_cosmos3_edge_lora.sh` to adapt Cosmos 3 Edge on robot video demonstrations once the zero-shot baseline completes.
+
+### 3. Empirical Results on Pure 600 Vision Tokens (Zero-Shot Baseline)
+
+The pure 600 vision token benchmark (`cosmos3-edge-pure600-smolexpert-20260903`) completed on abakus:
+
+- **Validation RMSE**: Reached **`14.26°`** at Step 55,000 (down from 20.44° on the zero-padded sequence).
+- **First-Step Action Accuracy (H=1)**: **`4.67°`** (matching the 13.06° gold standard).
+- **First-5 Actions Mean**: **`6.34°`**.
+- **Inference Speed**: **`91.99 ms` uncompiled** (total policy reaction time ~100 ms).
+- **Key Insight**: With zero Video LoRA adaptation and only 600 tokens (1/4th of Cosmos 2B), Cosmos 3 Edge delivers a strong physical representation, setting the baseline for subsequent Video LoRA adaptation.
