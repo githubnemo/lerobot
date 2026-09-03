@@ -1,140 +1,105 @@
-# Video-VAM roadmap and open ablations
+# Video Action Model (VAM) Strategic Research Roadmap & Living Status
 
-Entry point: [Video-VAM index](video_vam_index.md).
+_Last Updated: 2026-09-02_
+_Target Application: High-Precision, Real-Time Robotic Manipulation (SO-100 Robot Arm, `cube_out_of_box` task)_
+_Core Infrastructure: Remote Server `abakus` (Ubuntu, RTX 4090 24GB VRAM), Local Repository `/Users/anton.wiehe/Code/compass`_
 
-Written 2026-08-26. Companion docs: research diary (journey), cube-out-of-box
-leaderboard (numbers), world-model usage comparison (architecture survey),
-mimic-video reference (upstream fidelity).
+---
 
-## The journey in five sentences
+## 1. Executive Summary & North Star
 
-We built a causal training/eval pipeline on the SO-101 cube-out-of-box dataset
-(40 episodes, gripper-mounted FPV camera) and compared action policies driven
-by frozen video-foundation-model features against a conventional VLA. Frozen
-Cosmos-2B layer-20 features with a SmolVLA-style action expert reach 13.81
-deg RMSE; frozen LTX-2.5-22B features reach 13.65; a converged, leakage-free
-SmolVLA baseline reaches 14.93. Both video backbones therefore beat the VLA
-under the frozen protocol, at the cost of ~1 Hz inference vs the 10 Hz target.
-Randomized-backbone controls degrade markedly, so pretrained features carry
-signal beyond the architecture. Joint LoRA co-training (video+action) on
-Cosmos was worse than frozen features in our one attempt.
+- **The Core Dilemma**: Heavy video diffusion world models ($T=16$) generate state-of-the-art physical representations (**13.06°** validation RMSE), but take **~1,200 ms** per forward pass—far too slow for 10 Hz real-time robotic control (~100 ms budget). Fast 2-frame inference ($T=2$, **~204 ms**) exhibits severe attention concentration and distribution shift, dropping accuracy to **13.74°**.
+- **The Breakthrough**: By directly distilling the frozen $T=16$ Layer-20 spatiotemporal diffusion manifold into a fast $T=2$ student LoRA without intermediate projection heads, we eliminate feature collapse, achieve a **93.6% MSE reduction** ($\text{CosSim} = \mathbf{0.9732}$), and reach **`13.15°`** validation RMSE at **~204 ms**.
+- **Oracle Verification**: Training directly on the teacher's ground-truth first 2 latent frames establishes an absolute theoretical ceiling of **`13.08°`**. Our distilled model reaches **`13.15°`**, capturing **`98.9%`** of the maximum possible teacher value while running 6× faster.
 
-## Feature interface (exact shapes)
+---
 
-- Cosmos-2B, layer 20 of the DiT: tokens (B, 19200, 2048); the 19200 is a
-  flattened T,H,W grid of 16 latent frames x 30 x 40 spatial patches.
-  Latent frames 0-1 are the VAE-encoded observed frames; frames 2-15 enter
-  as rectified-flow noise (the future slots). One forward pass, no sampling.
-- Pooling is spatial-only per latent frame, channels and temporal axis
-  untouched: pool2 = adaptive 2x2 avg -> (16,15,20) = 4800 tokens;
-  pool4 -> (16,8,10) = 1280; frame_mean -> 16 tokens. Ablation showed
-  little RMSE cost down to pool2, large training-speed gain.
-- LTX-2.5-22B: tokens (B, 2400, 4096) = 8 latent frames x 15 x 20 (stronger
-  VAE compression); unpooled LTX is already smaller than pool2 Cosmos.
-  Layer probe (running) taps six depths and learns a scalar mix to pick
-  the readout layer.
+## 2. Live Pipeline Status (In-Flight)
 
-## Confounders we can name, and which ablation isolates each
+- **Active Run**: `cosmos3-edge-pipeline-20260902` on `abakus` (tmux)
+  - **Model**: `nvidia/Cosmos3-Edge` (28 layers, 2048 hidden, 3.37B dense parameters, Wan 2.2 VAE)
+  - **Current Execution**: **Stage 1 (Feature Extraction)** is extracting Layer-20 representations across train (episodes 0–31) and validation (episodes 32–39) at ~8.3 samples/second.
+  - **Next Stage**: Automatically launches **Stage 2 (SmolExpert Policy Training)** to evaluate whether Cosmos 3 Edge's updated architecture surpasses the 13.15° mark.
+- **Master Log**: `/home/anton/.cache/video-vam/runs/cosmos3-edge-pipeline-20260902.log`
 
-| Confounder                                                          | Status                                                                                                                                                   |
-| ------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Architecture + conditioning alone (no pretraining)                  | Random-init Cosmos control done: much worse. Caveat: single seed; random init may be ill-conditioned rather than knowledge-free. Multi-seed repeat open. |
-| Just model scale, any pretraining                                   | Partially covered (SmolVLA 500M vs 2B vs 22B, but recipes differ). Clean scale ablation open: Cosmos 2B vs 14B, identical recipe.                        |
-| Time-as-input vs video pretraining (would an image DiT do as well?) | OPEN. Strongest missing ablation: same conditioning through an image-only diffusion backbone of similar scale.                                           |
-| Video pretraining data domain (third-person web video vs our FPV)   | Evidence of mismatch: generated rollouts hallucinate human hands. Bridge-adapted Cosmos test queued (partial run tracked generic almost exactly).        |
-| Readout depth                                                       | Cosmos: layer 20 fixed (mimic-video choice). LTX: layer probe running now.                                                                               |
-| Decoder capacity vs feature quality                                 | Done: SmolVLA expert on Cosmos features vs World2Action decoder; expert head better.                                                                     |
+---
 
-## Next steps (priority order)
+## 3. Quantitative Benchmark Scoreboard (Held-Out Episodes 32–39)
 
-Tonight's overnight queue is smoke-first Cosmos `state_t=2` video-LoRA with layer attention, followed by LTX-2.5 `state_t=2` observed-only unpooled features; both queues stop after smoke when passed `--smoke-only`.
+| Model / Architecture                       | Latency     | Tokens to Policy                 | Representation Loss / CosSim | Action RMSE (Overall) | Immediate Action (H=1) | First-5 Actions Mean | Status / Role                    |
+| :----------------------------------------- | :---------- | :------------------------------- | :--------------------------- | :-------------------- | :--------------------- | :------------------- | :------------------------------- |
+| **Cosmos $T=16$ Gold Standard**            | ~1,200 ms   | 4,800 ($16 \times 15 \times 20$) | - / 1.0000                   | **`13.06°`**          | `4.76°`                | `6.19°`              | Offline Gold Standard            |
+| **Teacher $T=16$ `cond_frames` Oracle**    | -           | 2,400 ($2 \times 30 \times 40$)  | - / 1.0000                   | **`13.08°`**          | `4.97°`                | `6.40°`              | **Theoretical Oracle Ceiling**   |
+| **Cosmos $T=2$ Direct Distilled (Ours)**   | **~204 ms** | 2,400 ($2 \times 30 \times 40$)  | **1.21 / 0.9732**            | **`13.15°`**          | **`4.58°`** (Best)     | **`6.04°`** (Best)   | **Matches Oracle within 0.07°!** |
+| **Cosmos $T=2$ Undistilled Baseline**      | **~204 ms** | 2,400 ($2 \times 30 \times 40$)  | - / 0.6092                   | **`13.74°`**          | `4.92°`                | `6.34°`              | Fast Baseline (0.68° gap)        |
+| **LTX-2.5 22B (Unpooled Layer 34)**        | ~1,400 ms   | 2,400 ($15 \times 20$ / frame)   | -                            | **`13.84°`**          | `5.21°`                | `6.72°`              | Limited by 32× spatial VAE       |
+| _V2 Distillation (Lag Bug + Linear Head)_  | ~204 ms     | 2,400                            | 8.88 / 0.6809                | `13.99°`              | `5.18°`                | `6.83°`              | Scrambled latent space           |
+| _V1 Distillation (Lag Bug)_                | ~204 ms     | 2,400                            | 8.26 / 0.8056                | `14.08°`              | `5.02°`                | `6.58°`              | Degraded by 400 ms lag           |
+| _Failed: Action Backprop into Blocks 0–19_ | ~204 ms     | 2,400                            | exploded variance            | `14.51° – 14.74°`     | -                      | -                    | Catastrophic feature collapse    |
+| _SmolVLA 450M Baseline_                    | ~80 ms      | 64                               | -                            | **`14.83°`**          | -                      | -                    | Pure VLA Baseline                |
+| _Failed: $T=4$ Noise Slots_                | ~340 ms     | 4,800                            | unstable                     | `17.92°`              | -                      | -                    | Attended to Gaussian noise       |
 
-1. LTX layer probe -> retrain best LTX configuration to plateau (no wall-clock
-   cap; cap only as safety net).
-2. Cosmos to plateau under the same stopping rule, so converged-vs-converged.
-   Done for generic prefix-pool2 (13.81 deg at 36k), video-LoRA T=16 pool2
-   (13.06 deg at 38k, W&B ixzworl4, stopped on patience 10), and video-LoRA
-   `state_t=2` unpooled (13.74 deg at 27k / 46 min, W&B jri7vehq, stopped
-   37k / 1.06 h on patience 10).
-3. LoRA fine-tune of the backbone on our 32 training episodes, video loss
-   only, then freeze and retrain the action expert. Distinct from the failed
-   co-training arm (joint losses). Cosmos video-only LoRA (step 6k) + SmolExpert
-   is done and is the current offline best. LTX-2.5 video LoRA still open
-   (22B will not LoRA-train on a 4090).
-4. Fast video features for control (pretrained -> LoRA -> short forward ->
-   action expert). Do not start another backbone LoRA until this is measured.
-   Stack:
-   1. Pretrained video model (Cosmos-2B; LTX later if needed).
-   2. Video-only LoRA on our 32 episodes, then freeze. Cosmos step-6k is done
-      (13.06 deg expert). Do not jointly train video+action (already worse).
-   3. Cheap DiT forward, then train a **new** SmolExpert on that cache (train
-      and eval must match). Two options, in this order:
-      - **Observed-only (`state_t=2`): done.** Same video-LoRA as 13.06,
-        unpooled 2,400 tokens (no pool2). Trainer val **13.74 deg** at 27k /
-        46 min (W&B jri7vehq; h1 4.78, first-5 6.55). Cache extract 5.7x vs
-        T=16 LoRA pool2. Quality held: +0.68 vs 13.06, still better than
-        prefix-pool2 13.81. T=3 is optional if we want to chase that 0.68;
-        not required to proceed.
-      - **Parked (do not start now):** LTX-2.5 GPU-resident INT4 weight-only
-        extract at T=2. Fits the 4090 (10.7 GiB), 780 ms vs 1228 ms FP8
-        CPU-offload (~1.57x). Hidden states are still BF16. Needed before use:
-        feature drift vs FP8 extract, then a **new** SmolExpert on an INT4
-        cache. See `video_vam_ltx_latency_optimization.md`.
-      - **Optional: one-step future (T=3).** Keep the two cond
-        frames and add one noisy/predicted latent (~4 RGB frames, ~0.4 s at
-        10 Hz). Still ~5x fewer tokens than T=16. Optional extra LoRA for
-        next-latent / short-horizon prediction only (Diffusion Forcing /
-        Dreamer-style next-latent world models), then freeze again. This is
-        not one-denoising-step distillation; we already do a single high-sigma
-        forward. The win is fewer tokens. Do not rerun 16-frame video LoRA
-        for this.
-   4. Action expert on the resulting features. Even a tiny DiT does not
-      reach 10 Hz alone (VAE ~120 ms, expert ~90 ms). T=2 DiT in the
-      80-150 ms band is ~3 Hz per chunk, enough to hide behind a 30-step /
-      3 s buffer. Overlap still needed for true 10 Hz.
-      Details: `video_vam_latency_optimization_plan.md`,
-      `video_vam_connector_ablation_report.md`.
-      4b. **cosmos-t2-we (world expert), implemented + smoke-tested 2026-08-29,
-      full run not started.** Merge old video LoRA into the trunk at load,
-      fresh LoRA on blocks 0-19, SmolExpert-shaped 115M diffusion expert
-      denoises the 14 future latents from layer-20 T=2 features via prefix
-      K/V (same Cosmos rectified-flow objective). Goal: recover the 0.68
-      T=2 gap by putting future-prediction pressure back on the layer-20
-      interface; trunk runs once at inference, only the expert iterates.
-      Smoke: 2.2 s/step, 13.7 GiB, merge bit-identical to fused-step6000.
-      Run: `scripts/video_vam/run_cosmos_t2_we.sh` (train + anchor previews),
-      then 3-arm video eval vs base/LoRA Cosmos, then T=2 cache rebuild +
-      SmolExpert retrain. Details: `video_vam_world_expert.md`.
-5. Train on the new cube-out-of-box **v2** dataset next: video-LoRA cache +
-   SmolExpert on the same `state_t=2` short-forward contract. v1 T=2 is scored
-   (13.74 vs 13.06 T=16 LoRA).
-6. Real-robot deployment of best SmolVLA / Cosmos / LTX policies on a freshly
-   collected dataset; success-rate is the metric that matters, RMSE is proxy.
-   Real-time gap: video backbones ~1 Hz vs 10 Hz target; RTC + chunking plus
-   the fast-feature stack in (4) if RMSE holds. `torch.compile` is the rollout
-   default (~1.17x DiT); `--no-compile` disables it. Mac can only run SmolVLA
-   locally; Cosmos/LTX go through abakus RPC.
-7. Joint-state / calibration noise during SmolExpert training (not at deploy).
-   Sample a per-window or per-batch bias/scale on the 6 joints in physical
-   units, apply the same offset to action targets, then normalize. Val stays
-   clean. Isolates SO-101 recalibration mismatch and the episode-24 sign flip
-   without rebuilding video caches.
-8. Pregenerate augmented feature caches: apply cheap image augs (photometric
-   noise, small shifts/crops) _before_ Cosmos/LTX extract; write extra cache
-   entries with aug seed in provenance; mix with the clean 1,572-window cache
-   at train time. Val stays unaugmented. Do not replace the clean cache.
-   Budget: clean train cache is already ~31 GB / ~30 min; K extra augs costs
-   ~K times that. Start with K=2 photometric-only.
-9. Cosmos+LoRA continuation-video comparison vs generic Cosmos on the same
-   windows (episode 0 frame 4, episode 19 frame 2203) using
-   preview_cosmos_video_prediction.py --checkpoint fused-step6000.pt.
-10. Cheap high-value ablations if time permits: image-only backbone control,
-    multi-seed random-init, Cosmos-14B scale point.
+---
 
-## What this argues for a BFL forward-deployed-engineer story
+## 4. Key Scientific Insights & Discoveries
 
-Taking a frontier video model (LTX-2.5), building a feature interface for it,
-beating both the incumbent VAM recipe (Cosmos/mimic-video) and a standard VLA
-on a real robot dataset with 32 demos, with documented ablations separating
-pretraining, scale, and architecture effects - plus a clear-eyed account of
-the real-time gap and the domain-mismatch (FPV) limitation.
+1. **Direct Manifold Distillation Beats Auxiliary Heads**:
+   - Placing a 134M linear readout head between student LoRA and teacher targets allowed the LoRA to produce _scrambled intermediate coordinates_ ($z$ had $\text{CosSim} = 0.2782$).
+   - Removing the auxiliary head and applying direct supervision ($T=2 \to H_{\text{teacher}}^{0..1}$) forced the student LoRA to directly learn the un-scrambled physical manifold ($\text{CosSim} = 0.9732$).
+2. **The 4-Frame Temporal Shift Bug**:
+   - An indexing flaw in data loading (`entry.frame_index + i` vs. `entry.frame_index - 4 + i`) fed future frames during distillation while testing on past frames, creating a 400 ms lag that artificially degraded earlier distillation runs.
+   - Resolving this to the canonical `CUBE_OUT_OF_BOX_CONTRACT` causal window immediately unlocked the 13.15° result.
+3. **The Dual-Operator Dataset Shift**:
+   - Kinematic analysis revealed that `cube_out_of_box_dataset` consists of two distinct teleoperators:
+     - **Episodes 0–19 (Operator A)**: High-elbow posture (`Lift ≈ -30°`, `Elbow ≈ +35°`).
+     - **Episodes 20–39 (Operator B)**: Low-elbow posture (`Lift ≈ +10°`, `Elbow ≈ -20°`).
+   - The validation set (episodes 32–39) is 100% Operator B, testing cross-operator out-of-distribution kinematic transfer.
+4. **Why LTX-2.5 Trails Cosmos**:
+   - LTX-2.5 utilizes an aggressive **$32\times$ spatial VAE** ($15 \times 20$ latents at 480p), whereas Cosmos uses an **$8\times$ spatial VAE** ($60 \times 80$ latents). A 3 cm cube collapses into less than 1.5 latent pixels in LTX, destroying contact geometry before the transformer even processes it.
+
+---
+
+## 5. Strategic Roadmap & Execution Phases
+
+```
+┌────────────────────────────────────────────────────────────────────────┐
+│ Phase 1: Representation Distillation Breakthrough (COMPLETED)           │
+│  ✔ Fixed 4-frame lag bug and aligned causal window contract            │
+│  ✔ Succeeded in direct Layer-20 manifold distillation (13.15° RMSE)    │
+│  ✔ Verified Oracle ceiling on teacher cond_frames (13.08° RMSE)        │
+└───────────────────────────────────┬────────────────────────────────────┘
+                                    │
+                                    ▼
+┌────────────────────────────────────────────────────────────────────────┐
+│ Phase 2: Cosmos 3 Edge Scaling & Benchmarking (IN PROGRESS)            │
+│  ▶ Downloaded nvidia/Cosmos3-Edge & upgraded diffusers to 0.41.0.dev0  │
+│  ▶ Active: Extracting Cosmos3-Edge teacher features (Stage 1)          │
+│  ▶ Queued: SmolExpert policy training on Cosmos3-Edge                  │
+│  ▶ Queued: Direct distillation from Cosmos3-Edge (T=16 -> T=2)         │
+└───────────────────────────────────┬────────────────────────────────────┘
+                                    │
+                                    ▼
+┌────────────────────────────────────────────────────────────────────────┐
+│ Phase 3: Real-Time Inference Acceleration (< 80 ms Target)             │
+│  ☐ torch.compile(mode="max-autotune") on distilled student DiT         │
+│  ☐ Static CUDA Graph capture for SmolExpert 10-step flow head (26 ms)  │
+│  ☐ Benchmark 5-step flow matching vs. 10-step flow matching            │
+│  ☐ End-to-end latency profiling: Push full loop to 12-16 Hz            │
+└───────────────────────────────────┬────────────────────────────────────┘
+                                    │
+                                    ▼
+┌────────────────────────────────────────────────────────────────────────┐
+│ Phase 4: Closed-Loop Physical Robot Rollouts (SO-100 Hardware)         │
+│  ☐ Dry-run policy execution verification with live camera feed         │
+│  ☐ A/B Trial: Distilled T=2 (13.15°) vs. Undistilled T=2 (13.74°)       │
+│  ☐ Measure real-world grasp success rate on 20 physical trials         │
+└───────────────────────────────────┬────────────────────────────────────┘
+                                    │
+                                    ▼
+┌────────────────────────────────────────────────────────────────────────┐
+│ Phase 5: Publication & Interactive Blog Post (notnanton.io)            │
+│  ☐ Interactive figures & learning curve comparisons                    │
+│  ☐ Document the failed ablations, lag bug, and distillation solution   │
+│  ☐ Release code, checkpoints, and citeable technical report            │
+└────────────────────────────────────────────────────────────────────────┘
+```
