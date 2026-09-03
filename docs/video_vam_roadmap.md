@@ -16,11 +16,13 @@ _Core Infrastructure: Remote Server `abakus` (Ubuntu, RTX 4090 24GB VRAM), Local
 
 ## 2. Live Pipeline Status (In-Flight)
 
-- **Active Run**: `cosmos3-edge-pipeline-20260902` on `abakus` (tmux)
+- **Active Run**: `cosmos3-edge-pure600-20260903` on `abakus` (tmux)
   - **Model**: `nvidia/Cosmos3-Edge` (28 layers, 2048 hidden, 3.37B dense parameters, Wan 2.2 VAE)
-  - **Current Execution**: **Stage 1 (Feature Extraction)** is extracting Layer-20 representations across train (episodes 0–31) and validation (episodes 32–39) at ~8.3 samples/second.
-  - **Next Stage**: Automatically launches **Stage 2 (SmolExpert Policy Training)** to evaluate whether Cosmos 3 Edge's updated architecture surpasses the 13.15° mark.
-- **Master Log**: `/home/anton/.cache/video-vam/runs/cosmos3-edge-pipeline-20260902.log`
+  - **Clean 600-Token Representation**: Bypasses noisy generation slots and prompt tokens, extracting purely the 600 clean physical vision tokens from Layer 20 (2 frames x 15 x 20, exactly 91.99 ms uncompiled latency).
+  - **Current Execution**: **Stage 2 (SmolExpert Policy Training)** is training the flow-matching action policy on the clean 600-token physical representations.
+- **Queued Next**: `cosmos3-edge-lora-queue-20260903`
+  - Automated Video LoRA fine-tuning script scheduled to adapt Cosmos 3 Edge on robot demonstration data.
+- **Master Log**: `/home/anton/.cache/video-vam/runs/cosmos3-edge-pure600-pipeline-20260903.log`
 
 ---
 

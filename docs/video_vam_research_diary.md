@@ -1754,3 +1754,25 @@ To determine the theoretical upper bound of 2-frame representation distillation,
 | **Cosmos $T=2$ Undistilled Baseline**     | **~204 ms**       | 2,400 ($2 \times 30 \times 40$)  | - / 0.6092                  | **`13.74°`**             | `4.92°`               |
 | _V1 Distillation (Lag Bug)_               | ~204 ms           | 2,400                            | 8.06 / 0.8056               | `14.08°`                 | `5.02°`               |
 | _V2 Distillation (Lag Bug + Linear Head)_ | ~204 ms           | 2,400                            | 8.57 / 0.6809               | `13.99°`                 | `5.18°`               |
+
+## 2026-09-03 — Cosmos 3 Edge: Dissecting Partial Latents & Clean 600 Vision Tokens
+
+### 1. The Investigation: Do We Need the Partial Vision Latents?
+
+An architectural probe into `Cosmos3OmniPipeline` and `Cosmos3OmniTransformer` resolved why the initial out-of-the-box run scored 20.44°:
+
+- **The Noise & Padding Discovery**:
+  When `pipe(num_frames=16)` was called, the pipeline created 2 observed conditioning frames (2 x 15 x 20 = 600 tokens) and 14 noisy diffusion generation slots. Our earlier hook captured `torch.cat([und_seq, gen_seq])`, which mixed 58 prompt tokens + 600 vision tokens + partial noisy frames (3,738 tokens), which was then padded with 1,062 zeros to reach 4,800 tokens. The action policy was cross-attending to 22% empty padding and ungrounded noise!
+- **Pure Vision Token Extraction**:
+  We modified the feature extractor to isolate only the clean 600 vision tokens from Layer 20 (`und_seq`):
+  - **0 Prompt Tokens**
+  - **0 Future Noise Slots**
+  - **0 Zero Padding**
+  - **Shape**: Exactly `[1, 600, 2048]` (2 frames x 15 x 20 grid)
+  - **Latency**: Measured at **91.99 ms uncompiled** on the RTX 4090!
+
+### 2. Live Benchmark Execution
+
+- **Train & Val Caching**: Successfully extracted all 1,572 train samples and 88 val samples in under 2 minutes (~12 samples/s).
+- **Policy Training**: Launched `cosmos3-edge-pure600-smolexpert-20260903` on the clean 600-token representations.
+- **Video LoRA Adaptation Queued**: Prepared `schedule_cosmos3_edge_lora.sh` to adapt Cosmos 3 Edge on robot video demonstrations once the zero-shot baseline completes.
