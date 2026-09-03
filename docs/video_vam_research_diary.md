@@ -1786,3 +1786,29 @@ The pure 600 vision token benchmark (`cosmos3-edge-pure600-smolexpert-20260903`)
 - **First-5 Actions Mean**: **`6.34°`**.
 - **Inference Speed**: **`91.99 ms` uncompiled** (total policy reaction time ~100 ms).
 - **Key Insight**: With zero Video LoRA adaptation and only 600 tokens (1/4th of Cosmos 2B), Cosmos 3 Edge delivers a strong physical representation, setting the baseline for subsequent Video LoRA adaptation.
+
+## 2026-09-03 — Cosmos 3 Edge: Video LoRA Adaptation & First-N-Layers Representation Pipeline
+
+### 1. Motivation & Technical Strategy
+
+- In Cosmos 2B, base representations achieved ~26 deg RMSE without adaptation, but dropped to 13.06 deg once adapted via Video LoRA on the SO-100 cube_out_of_box task.
+- For Cosmos 3 Edge (3.37B), zero-shot representations already hit 14.26 deg with pure 600 vision tokens at 91.99 ms. Adapting the spatiotemporal world model with Video LoRA directly on robot demonstration videos targets closing the gap to the 13.06 deg gold standard.
+- Architectural LoRA Design:
+  - Model: nvidia/Cosmos3-Edge (28 blocks, hidden 2048, 16 attention heads, Wan 2.2 VAE).
+  - Injected LoRALinear into all 336 attention and MLP projections across all 28 layers (rank 16, alpha 16.0, 33.03M trainable parameters).
+  - Objective: Flow Matching on 17-frame video clips (5 latents: frames 0-1 conditioning, frames 2-4 flow-matching velocity prediction).
+  - Gradient Checkpointing enabled: Peak VRAM bounded at 9.63 GB on 24GB RTX 4090.
+
+### 2. Feature Extraction & Policy Coupling
+
+- After Video LoRA training, representations are probed at Layer 20:
+  - The LoRA weights are active on transformer layers 0..19.
+  - Layers 20..27 are truncated, saving ~28% forward DiT compute.
+  - Generates adapted pure 600-token feature caches (cosmos3-edge-adapted-train0-31-stride3 and cosmos3-edge-adapted-val32-39-stride20).
+- SmolExpert action policy is trained on the adapted 600-token representations to evaluate validation RMSE on held-out episodes 32-39.
+
+### 3. Live Pipeline Launch
+
+- Active tmux session: cosmos3-edge-lora-pipeline-20260903
+- Script: scripts/video_vam/run_cosmos3_edge_lora_pipeline.sh
+- Master log: /home/anton/.cache/video-vam/runs/cosmos3-edge-adapted-pipeline-20260903.log

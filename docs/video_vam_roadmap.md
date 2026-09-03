@@ -16,7 +16,10 @@ _Core Infrastructure: Remote Server `abakus` (Ubuntu, RTX 4090 24GB VRAM), Local
 
 ## 2. Live Pipeline Status (In-Flight)
 
-- **Active Run**: `cosmos3-edge-pure600-20260903` on `abakus` (tmux)
+- **Active Run**: `cosmos3-edge-lora-pipeline-20260903` on `abakus` (tmux)
+  - **Stage 1 (In Flight)**: Training Cosmos 3 Edge Video LoRA (rank 16, 33M params) via Flow Matching on robot video clips.
+  - **Stage 2 (Queued)**: Extracting adapted pure 600 vision tokens at Layer 20 (layers 0..19 LoRA active).
+  - **Stage 3 (Queued)**: Training SmolExpert policy on the adapted 600-token representations.
   - **Model**: `nvidia/Cosmos3-Edge` (28 layers, 2048 hidden, 3.37B dense parameters, Wan 2.2 VAE)
   - **Clean 600-Token Representation**: Bypasses noisy generation slots and prompt tokens, extracting purely the 600 clean physical vision tokens from Layer 20 (2 frames x 15 x 20, exactly 91.99 ms uncompiled latency).
   - **Current Execution**: **Stage 2 (SmolExpert Policy Training)** is training the flow-matching action policy on the clean 600-token physical representations.
