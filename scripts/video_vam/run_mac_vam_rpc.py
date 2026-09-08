@@ -1,23 +1,38 @@
 #!/usr/bin/env python3
-"""Mac-side Video-VAM rollout: SSH RPC on abakus, execute action chunks on the SO-101.
+"""Mac-side Video-VAM & SmolVLA Universal Rollout Launcher.
 
-This is a real hardware rollout, not a dry print of chunks. Flags match
-``lerobot-rollout`` where they apply. Cosmos/LTX stay on abakus; the Mac owns
-USB, cameras, and ``send_action``. Each launch ``git pull --ff-only``s
-``/home/anton/lerobot-video-vam`` on abakus and restarts tmux when HEAD moved
-or the running server is missing RTC.
+Communicates with the model server on abakus via SSH HTTP RPC and streams
+action chunks directly to the SO-101 / SO-100 robot arm at 10 Hz.
 
-Example (same shape as lerobot-rollout):
+Features:
+1. Automated Server Management: If the model server is not already running on abakus
+   (or running a different policy/checkpoint), automatically starts it in tmux.
+2. Real-Time Chunking (RTC): Enabled by default with execution delay compensation and
+   native denoiser prefix guidance (the repository RTC approximation).
+3. Multiple Policies:
+   - --policy smolvla (converged 29.2k checkpoint, or new Scale-100 checkpoint)
+   - --policy video_vam (Cosmos 2B backbone + SmolExpert action decoder)
+4. RPC-only Dry-Run Verification:
+   Pass --dry-run to test RPC inference only, without opening cameras or connecting motors.
 
-    python run_mac_vam_rpc.py \\
-        --robot.type=so101_follower \\
-        --robot.port=/dev/tty.usbmodemXXXX \\
-        --robot.id=so101 \\
-        --robot.use_degrees=true \\
-        --robot.cameras='{front: {type: opencv, index_or_path: 0, width: 640, height: 480, fps: 30}}' \\
-        --inference.type=rtc --prefetch-steps=15 \\
-        --fps=10 --duration=30 --task="take cube out of box" \\
-        --keep-server
+Usage Examples:
+
+    # 1. Test model inference over RPC without moving motors:
+    python scripts/video_vam/run_mac_vam_rpc.py --policy smolvla --dry-run
+
+    # 2. Live hardware rollout with SO-101 arm (RTC enabled by default).
+    # Also supply --joint-limits-min and --joint-limits-max: six calibrated bounds each.
+    # Existing calibration is required. Disconnect releases torque; support the arm.
+    python scripts/video_vam/run_mac_vam_rpc.py \
+        --policy smolvla \
+        --robot.type=so101_follower \
+        --robot.port=/dev/tty.usbmodemXXXX \
+        --robot.id=so101 \
+        --robot.cameras='{front: {type: opencv, index_or_path: 0, width: 640, height: 480, fps: 30}}' \
+        --duration=30 --task="take cube out of box"
+
+    # 3. Rollout with newly trained Scale-100 model:
+    python scripts/video_vam/run_mac_vam_rpc.py --policy smolvla --checkpoint latest_scale100 --dry-run
 """
 
 from __future__ import annotations
@@ -27,15 +42,22 @@ import ast
 import base64
 import json
 import math
-import re
+import shlex
 import shutil
 import subprocess
-import threading
 import time
+import uuid
+import warnings
 from collections import deque
 from concurrent.futures import Future, ThreadPoolExecutor
 from io import BytesIO
 from typing import Any
+
+import torch
+
+from lerobot.policies.rtc.action_queue import ActionQueue
+from lerobot.policies.rtc.configuration_rtc import RTCConfig
+from lerobot.policies.rtc.latency_tracker import LatencyTracker
 
 SSH_HOST = "abakus"
 
@@ -47,12 +69,18 @@ def _ssh_executable() -> str:
     return path
 
 
-DEFAULT_PORT = 8765
-TMUX_SESSION = "video-vam-rpc"
+DEFAULT_PORT = 8766
 REPO = "/home/anton/lerobot-video-vam"
 SERVER_WRAPPER = "scripts/video_vam/run_rpc_server.sh"
-READY_TIMEOUT_S = 180.0
 IMAGE_SIZE = (640, 480)
+
+# Checkpoints
+DEFAULT_SMOLVLA_CHECKPOINT = "/home/anton/lerobot-video-vam/outputs/train/cube_out_of_box_il_smolvla_train_only_stats_0_31_20260826_1hr/checkpoints/029200/pretrained_model"
+SCALE100_SMOLVLA_CHECKPOINT = "/home/anton/lerobot-video-vam/outputs/train/cube_out_of_box_scale100_smolvla_1hr/checkpoints/last/pretrained_model"
+DEFAULT_COSMOS_CHECKPOINT = (
+    "/home/anton/.cache/video-vam/runs/cosmos2b-videolora-smolexpert-20260828/smolexpert"
+)
+
 ACTION_NAMES = (
     "shoulder_pan.pos",
     "shoulder_lift.pos",
@@ -63,9 +91,6 @@ ACTION_NAMES = (
 )
 MOTOR_NAMES = tuple(name.removesuffix(".pos") for name in ACTION_NAMES)
 DEFAULT_CAMERAS = "{front: {type: opencv, index_or_path: 0, width: 640, height: 480, fps: 30}}"
-DEFAULT_N_ACTION_STEPS = 30
-# Per-tick clip in motor units (degrees for the arm, 0-100 for the gripper).
-# 10 was clamping almost every Video-VAM step; 30/50 lets the chunk through.
 DEFAULT_MAX_RELATIVE_TARGET = {
     "shoulder_pan": 30.0,
     "shoulder_lift": 30.0,
@@ -76,710 +101,676 @@ DEFAULT_MAX_RELATIVE_TARGET = {
 }
 
 
-class VideoVAMRPCClient:
-    def __init__(self, *, policy: str, port: int = DEFAULT_PORT, ssh_host: str = SSH_HOST) -> None:
-        if policy not in {"smolvla", "video_vam"}:
-            raise ValueError("policy must be smolvla or video_vam")
-        self.policy = policy
-        self.port = port
-        self.ssh_host = ssh_host
-        self.frames: deque[str] = deque(maxlen=5)
-        self.frame_times: deque[float] = deque(maxlen=5)
-        self._lock = threading.Lock()
+SSH_OPTIONS = [
+    "-o",
+    "BatchMode=yes",
+    "-o",
+    "ConnectTimeout=10",
+    "-o",
+    "ControlMaster=no",
+    "-o",
+    "ControlPath=none",
+]
+MANAGED_OWNER = "lerobot-video-vam-rpc-v2"
 
-    @staticmethod
-    def _png_b64(frame: Any) -> str:
-        from PIL import Image
 
-        if not isinstance(frame, Image.Image):
-            raise TypeError("frame must be a PIL Image")
-        stream = BytesIO()
-        frame.convert("RGB").save(stream, format="PNG")
-        return base64.b64encode(stream.getvalue()).decode("ascii")
-
-    def remember(self, frame: Any) -> None:
-        with self._lock:
-            self.frames.append(self._png_b64(frame))
-            self.frame_times.append(time.perf_counter())
-
-    def history_spacing_ms(self) -> list[float]:
-        with self._lock:
-            times = list(self.frame_times)
-        return [(later - earlier) * 1000.0 for earlier, later in zip(times, times[1:], strict=False)]
-
-    def request(
-        self,
-        frame: Any,
-        state: list[float],
-        *,
-        feature_seed: int | None = None,
-        remember: bool = True,
-        inference_delay: int | None = None,
-        prev_chunk_left_over: list[list[float]] | None = None,
-        execution_horizon: int | None = None,
-    ) -> dict[str, Any]:
-        if tuple(frame.size) != IMAGE_SIZE:
-            raise ValueError(f"frame must be 640x480, got {frame.size}")
-        if len(state) != 6:
-            raise ValueError("state must contain six floats")
-        with self._lock:
-            if remember:
-                self.frames.append(self._png_b64(frame))
-                self.frame_times.append(time.perf_counter())
-            if self.policy == "video_vam" and len(self.frames) < 5:
-                return {"need_more_frames": 5 - len(self.frames), "policy": self.policy}
-            value: str | list[str] = encoded_latest(self) if self.policy == "smolvla" else list(self.frames)
-        payload: dict[str, Any] = {
-            "state": [float(x) for x in state],
-            "images_front_u8_png_b64": value,
-        }
-        if feature_seed is not None:
-            if feature_seed < 0:
-                raise ValueError("feature_seed must be non-negative")
-            payload["feature_seed"] = feature_seed
-        if prev_chunk_left_over is not None:
-            payload["prev_chunk_left_over"] = prev_chunk_left_over
-            payload["inference_delay"] = 0 if inference_delay is None else int(inference_delay)
-        if execution_horizon is not None:
-            payload["execution_horizon"] = int(execution_horizon)
-        command = [
-            _ssh_executable(),
-            self.ssh_host,
-            "curl",
-            "--fail-with-body",
-            "-sS",
-            "-X",
-            "POST",
-            "-H",
-            "Content-Type: application/json",
-            "--data-binary",
-            "@-",
-            f"http://127.0.0.1:{self.port}/predict",
-        ]
+def _ssh(args: list[str], *, check: bool = True, timeout: float = 15.0) -> subprocess.CompletedProcess[bytes]:
+    try:
         completed = subprocess.run(
-            command,
-            input=json.dumps(payload).encode(),
+            [_ssh_executable(), *SSH_OPTIONS, SSH_HOST, shlex.join(args)],
             capture_output=True,
             check=False,
+            timeout=timeout,
         )
-        if completed.returncode:
-            err = completed.stderr.decode(errors="replace") or completed.stdout.decode(errors="replace")
-            raise RuntimeError(err or "SSH RPC request failed")
-        result = json.loads(completed.stdout)
-        if not isinstance(result, dict):
-            raise RuntimeError("RPC response must be a JSON object")
-        if "error" in result:
-            raise RuntimeError(result["error"])
-        return result
-
-
-def encoded_latest(client: VideoVAMRPCClient) -> str:
-    if not client.frames:
-        raise RuntimeError("no frames buffered")
-    return client.frames[-1]
-
-
-def _ssh(args: list[str], *, check: bool = True) -> subprocess.CompletedProcess[bytes]:
-    completed = subprocess.run([_ssh_executable(), SSH_HOST, *args], capture_output=True, check=False)
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError(f"SSH operation timed out after {timeout}s") from exc
     if check and completed.returncode:
-        raise RuntimeError(
-            completed.stderr.decode(errors="replace")
-            or completed.stdout.decode(errors="replace")
-            or "ssh failed"
-        )
+        raise RuntimeError(completed.stderr.decode(errors="replace") or "SSH failed")
     return completed
 
 
-def _healthz(port: int) -> bool:
-    completed = _ssh(
-        ["curl", "-sS", "-o", "/dev/null", "-w", "%{http_code}", f"http://127.0.0.1:{port}/healthz"],
+def _healthz_payload(port: int) -> dict[str, Any] | None:
+    result = _ssh(
+        [
+            "curl",
+            "--fail",
+            "--silent",
+            "--show-error",
+            "--connect-timeout",
+            "2",
+            "--max-time",
+            "3",
+            f"http://127.0.0.1:{port}/healthz",
+        ],
         check=False,
     )
-    return completed.returncode == 0 and completed.stdout.strip() == b"200"
-
-
-def _healthz_payload(port: int) -> dict[str, Any] | None:
-    completed = _ssh(["curl", "-sS", f"http://127.0.0.1:{port}/healthz"], check=False)
-    if completed.returncode:
+    if result.returncode:
         return None
     try:
-        payload = json.loads(completed.stdout)
-    except json.JSONDecodeError:
+        value = json.loads(result.stdout)
+    except (ValueError, UnicodeDecodeError):
         return None
-    return payload if isinstance(payload, dict) else None
+    return value if isinstance(value, dict) else None
 
 
-def _session_exists() -> bool:
-    completed = _ssh(["tmux", "has-session", "-t", TMUX_SESSION], check=False)
-    return completed.returncode == 0
+def _server_args(args: argparse.Namespace) -> list[str]:
+    values = [
+        "--policy",
+        args.policy,
+        "--checkpoint",
+        args.resolved_checkpoint,
+        "--port",
+        str(args.port),
+        "--device",
+        args.device,
+        "--execution-horizon",
+        str(args.execution_horizon),
+        "--max-guidance-weight",
+        str(args.max_guidance_weight),
+        "--compile" if args.compile else "--no-compile",
+        "--rtc" if args.inference_type == "rtc" else "--no-rtc",
+    ]
+    if args.joint_limits_min is not None:
+        values += ["--joint-limits-min", *map(str, args.joint_limits_min)]
+        values += ["--joint-limits-max", *map(str, args.joint_limits_max)]
+    return values
 
 
-def _start_server() -> None:
-    remote = (
-        f"cd {REPO} && tmux has-session -t {TMUX_SESSION} 2>/dev/null || "
-        f"tmux new-session -d -s {TMUX_SESSION} 'bash {SERVER_WRAPPER}'"
+def _describe_server(args: argparse.Namespace) -> dict[str, Any]:
+    result = _ssh(
+        ["bash", f"{REPO}/{SERVER_WRAPPER}", *_server_args(args), "--describe"], timeout=args.ready_timeout
     )
-    _ssh(["bash", "-lc", remote])
+    value = json.loads(result.stdout)
+    required = {"protocol", "policy", "checkpoint", "fingerprint", "server_code", "config"}
+    if not isinstance(value, dict) or not required <= value.keys() or value["protocol"] != 2:
+        raise RuntimeError("Remote server did not provide a complete protocol-v2 identity")
+    if not value["fingerprint"] or not value["checkpoint"] or value["policy"] != args.policy:
+        raise RuntimeError("Incomplete checkpoint identity")
+    return value
 
 
-def _stop_server() -> None:
-    _ssh(["tmux", "kill-session", "-t", TMUX_SESSION], check=False)
-
-
-def should_restart_rpc(
-    *,
-    updated: bool,
-    healthy: bool,
-    require_rtc: bool,
-    rtc_advertised: bool,
-) -> bool:
-    """Restart after a pull when the process would otherwise keep stale code."""
-    if not healthy or updated:
-        return True
-    return require_rtc and not rtc_advertised
-
-
-def _sync_remote_repo() -> bool:
-    """Fast-forward the abakus checkout. Returns True if HEAD moved."""
-    before = _ssh(["git", "-C", REPO, "rev-parse", "HEAD"]).stdout.decode().strip()
-    print(f"git pull --ff-only in {SSH_HOST}:{REPO}", flush=True)
-    completed = _ssh(["bash", "-lc", f"git -C {REPO} pull --ff-only"])
-    output = (completed.stdout.decode(errors="replace") + completed.stderr.decode(errors="replace")).strip()
-    if output:
-        print(output, flush=True)
-    after = _ssh(["git", "-C", REPO, "rev-parse", "HEAD"]).stdout.decode().strip()
-    if before != after:
-        print(f"abakus repo updated {before[:12]} -> {after[:12]}", flush=True)
-        return True
-    print(f"abakus repo already at {after[:12]}", flush=True)
-    return False
-
-
-def _wait_ready(port: int, timeout_s: float) -> None:
-    deadline = time.time() + timeout_s
-    while time.time() < deadline:
-        if _healthz(port):
-            return
-        time.sleep(2.0)
-    raise TimeoutError(f"RPC server on {SSH_HOST}:{port} did not become ready within {timeout_s:.0f}s")
-
-
-def _bool_arg(value: str) -> bool:
-    lowered = value.strip().lower()
-    if lowered in {"true", "1", "yes"}:
-        return True
-    if lowered in {"false", "0", "no"}:
-        return False
-    raise argparse.ArgumentTypeError(f"expected true/false, got {value!r}")
-
-
-def _parse_mapping(raw: str) -> Any:
-    text = raw.strip()
-    if not text:
-        raise ValueError("empty mapping")
-    try:
-        return json.loads(text)
-    except json.JSONDecodeError:
-        pass
-    try:
-        return ast.literal_eval(text)
-    except (ValueError, SyntaxError):
-        pass
-    quoted = re.sub(
-        r"[A-Za-z_][A-Za-z0-9_]*",
-        lambda match: (
-            match.group(0) if match.group(0) in {"true", "false", "null"} else json.dumps(match.group(0))
-        ),
-        text,
+def should_restart_rpc(*, health_payload: dict[str, Any] | None, requested_identity: dict[str, Any]) -> bool:
+    return not (
+        health_payload
+        and health_payload.get("ok") is True
+        and health_payload.get("identity") == requested_identity
+        and health_payload.get("instance_id")
     )
-    try:
-        return json.loads(quoted)
-    except json.JSONDecodeError as exc:
-        raise ValueError(f"could not parse mapping {raw!r}") from exc
+
+
+# This lock serializes only tmux lifecycle operations for one port, never GPU work.
+REMOTE_MANAGER = r"""
+import fcntl, json, pathlib, shlex, socket, subprocess, sys, time
+op, port, owner, token, repo, wrapper, encoded_args = sys.argv[1:]
+port = int(port)
+session = 'video-vam-rpc-' + str(port)
+log = '/tmp/video-vam-rpc-' + str(port) + '-' + token + '.log'
+def tmux(*args):
+    return subprocess.run(['tmux', *args], capture_output=True, text=True, timeout=5)
+def session_id():
+    result = tmux('list-sessions', '-F', '#{session_name}\t#{session_id}')
+    for line in result.stdout.splitlines():
+        name, separator, identifier = line.partition('\t')
+        if separator and name == session:
+            return identifier
+    return None
+def exists():
+    return session_id() is not None
+def option(name):
+    target = session_id()
+    if target is None:
+        return ''
+    return tmux('show-options', '-qv', '-t', target, name).stdout.strip()
+def startup_log():
+    path = pathlib.Path(log)
+    if not path.is_file():
+        return '(startup log not created)'
+    with path.open('rb') as stream:
+        stream.seek(max(0, path.stat().st_size - 4000))
+        return stream.read().decode(errors='replace')
+def startup_error(message):
+    return RuntimeError(message + '\nStartup log: ' + log + '\n' + startup_log())
+def listening():
+    with socket.socket() as sock:
+        sock.settimeout(0.2)
+        return sock.connect_ex(('127.0.0.1', port)) == 0
+with open('/tmp/video-vam-rpc-' + str(port) + '.lifecycle.lock', 'a') as lock:
+    lock_deadline = time.monotonic() + 3
+    while True:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            break
+        except BlockingIOError:
+            if time.monotonic() >= lock_deadline:
+                raise RuntimeError('Lifecycle operation already in progress')
+            time.sleep(0.1)
+    if op == 'stop':
+        if exists() and option('@vam_owner') == owner and option('@vam_instance') == token:
+            result = tmux('kill-session', '-t', session_id())
+            if result.returncode:
+                raise RuntimeError(result.stderr)
+            deadline = time.monotonic() + 10
+            while listening() and time.monotonic() < deadline:
+                time.sleep(0.1)
+            if listening():
+                raise RuntimeError('Managed session stopped but port is still occupied; no other process was killed')
+        print(json.dumps({'stopped': True}))
+    elif op == 'status':
+        alive = exists() and option('@vam_owner') == owner and option('@vam_instance') == token
+        text = startup_log()
+        print(json.dumps({'alive': alive, 'log': text}))
+    elif op == 'start':
+        if exists():
+            if option('@vam_owner') != owner:
+                raise RuntimeError('Refusing to replace an unowned tmux session')
+            # Never kill a listener just because it occupies our requested port.
+            if listening():
+                import urllib.request
+                with urllib.request.urlopen('http://127.0.0.1:' + str(port) + '/healthz', timeout=3) as response:
+                    health = json.load(response)
+                if health.get('instance_id') != option('@vam_instance'):
+                    raise RuntimeError('Listener does not belong to the managed instance')
+            result = tmux('kill-session', '-t', session_id())
+            if result.returncode:
+                raise RuntimeError(result.stderr)
+            deadline = time.monotonic() + 10
+            while listening() and time.monotonic() < deadline:
+                time.sleep(0.1)
+        if listening():
+            raise RuntimeError('Port occupied by an unmanaged or still-stopping process')
+        command = shlex.join(['bash', str(pathlib.Path(repo) / wrapper), *json.loads(encoded_args), '--instance-id', token])
+        command = 'exec ' + command + ' >' + shlex.quote(log) + ' 2>&1'
+        # Set ownership before launching a child that could exit immediately.
+        result = tmux('new-session', '-d', '-P', '-F', '#{session_id}', '-s', session, 'exec sleep 30')
+        if result.returncode:
+            raise startup_error(result.stderr)
+        target = result.stdout.strip()
+        try:
+            if not target or target != session_id():
+                raise startup_error('Could not identify the reserved tmux session')
+            # Option commands do not consistently accept exact-name targets across tmux versions.
+            for key, value in (('@vam_owner', owner), ('@vam_instance', token)):
+                result = tmux('set-option', '-t', target, key, value)
+                if result.returncode:
+                    raise startup_error(result.stderr)
+            result = tmux('respawn-window', '-k', '-t', target + ':', command)
+            if result.returncode:
+                raise startup_error(result.stderr)
+            if session_id() != target:
+                raise startup_error('Managed server exited during startup')
+        except BaseException:
+            if target:
+                tmux('kill-session', '-t', target)
+            raise
+        print(json.dumps({'instance_id': token, 'log': log}))
+    else:
+        raise ValueError('unknown operation')
+"""
+
+
+def _manage(args: argparse.Namespace, operation: str, token: str) -> dict[str, Any]:
+    result = _ssh(
+        [
+            "python3",
+            "-c",
+            REMOTE_MANAGER,
+            operation,
+            str(args.port),
+            MANAGED_OWNER,
+            token,
+            REPO,
+            SERVER_WRAPPER,
+            json.dumps(_server_args(args)),
+        ],
+        timeout=75,
+    )
+    return json.loads(result.stdout)
+
+
+def _wait_ready(args: argparse.Namespace, identity: dict[str, Any], token: str) -> dict[str, Any]:
+    deadline = time.monotonic() + args.ready_timeout
+    while time.monotonic() < deadline:
+        health = _healthz_payload(args.port)
+        if health is not None:
+            if health.get("instance_id") != token:
+                raise RuntimeError("Different server instance appeared during startup")
+            if should_restart_rpc(health_payload=health, requested_identity=identity):
+                raise RuntimeError("Loaded server identity differs from requested checkpoint/config")
+            return health
+        status = _manage(args, "status", token)
+        if not status["alive"]:
+            raise RuntimeError(f"Managed server exited during startup: {status['log']}")
+        time.sleep(0.5)
+    raise RuntimeError(
+        f"Server not ready within {args.ready_timeout}s; see /tmp/video-vam-rpc-{args.port}-{token}.log on {SSH_HOST}"
+    )
+
+
+def _finite_state(value: Any) -> list[float]:
+    tensor = torch.as_tensor(value, dtype=torch.float32)
+    if tuple(tensor.shape) != (6,) or not torch.isfinite(tensor).all().item():
+        raise ValueError("state/action step must contain six finite values")
+    return tensor.tolist()
+
+
+class VideoVAMRPCClient:
+    def __init__(
+        self,
+        *,
+        policy: str,
+        port: int = DEFAULT_PORT,
+        ssh_host: str = SSH_HOST,
+        timeout: float = 120.0,
+        health: dict[str, Any] | None = None,
+    ) -> None:
+        if policy not in {"smolvla", "video_vam"}:
+            raise ValueError("policy must be smolvla or video_vam")
+        self.policy, self.port, self.ssh_host = policy, port, ssh_host
+        self.timeout, self.health = timeout, health or {}
+        self.frames: deque[Any] = deque(maxlen=5 if policy == "video_vam" else 1)
+        self.frame_times: deque[float] = deque(maxlen=self.frames.maxlen)
+        self.frame_index = -1
+
+    @staticmethod
+    def _image(frame: Any) -> Any:
+        import numpy as np
+        from PIL import Image
+
+        if isinstance(frame, Image.Image):
+            image = frame.convert("RGB")
+        elif isinstance(frame, np.ndarray) and frame.dtype == np.uint8 and frame.shape == (480, 640, 3):
+            image = Image.fromarray(frame, "RGB")
+        else:
+            raise TypeError("front camera must supply an RGB uint8 [480,640,3] array or PIL image")
+        if image.size != IMAGE_SIZE:
+            raise ValueError("front camera must be 640x480")
+        return image.copy()
+
+    @staticmethod
+    def _png_b64(frame: Any) -> str:
+        stream = BytesIO()
+        frame.save(stream, format="PNG")
+        return base64.b64encode(stream.getvalue()).decode("ascii")
+
+    def remember(self, frame: Any, *, timestamp: float | None = None) -> None:
+        self.frames.append(self._image(frame))
+        self.frame_times.append(time.monotonic() if timestamp is None else timestamp)
+        self.frame_index += 1
+
+    def history_spacing_ms(self) -> list[float]:
+        times = list(self.frame_times)
+        return [(b - a) * 1000 for a, b in zip(times, times[1:], strict=False)]
+
+    def snapshot(
+        self,
+        state: list[float],
+        *,
+        task: str,
+        feature_seed: int | None,
+        leftover: torch.Tensor | None = None,
+        inference_delay: int = 0,
+    ) -> dict[str, Any]:
+        if len(self.frames) != self.frames.maxlen:
+            raise RuntimeError("observation history is not ready")
+        now = time.monotonic()
+        if now - self.frame_times[-1] > 0.175 or any(
+            not 0.05 <= gap / 1000 <= 0.175 for gap in self.history_spacing_ms()
+        ):
+            raise RuntimeError("observation history is stale or not sampled at 10 Hz")
+        return {
+            "frames": list(self.frames),
+            "state": _finite_state(state),
+            "task": task,
+            "feature_seed": feature_seed,
+            "frame_index": self.frame_index,
+            "identity": self.health["identity"],
+            "instance_id": self.health["instance_id"],
+            "request_id": uuid.uuid4().hex,
+            "original_space": self.health["original_space"],
+            "prev_chunk_left_over": leftover_payload(leftover),
+            "inference_delay": inference_delay,
+        }
+
+    def request(self, snapshot: dict[str, Any]) -> dict[str, Any]:
+        payload = dict(snapshot)
+        frames = [self._png_b64(frame) for frame in payload.pop("frames")]
+        payload["images_front_u8_png_b64"] = frames if self.policy == "video_vam" else frames[-1]
+        command = shlex.join(
+            [
+                "curl",
+                "--fail-with-body",
+                "--silent",
+                "--show-error",
+                "--connect-timeout",
+                "3",
+                "--max-time",
+                str(self.timeout),
+                "-X",
+                "POST",
+                f"http://127.0.0.1:{self.port}/predict",
+                "-H",
+                "Content-Type: application/json",
+                "--data-binary",
+                "@-",
+            ]
+        )
+        try:
+            completed = subprocess.run(
+                [_ssh_executable(), *SSH_OPTIONS, self.ssh_host, command],
+                input=json.dumps(payload, allow_nan=False).encode(),
+                capture_output=True,
+                check=False,
+                timeout=self.timeout + 12,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise RuntimeError("RPC transport timed out; no request will be retried") from exc
+        if completed.returncode:
+            raise RuntimeError(
+                f"RPC failed: {completed.stderr.decode(errors='replace')} {completed.stdout.decode(errors='replace')[:1000]}"
+            )
+        result = json.loads(completed.stdout)
+        if not isinstance(result, dict) or "error" in result:
+            raise RuntimeError(f"RPC server error: {result}")
+        for key in ("identity", "instance_id", "request_id", "original_space"):
+            if result.get(key) != payload[key]:
+                raise RuntimeError(f"RPC response {key} mismatch")
+        _chunks_from_result(result, self.health["horizon"])
+        return result
+
+
+def planned_inference_delay(latency_s: float | None, fps: int) -> int:
+    return 0 if not latency_s else math.ceil(latency_s * fps)
+
+
+def leftover_payload(tensor: torch.Tensor | None, horizon: int | None = None) -> list[list[float]] | None:
+    if tensor is None or tensor.numel() == 0:
+        return None
+    if tensor.ndim != 2 or tensor.shape[1] != 6 or not torch.isfinite(tensor).all().item():
+        raise ValueError("leftover must be finite [T,6]")
+    # Do not invent physical zero targets or truncate the available guidance prefix.
+    return tensor.detach().cpu().float().tolist()
 
 
 def _parse_max_relative_target(raw: str) -> dict[str, float]:
-    value = _parse_mapping(raw)
-    if not isinstance(value, dict):
-        raise ValueError(
-            "robot.max_relative_target must be a per-motor dict "
-            f"(not a scalar). Expected keys: {list(MOTOR_NAMES)}"
-        )
-    missing = [name for name in MOTOR_NAMES if name not in value]
-    if missing:
-        raise ValueError(f"robot.max_relative_target is missing motors: {missing}")
-    parsed = {name: float(value[name]) for name in MOTOR_NAMES}
-    if any(not math.isfinite(limit) or limit <= 0 for limit in parsed.values()):
-        raise ValueError("robot.max_relative_target values must be finite and positive")
-    return parsed
+    parsed = ast.literal_eval(raw)
+    if not isinstance(parsed, dict) or set(parsed) != set(MOTOR_NAMES):
+        raise ValueError("max_relative_target must contain exactly the six motor names")
+    result = {name: float(parsed[name]) for name in MOTOR_NAMES}
+    if any(not math.isfinite(value) or value <= 0 for value in result.values()):
+        raise ValueError("relative target limits must be finite and positive")
+    return result
 
 
-def _parse_cameras(raw: str) -> dict[str, dict[str, Any]]:
-    value = _parse_mapping(raw)
-    if not isinstance(value, dict) or not value:
-        raise ValueError("robot.cameras must be a non-empty mapping")
-    cameras: dict[str, dict[str, Any]] = {}
-    for name, spec in value.items():
-        if not isinstance(spec, dict):
-            raise ValueError(f"camera {name!r} must be a mapping")
-        cam_type = spec.get("type")
-        if cam_type != "opencv":
-            raise ValueError(f"only opencv cameras are supported, got {cam_type!r} for {name}")
-        if "index_or_path" not in spec:
-            raise ValueError(f"camera {name!r} needs index_or_path")
-        width = int(spec.get("width", IMAGE_SIZE[0]))
-        height = int(spec.get("height", IMAGE_SIZE[1]))
-        fps = int(spec.get("fps", 10))
-        if (width, height) != IMAGE_SIZE:
-            raise ValueError(f"camera {name!r} must be 640x480, got {width}x{height}")
-        cameras[str(name)] = {
-            "type": "opencv",
-            "index_or_path": spec["index_or_path"],
-            "width": width,
-            "height": height,
-            "fps": fps,
-        }
-    if "front" not in cameras:
-        raise ValueError("robot.cameras must include a 'front' camera")
-    return cameras
+def _parse_cameras(raw: str) -> dict[str, Any]:
+    import yaml
 
+    from lerobot.cameras.opencv.configuration_opencv import OpenCVCameraConfig
 
-def _observation_to_pil(obs: dict[str, Any], camera_key: str = "front"):
-    import numpy as np
-    from PIL import Image
-
-    if camera_key not in obs:
-        raise KeyError(f"observation is missing camera {camera_key!r}; keys={sorted(obs)}")
-    arr = obs[camera_key]
-    if hasattr(arr, "detach"):
-        arr = arr.detach().cpu().numpy()
-    arr = np.asarray(arr)
-    if arr.ndim == 3 and arr.shape[0] in {1, 3} and arr.shape[-1] not in {1, 3}:
-        arr = np.transpose(arr, (1, 2, 0))
-    if arr.dtype != np.uint8:
-        max_value = float(arr.max()) if arr.size else 0.0
-        if max_value <= 1.0:
-            arr = arr * 255.0
-        arr = np.clip(arr, 0, 255).astype(np.uint8)
-    if arr.ndim == 2:
-        arr = np.repeat(arr[..., None], 3, axis=-1)
-    image = Image.fromarray(arr).convert("RGB")
-    if image.size != IMAGE_SIZE:
-        image = image.resize(IMAGE_SIZE)
-    return image
-
-
-def _observation_state(obs: dict[str, Any]) -> list[float]:
-    missing = [name for name in ACTION_NAMES if name not in obs]
-    if missing:
-        raise KeyError(f"observation is missing joints {missing}; keys={sorted(obs)}")
-    return [float(obs[name]) for name in ACTION_NAMES]
+    parsed = yaml.safe_load(raw)
+    if not isinstance(parsed, dict) or set(parsed) != {"front"}:
+        raise ValueError("RPC requires exactly a front camera")
+    config = dict(parsed["front"])
+    if config.pop("type", None) != "opencv":
+        raise ValueError("RPC launcher currently supports an OpenCV front camera")
+    camera = OpenCVCameraConfig(**config)
+    if (camera.width, camera.height) != IMAGE_SIZE or str(camera.color_mode.value).lower() != "rgb":
+        raise ValueError("front camera must be RGB 640x480")
+    if camera.fps is None or not math.isfinite(camera.fps) or camera.fps < 10:
+        raise ValueError("front camera must deliver at least 10 FPS")
+    return {"front": camera}
 
 
 def _chunk_to_action(step: list[float]) -> dict[str, float]:
-    if len(step) != 6:
-        raise ValueError(f"action step must have 6 values, got {len(step)}")
-    return {name: float(value) for name, value in zip(ACTION_NAMES, step, strict=True)}
+    return dict(zip(ACTION_NAMES, _finite_state(step), strict=True))
 
 
-def _make_robot(args: argparse.Namespace):
-    try:
-        from lerobot.cameras.opencv import OpenCVCameraConfig
-        from lerobot.robots import make_robot_from_config
-        from lerobot.robots.so_follower import SO101FollowerConfig
-    except ImportError as exc:
-        raise SystemExit(
-            "This rollout needs the same Python env as lerobot-rollout "
-            f"(import lerobot failed: {exc}). Activate that env and retry."
-        ) from exc
-
-    if args.robot_type not in {"so101_follower", "so100_follower"}:
-        raise ValueError(f"unsupported robot.type {args.robot_type!r}")
-    cameras = {
-        name: OpenCVCameraConfig(
-            index_or_path=spec["index_or_path"],
-            width=spec["width"],
-            height=spec["height"],
-            fps=spec["fps"],
-            warmup_s=3,
-        )
-        for name, spec in args.robot_cameras.items()
-    }
-    config = SO101FollowerConfig(
-        port=args.robot_port,
-        id=args.robot_id,
-        cameras=cameras,
-        use_degrees=args.robot_use_degrees,
-        max_relative_target=args.robot_max_relative_target,
-    )
-    return make_robot_from_config(config)
+def _chunks_from_result(result: dict[str, Any], horizon: int) -> tuple[torch.Tensor, torch.Tensor]:
+    chunks = []
+    for key in ("original_chunk", "action_chunk"):
+        value = result.get(key)
+        if not isinstance(value, list):
+            raise RuntimeError(f"missing {key}")
+        tensor = torch.tensor(value, dtype=torch.float32)
+        if tuple(tensor.shape) != (horizon, 6) or not torch.isfinite(tensor).all().item():
+            raise RuntimeError(f"{key} must be finite [{horizon},6]")
+        chunks.append(tensor)
+    return chunks[0], chunks[1]
 
 
-def _sleep_until(deadline: float) -> None:
-    remaining = deadline - time.perf_counter()
+def _sleep_until(target: float) -> None:
+    remaining = target - time.monotonic()
     if remaining > 0:
         time.sleep(remaining)
 
 
-def _actions_from_result(result: dict[str, Any], n_action_steps: int) -> list[list[float]]:
-    chunk = result.get("action_chunk")
-    if not isinstance(chunk, list) or not chunk:
-        raise RuntimeError(f"RPC returned no action_chunk: {result}")
-    if n_action_steps > len(chunk):
-        print(
-            f"WARNING: --n-action-steps={n_action_steps} exceeds predicted chunk "
-            f"({len(chunk)}); executing the full chunk.",
-            flush=True,
-        )
-    return [list(step) for step in chunk[:n_action_steps]]
+def _next_tick(previous: float, now: float, period: float) -> float:
+    scheduled = previous + period
+    return now + period if scheduled <= now else scheduled
 
 
-def planned_inference_delay(max_latency_s: float | None, fps: int) -> int:
-    if not max_latency_s:
-        return 0
-    return max(0, math.ceil(max_latency_s * fps))
-
-
-def leftover_payload(leftover: Any, execution_horizon: int) -> list[list[float]] | None:
-    """Pad/truncate leftover original actions to the RTC prefix length."""
-    import torch
-
-    if leftover is None:
-        return None
-    steps = leftover if torch.is_tensor(leftover) else torch.as_tensor(leftover, dtype=torch.float32)
-    if steps.ndim != 2 or steps.shape[-1] != 6:
-        raise ValueError(f"leftover must have shape [T, 6], got {tuple(steps.shape)}")
-    if steps.shape[0] == 0:
-        return None
-    if steps.shape[0] > execution_horizon:
-        steps = steps[:execution_horizon]
-    elif steps.shape[0] < execution_horizon:
-        padded = torch.zeros((execution_horizon, steps.shape[1]), dtype=steps.dtype)
-        padded[: steps.shape[0]] = steps
-        steps = padded
-    return [[float(value) for value in row] for row in steps.tolist()]
-
-
-def _run_rollout_rtc(args: argparse.Namespace, client: VideoVAMRPCClient) -> None:
-    import torch
-
-    from lerobot.policies.rtc.action_queue import ActionQueue
-    from lerobot.policies.rtc.configuration_rtc import RTCConfig
-    from lerobot.policies.rtc.latency_tracker import LatencyTracker
-
-    robot = _make_robot(args)
-    period = 1.0 / args.fps
-    rtc_config = RTCConfig(enabled=True, execution_horizon=args.execution_horizon)
-    queue = ActionQueue(rtc_config)
-    latency_tracker = LatencyTracker()
-    prefetch_future: Future[dict[str, Any]] | None = None
-    prefetch_meta: dict[str, Any] | None = None
-    print(
-        f"connecting {args.robot_type} port={args.robot_port} id={args.robot_id} "
-        f"task={args.task!r} duration={args.duration}s fps={args.fps} "
-        f"inference=rtc execution_horizon={args.execution_horizon} "
-        f"queue_threshold={args.prefetch_steps} "
-        f"max_relative_target={args.robot_max_relative_target}",
-        flush=True,
-    )
-    print(
-        "RTC: leftover prefix + inference delay, then ActionQueue.merge "
-        "(replaces the queue; does not append a second chunk). "
-        "Training contract: 10 Hz, 5 RGB frames at offsets [-4,-3,-2,-1,0].",
-        flush=True,
-    )
-    print(
-        "WARNING: abakus RPC joint limits are placeholders (-180..180 / gripper 0..100). "
-        "Local max_relative_target is the Mac-side motion clip.",
-        flush=True,
-    )
-    robot.connect()
-    executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="vam-rpc")
-    try:
-        deadline = time.perf_counter() + args.duration
-        next_tick = time.perf_counter()
-        chunks = 0
-
-        def merge_result(result: dict[str, Any], meta: dict[str, Any], *, reset_clock: bool) -> None:
-            nonlocal chunks, next_tick
-            if result.get("need_more_frames"):
-                raise RuntimeError("RTC RPC returned a warmup response")
-            steps = _actions_from_result(result, DEFAULT_N_ACTION_STEPS)
-            original = torch.tensor(steps, dtype=torch.float32)
-            wall_s = time.perf_counter() - meta["started"]
-            # Blocking infers happen with an empty queue: the arm was not executing,
-            # so skip 0 of the new chunk. Overlapping prefetch skips the steps that ran.
-            real_delay = 0 if reset_clock else planned_inference_delay(wall_s, args.fps)
-            queue.merge(original, original.clone(), real_delay, meta["idx_before"], task=args.task)
-            latency_tracker.add(wall_s)
-            chunks += 1
-            print(
-                f"chunk {chunks}: merged {len(steps)} actions delay={real_delay} "
-                f"(planned {meta['delay']}) queue={queue.qsize()} "
-                f"rpc_latency={result.get('latency_s', '?')}s wall={wall_s:.2f}s",
-                flush=True,
-            )
-            if reset_clock:
-                # First blocking infer consumed ~1s. Play the merged chunk at 10 Hz.
-                next_tick = time.perf_counter()
-
-        def take_prefetch() -> None:
-            nonlocal prefetch_future, prefetch_meta
-            if prefetch_future is None or prefetch_meta is None:
-                return
-            result = prefetch_future.result()
-            meta = prefetch_meta
-            prefetch_future = None
-            prefetch_meta = None
-            merge_result(result, meta, reset_clock=False)
-
-        def start_prefetch(frame: Any, state: list[float]) -> None:
-            nonlocal prefetch_future, prefetch_meta
-            leftover = leftover_payload(queue.get_left_over(), args.execution_horizon)
-            delay = planned_inference_delay(latency_tracker.max(), args.fps)
-            prefetch_meta = {
-                "idx_before": queue.get_action_index(),
-                "started": time.perf_counter(),
-                "delay": delay,
-            }
-            prefetch_future = executor.submit(
-                client.request,
-                frame,
-                state,
-                feature_seed=args.feature_seed,
-                remember=False,
-                inference_delay=delay,
-                prev_chunk_left_over=leftover,
-                execution_horizon=args.execution_horizon,
-            )
-            print(
-                f"RTC infer in flight (queue={queue.qsize()} leftover="
-                f"{0 if leftover is None else len(leftover)} delay={delay})",
-                flush=True,
-            )
-
-        while time.perf_counter() < deadline:
-            obs = robot.get_observation()
-            frame = _observation_to_pil(obs, camera_key="front")
-            state = _observation_state(obs)
-            client.remember(frame)
-
-            if prefetch_future is not None and prefetch_future.done():
-                take_prefetch()
-
-            if queue.empty():
-                if prefetch_future is not None:
-                    print("WARNING: RTC queue emptied while inference was in flight", flush=True)
-                    take_prefetch()
-                else:
-                    started = time.perf_counter()
-                    leftover = leftover_payload(queue.get_left_over(), args.execution_horizon)
-                    delay = planned_inference_delay(latency_tracker.max(), args.fps)
-                    result = client.request(
-                        frame,
-                        state,
-                        feature_seed=args.feature_seed,
-                        remember=False,
-                        inference_delay=delay,
-                        prev_chunk_left_over=leftover,
-                        execution_horizon=args.execution_horizon,
-                    )
-                    if result.get("need_more_frames"):
-                        print(
-                            f"warming up 5-frame history, need {result['need_more_frames']} more",
-                            flush=True,
-                        )
-                        next_tick += period
-                        _sleep_until(min(next_tick, deadline))
-                        continue
-                    spacing = client.history_spacing_ms()
-                    print(
-                        f"history_dt_ms={[round(dt) for dt in spacing]}",
-                        flush=True,
-                    )
-                    merge_result(
-                        result,
-                        {
-                            "idx_before": queue.get_action_index(),
-                            "started": started,
-                            "delay": delay,
-                        },
-                        reset_clock=True,
-                    )
-
-            if prefetch_future is None and not queue.empty() and queue.qsize() <= args.prefetch_steps:
-                start_prefetch(frame, state)
-
-            action_t = queue.get()
-            if action_t is None:
-                raise RuntimeError("RTC queue empty after merge")
-            sent = robot.send_action(_chunk_to_action(action_t.tolist()))
-            print(
-                "sent " + " ".join(f"{name}={sent[name]:.2f}" for name in ACTION_NAMES if name in sent),
-                flush=True,
-            )
-            next_tick += period
-            _sleep_until(min(next_tick, deadline))
-        print(f"duration reached after {chunks} chunk(s)", flush=True)
-    finally:
-        if prefetch_future is not None:
-            prefetch_future.cancel()
-        executor.shutdown(wait=False, cancel_futures=True)
-        robot.disconnect()
-
-
-def _run_rollout(args: argparse.Namespace, client: VideoVAMRPCClient) -> None:
-    if args.inference_type == "rtc":
-        _run_rollout_rtc(args, client)
-        return
-    robot = _make_robot(args)
-    pending: list[list[float]] = []
-    period = 1.0 / args.fps
-    prefetch_future: Future[dict[str, Any]] | None = None
-    print(
-        f"connecting {args.robot_type} port={args.robot_port} id={args.robot_id} "
-        f"task={args.task!r} duration={args.duration}s fps={args.fps} "
-        f"n_action_steps={args.n_action_steps} prefetch_steps={args.prefetch_steps} "
-        f"max_relative_target={args.robot_max_relative_target}",
-        flush=True,
-    )
-    print(
-        "Training contract: 10 Hz, 5 RGB frames at offsets [-4,-3,-2,-1,0] "
-        "(100 ms apart), then execute 30 actions over 3.0 s. "
-        "After a blocking RPC we do not catch up — the chunk plays at real 10 Hz.",
-        flush=True,
-    )
-    print(
-        "WARNING: abakus RPC joint limits are placeholders (-180..180 / gripper 0..100). "
-        "Local max_relative_target is the Mac-side motion clip.",
-        flush=True,
-    )
-    robot.connect()
-    executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="vam-rpc")
-    try:
-        deadline = time.perf_counter() + args.duration
-        next_tick = time.perf_counter()
-        chunks = 0
-
-        def take_prefetch() -> None:
-            nonlocal prefetch_future, pending, chunks
-            if prefetch_future is None:
-                return
-            result = prefetch_future.result()
-            prefetch_future = None
-            if result.get("need_more_frames"):
-                raise RuntimeError("prefetch RPC returned a warmup response")
-            steps = _actions_from_result(result, args.n_action_steps)
-            pending.extend(steps)
-            chunks += 1
-            print(
-                f"chunk {chunks}: +{len(steps)} actions queued ({len(pending)} pending), "
-                f"rpc_latency={result.get('latency_s', '?')}s",
-                flush=True,
-            )
-
-        while time.perf_counter() < deadline:
-            obs = robot.get_observation()
-            frame = _observation_to_pil(obs, camera_key="front")
-            state = _observation_state(obs)
-            client.remember(frame)
-
-            if prefetch_future is not None and prefetch_future.done():
-                take_prefetch()
-
-            if not pending:
-                if prefetch_future is not None:
-                    take_prefetch()
-                else:
-                    result = client.request(frame, state, feature_seed=args.feature_seed, remember=False)
-                    if result.get("need_more_frames"):
-                        print(
-                            f"warming up 5-frame history, need {result['need_more_frames']} more",
-                            flush=True,
-                        )
-                        next_tick += period
-                        _sleep_until(min(next_tick, deadline))
-                        continue
-                    pending.extend(_actions_from_result(result, args.n_action_steps))
-                    chunks += 1
-                    spacing = client.history_spacing_ms()
-                    print(
-                        f"chunk {chunks}: {len(pending)} actions, "
-                        f"rpc_latency={result.get('latency_s', '?')}s, "
-                        f"history_dt_ms={[round(dt) for dt in spacing]}",
-                        flush=True,
-                    )
-                    # Inference just consumed ~1s. Do not dump the 30-step chunk
-                    # as fast as possible to "catch up" — that would run motors
-                    # and the next 5-frame window much faster than training's 10 Hz.
-                    next_tick = time.perf_counter()
-
-            if (
-                args.prefetch_steps > 0
-                and prefetch_future is None
-                and 0 < len(pending) <= args.prefetch_steps
-            ):
-                prefetch_future = executor.submit(
-                    client.request,
-                    frame,
-                    state,
-                    feature_seed=args.feature_seed,
-                    remember=False,
-                )
-                print(f"prefetching next chunk ({len(pending)} actions left)", flush=True)
-
-            action = pending.pop(0)
-            sent = robot.send_action(_chunk_to_action(action))
-            print(
-                "sent " + " ".join(f"{name}={sent[name]:.2f}" for name in ACTION_NAMES if name in sent),
-                flush=True,
-            )
-            next_tick += period
-            _sleep_until(min(next_tick, deadline))
-        print(f"duration reached after {chunks} chunk(s)", flush=True)
-    finally:
-        if prefetch_future is not None:
-            prefetch_future.cancel()
-        executor.shutdown(wait=False, cancel_futures=True)
-        robot.disconnect()
-
-
-def _dry_frame():
-    from PIL import Image
-
-    return Image.new("RGB", IMAGE_SIZE, (0, 0, 0))
+def _bool_arg(value: str) -> bool:
+    if value.lower() in {"true", "1", "yes"}:
+        return True
+    if value.lower() in {"false", "0", "no"}:
+        return False
+    raise argparse.ArgumentTypeError(f"invalid boolean: {value}")
 
 
 def _run_dry(args: argparse.Namespace, client: VideoVAMRPCClient) -> None:
-    n_needed = 5 if args.policy == "video_vam" else 1
-    for i in range(n_needed):
-        result = client.request(_dry_frame(), [0.0] * 6, feature_seed=args.feature_seed)
-        print(json.dumps({"i": i, **result}, indent=2))
+    from PIL import Image
+
+    image = Image.new("RGB", IMAGE_SIZE, (128, 128, 128))
+
+    def fresh_snapshot() -> dict[str, Any]:
+        # A blocking prediction may age the entire history; replace it at control cadence.
+        for _ in range(client.frames.maxlen):
+            client.remember(image)
+            time.sleep(0.1)
+        snapshot = client.snapshot([0.0] * 6, task=args.task, feature_seed=args.feature_seed)
+        snapshot.pop("prev_chunk_left_over")
+        snapshot.pop("inference_delay")
+        return snapshot
+
+    snapshot = fresh_snapshot()
+    started = time.monotonic()
+    result = client.request(snapshot)
+    elapsed = time.monotonic() - started
+    original, actions = _chunks_from_result(result, client.health["horizon"])
+    print(f"[DRY-RUN] Initial no-prefix request: {elapsed:.3f}s end-to-end, {len(actions)} finite actions.")
+
+    if args.inference_type == "rtc":
+        if len(original) < 2:
+            raise RuntimeError("RTC dry-run requires at least two original actions")
+        # Simulate one consumed action, not a hardware command. Preserve the actual
+        # remaining prefix in the server's original space; never pad physical zeros.
+        leftover = original[1:].clone()
+        snapshot = fresh_snapshot()
+        snapshot["prev_chunk_left_over"] = leftover_payload(leftover)
+        snapshot["inference_delay"] = 1
+        started = time.monotonic()
+        result = client.request(snapshot)
+        elapsed = time.monotonic() - started
+        _, actions = _chunks_from_result(result, client.health["horizon"])
+        print(
+            f"[DRY-RUN] RTC prefix request: {elapsed:.3f}s end-to-end, {len(actions)} finite actions; "
+            f"{len(leftover)} real {client.health['original_space']} prefix steps, inference_delay=1."
+        )
+    print("[DRY-RUN] RPC-only validation complete. Synthetic images/state; no camera or hardware was tested.")
+
+
+def _make_robot(args: argparse.Namespace) -> Any:
+    from lerobot.robots import make_robot_from_config
+    from lerobot.robots.so_follower.config_so_follower import SOFollowerRobotConfig
+
+    if args.robot_type not in {"so101_follower", "so100_follower"}:
+        raise ValueError("Only SO-100/101 followers are supported")
+    config = SOFollowerRobotConfig(
+        port=args.robot_port,
+        id=args.robot_id,
+        cameras=args.robot_cameras,
+        use_degrees=True,
+        max_relative_target=args.robot_max_relative_target,
+        disable_torque_on_disconnect=True,
+    )
+    return make_robot_from_config(config)
+
+
+def _disconnect_robot(robot: Any) -> None:
+    # is_connected requires all cameras too; partial connect failures need per-device cleanup.
+    errors = []
+    if robot.is_connected:
+        try:
+            robot.disconnect()
+            return
+        except Exception as exc:
+            errors.append(exc)
+    for camera in robot.cameras.values():
+        if camera.is_connected:
+            try:
+                camera.disconnect()
+            except Exception as exc:
+                errors.append(exc)
+    if robot.bus.is_connected:
+        try:
+            robot.bus.disconnect(disable_torque=True)
+        except Exception as exc:
+            errors.append(exc)
+    if errors:
+        raise RuntimeError(f"Partial robot disconnect failed: {errors}")
+
+
+def _run_rollout(args: argparse.Namespace, client: VideoVAMRPCClient) -> None:
+    robot = _make_robot(args)
+    executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="vam-rpc")
+    future: Future[dict[str, Any]] | None = None
+    rtc = args.inference_type == "rtc"
+    queue = ActionQueue(RTCConfig(enabled=rtc, execution_horizon=args.execution_horizon))
+    latencies = LatencyTracker(maxlen=20)
+    horizon = client.health["horizon"]
+    period = 1.0 / args.fps
+    phase = "warmup"
+    started = 0.0
+    deadline = time.monotonic() + args.ready_timeout
+    running = False
+    lower = torch.tensor(args.joint_limits_min)
+    upper = torch.tensor(args.joint_limits_max)
+    try:
+        # Do not open an interactive calibration workflow from an autonomous launcher.
+        if not robot.calibration:
+            raise RuntimeError("Existing robot calibration is required; calibrate separately")
+        robot.connect(calibrate=False)
+        if not robot.is_calibrated:
+            raise RuntimeError("Robot calibration mismatch; calibrate separately")
+        next_tick = time.monotonic()
+        previous_observation = None
+        while time.monotonic() < deadline:
+            obs = robot.get_observation()
+            observed_at = time.monotonic()
+            if (
+                running
+                and previous_observation is not None
+                and observed_at - previous_observation > 1.75 * period
+            ):
+                raise RuntimeError("Control deadline missed; refusing to execute stale actions")
+            previous_observation = observed_at
+            state = _finite_state([obs[name] for name in ACTION_NAMES])
+            client.remember(obs["front"])
+            if future is not None and future.done():
+                result = future.result()
+                original, actions = _chunks_from_result(result, horizon)
+                latency = time.monotonic() - started
+                future = None
+                if phase == "warmup":
+                    # Compilation latency is not a runtime estimate; request a fresh observation next.
+                    phase = "initial"
+                else:
+                    if ((actions < lower) | (actions > upper)).any().item():
+                        raise RuntimeError("Action chunk exceeds absolute joint limits")
+                    delay = planned_inference_delay(latency, args.fps) if running and rtc else 0
+                    if delay >= horizon:
+                        raise RuntimeError("Inference exceeded the action horizon")
+                    queue.merge(original, actions, delay)
+                    latencies.add(latency)
+                    if not running:
+                        running = True
+                        phase = "running"
+                        deadline = time.monotonic() + args.duration
+                        next_tick = time.monotonic()
+            if len(client.frames) == client.frames.maxlen and future is None:
+                threshold = max(args.prefetch_steps, planned_inference_delay(latencies.max(), args.fps) + 2)
+                if rtc and running and threshold >= horizon:
+                    raise RuntimeError("Measured RPC latency cannot sustain this policy horizon")
+                need_request = not running or (queue.qsize() <= threshold if rtc else queue.empty())
+                if need_request:
+                    previous = queue.get_left_over() if rtc and running else None
+                    delay = planned_inference_delay(latencies.max(), args.fps) if previous is not None else 0
+                    if previous is not None and delay >= len(previous):
+                        raise RuntimeError("Insufficient action prefix to cover inference")
+                    snapshot = client.snapshot(
+                        state,
+                        task=args.task,
+                        feature_seed=args.feature_seed,
+                        leftover=previous,
+                        inference_delay=delay,
+                    )
+                    started = time.monotonic()
+                    future = executor.submit(client.request, snapshot)
+            step = queue.get() if running else None
+            if step is not None:
+                action = _chunk_to_action(step.tolist())
+                sent = robot.send_action(action)
+                actual = _finite_state([sent[name] for name in ACTION_NAMES])
+                if max(abs(a - b) for a, b in zip(actual, step.tolist(), strict=True)) > 1e-3:
+                    raise RuntimeError("Robot safety limiter clipped a command; stopping rollout")
+            elif running and rtc:
+                raise RuntimeError(
+                    "RTC action queue exhausted; stopping instead of retrying stale observations"
+                )
+            next_tick = _next_tick(next_tick, time.monotonic(), period)
+            _sleep_until(min(next_tick, deadline))
+        if not running:
+            raise RuntimeError("Warmup/initial inference exceeded startup deadline")
+    finally:
+        if future is not None:
+            future.cancel()
+        try:
+            _disconnect_robot(robot)
+        finally:
+            # Running subprocesses have hard deadlines. Hardware disconnect never waits on RPC.
+            executor.shutdown(wait=True, cancel_futures=True)
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
-    parser.add_argument("--policy", choices=("smolvla", "video_vam"), default="video_vam")
-    parser.add_argument("--port", type=int, default=DEFAULT_PORT, help="abakus RPC port")
-    parser.add_argument("--keep-server", action="store_true", help="leave the abakus tmux session running")
-    parser.add_argument("--stop-server", action="store_true", help="stop even if we did not start it")
-    parser.add_argument("--dry-run", action="store_true", help="RPC only; do not connect the arm")
+    parser.add_argument("--policy", choices=("smolvla", "video_vam"), default="smolvla", help="Model policy")
+    parser.add_argument(
+        "--checkpoint", type=str, default=None, help="Custom checkpoint path or 'latest_scale100'"
+    )
+    parser.add_argument(
+        "--port", type=int, default=DEFAULT_PORT, help=f"RPC port on abakus (default {DEFAULT_PORT})"
+    )
+    parser.add_argument("--device", default="cuda")
+    parser.add_argument("--compile", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--ready-timeout", type=float, default=180.0)
+    parser.add_argument("--rpc-timeout", type=float, default=120.0)
+    parser.add_argument("--joint-limits-min", type=float, nargs=6)
+    parser.add_argument("--joint-limits-max", type=float, nargs=6)
+    parser.add_argument("--max-guidance-weight", type=float, default=10.0)
+    parser.add_argument("--keep-server", action="store_true", help="leave server running in tmux after exit")
+    parser.add_argument("--stop-server", action="store_true", help="stop server even if already running")
+    parser.add_argument(
+        "--dry-run", action="store_true", help="test RPC connection without connecting motors"
+    )
     parser.add_argument("--robot.type", dest="robot_type", default="so101_follower")
-    parser.add_argument("--robot.port", dest="robot_port", default=None)
-    parser.add_argument("--robot.id", dest="robot_id", default=None)
+    parser.add_argument(
+        "--robot.port", dest="robot_port", default=None, help="Serial port (/dev/tty.usbmodem*)"
+    )
+    parser.add_argument("--robot.id", dest="robot_id", default="so101")
     parser.add_argument("--robot.use_degrees", dest="robot_use_degrees", type=_bool_arg, default=True)
     parser.add_argument("--robot.cameras", dest="robot_cameras_raw", default=DEFAULT_CAMERAS)
-    parser.add_argument(
-        "--robot.max_relative_target",
-        dest="robot_max_relative_target_raw",
-        default=None,
-        help=(
-            "per-motor clip dict. Default is 30 deg / gripper 50 "
-            "(was 10/20, which clamped almost every Video-VAM step)"
-        ),
-    )
+    parser.add_argument("--robot.max_relative_target", dest="robot_max_relative_target_raw", default=None)
     parser.add_argument("--fps", type=int, default=10)
     parser.add_argument("--duration", type=float, default=30.0)
     parser.add_argument("--task", default="take cube out of box")
@@ -788,124 +779,112 @@ def main(argv: list[str] | None = None) -> int:
         "--inference.type",
         dest="inference_type",
         choices=("sync", "rtc"),
-        default="sync",
-        help="sync = open-loop chunks; rtc = leftover+delay merge (needs restarted RPC server)",
+        default="rtc",
+        help="Inference mode: 'rtc' (Real-Time Chunking, default) or 'sync'",
     )
     parser.add_argument(
         "--inference.rtc.execution_horizon",
         dest="execution_horizon",
         type=int,
-        default=None,
-        help="RTC leftover prefix length (default 10). Distinct from --n-action-steps.",
-    )
-    parser.add_argument(
-        "--n-action-steps",
-        type=int,
-        default=None,
-        help=(
-            "sync: how many steps of each predicted chunk to execute "
-            f"(default {DEFAULT_N_ACTION_STEPS}; the model predicts 30). Ignored for rtc."
-        ),
+        default=10,
+        help="RTC leftover prefix length (default 10).",
     )
     parser.add_argument(
         "--prefetch-steps",
         type=int,
-        default=None,
-        help=(
-            "sync: start the next RPC when this many executed steps remain "
-            "(default 0 = no overlap). rtc: action-queue threshold to start overlapping "
-            "inference (default 15)"
-        ),
+        default=12,
+        help="Action-queue threshold to trigger background prefetch (default 12)",
     )
     parser.add_argument("--feature-seed", type=int, default=0)
     args = parser.parse_args(argv)
-
     if args.fps != 10:
-        raise SystemExit("Video-VAM rollout requires --fps=10")
-    if not args.robot_use_degrees:
-        raise SystemExit("Video-VAM SO-101 rollout requires --robot.use_degrees=true")
+        parser.error("These checkpoints require 10 Hz observation/action cadence")
+    if not 1 <= args.port <= 65535 or args.execution_horizon < 1 or args.prefetch_steps < 1:
+        parser.error("invalid port, execution horizon, or prefetch threshold")
+    if any(
+        not math.isfinite(x) or x <= 0
+        for x in (args.duration, args.ready_timeout, args.rpc_timeout, args.max_guidance_weight)
+    ):
+        parser.error("duration/timeouts/guidance must be finite and positive")
+    if args.feature_seed < 0:
+        parser.error("feature seed must be nonnegative")
     if args.strategy_type != "base":
-        raise SystemExit("this launcher only implements --strategy.type=base")
-    if args.inference_type == "rtc":
-        args.execution_horizon = 10 if args.execution_horizon is None else args.execution_horizon
-        if args.execution_horizon < 1:
-            raise SystemExit("--inference.rtc.execution_horizon must be >= 1")
-        if args.n_action_steps is not None and args.n_action_steps != DEFAULT_N_ACTION_STEPS:
-            print(
-                "NOTE: --n-action-steps is ignored with --inference.type=rtc "
-                "(RTC merges the full 30-step chunk after skipping inference delay).",
-                flush=True,
-            )
-        args.n_action_steps = DEFAULT_N_ACTION_STEPS
-        if args.prefetch_steps is None:
-            args.prefetch_steps = 15
-        if args.prefetch_steps < 1:
-            raise SystemExit("RTC requires --prefetch-steps >= 1 (action-queue threshold)")
+        parser.error("only strategy.type=base is supported")
+    if (args.joint_limits_min is None) != (args.joint_limits_max is None):
+        parser.error("joint limits must be supplied together")
+    if args.joint_limits_min is not None and (
+        any(not math.isfinite(x) for x in args.joint_limits_min + args.joint_limits_max)
+        or any(a >= b for a, b in zip(args.joint_limits_min, args.joint_limits_max, strict=True))
+    ):
+        parser.error("joint limits must be finite and ordered")
+    if not args.dry_run and (not args.robot_use_degrees or args.joint_limits_min is None):
+        parser.error("hardware requires degree units and explicit six-dimensional absolute joint limits")
+
+    # Resolve checkpoints
+    if args.checkpoint in {"latest_scale100", "scale100"}:
+        if args.policy != "smolvla":
+            parser.error("Scale-100 alias is only valid for SmolVLA")
+        args.resolved_checkpoint = SCALE100_SMOLVLA_CHECKPOINT
+    elif args.checkpoint is not None:
+        args.resolved_checkpoint = args.checkpoint
     else:
-        args.n_action_steps = args.n_action_steps or args.execution_horizon or DEFAULT_N_ACTION_STEPS
-        if args.n_action_steps < 1:
-            raise SystemExit("--n-action-steps must be >= 1")
-        if args.prefetch_steps is None:
-            args.prefetch_steps = 0
-        if args.prefetch_steps < 0:
-            raise SystemExit("--prefetch-steps must be >= 0")
+        args.resolved_checkpoint = (
+            DEFAULT_SMOLVLA_CHECKPOINT if args.policy == "smolvla" else DEFAULT_COSMOS_CHECKPOINT
+        )
 
     if not args.dry_run:
         if not args.robot_port:
-            raise SystemExit("hardware rollout requires --robot.port")
+            raise SystemExit(
+                "Hardware rollout requires --robot.port (e.g. --robot.port=/dev/tty.usbmodemXXXX)"
+            )
         if not args.robot_id:
-            raise SystemExit("hardware rollout requires --robot.id")
+            raise SystemExit("Hardware rollout requires --robot.id")
         if args.robot_max_relative_target_raw:
             args.robot_max_relative_target = _parse_max_relative_target(args.robot_max_relative_target_raw)
         else:
             args.robot_max_relative_target = dict(DEFAULT_MAX_RELATIVE_TARGET)
         args.robot_cameras = _parse_cameras(args.robot_cameras_raw)
 
-    started_here = False
-    client = VideoVAMRPCClient(policy=args.policy, port=args.port)
+    token = None
+    owned = False
+    succeeded = False
     try:
-        updated = _sync_remote_repo()
-        healthy = _healthz(args.port)
-        health = _healthz_payload(args.port) if healthy else None
-        rtc_advertised = bool(health and health.get("rtc") is True)
-        if should_restart_rpc(
-            updated=updated,
-            healthy=healthy,
-            require_rtc=args.inference_type == "rtc",
-            rtc_advertised=rtc_advertised,
-        ):
-            if _session_exists() or healthy:
-                print("restarting RPC server so it loads the pulled code", flush=True)
-                _stop_server()
-                drop_by = time.time() + 15.0
-                while time.time() < drop_by and (_healthz(args.port) or _session_exists()):
-                    time.sleep(0.5)
-            print(f"starting RPC server in tmux session {TMUX_SESSION}", flush=True)
-            _start_server()
-            started_here = True
-            _wait_ready(args.port, READY_TIMEOUT_S)
-            print("RPC ready", flush=True)
+        identity = _describe_server(args)
+        # Pin a mutable `last` symlink before starting a process.
+        args.resolved_checkpoint = identity["checkpoint"]
+        health = _healthz_payload(args.port)
+        if should_restart_rpc(health_payload=health, requested_identity=identity):
+            token = uuid.uuid4().hex
+            owned = True
+            _manage(args, "start", token)
+            health = _wait_ready(args, identity, token)
         else:
-            print(f"RPC already healthy on {SSH_HOST}:{args.port}", flush=True)
-        if args.inference_type == "rtc":
-            health = _healthz_payload(args.port)
-            if not health or health.get("rtc") is not True:
-                raise SystemExit(
-                    "The abakus RPC server still does not advertise RTC after git pull. "
-                    "Push this branch first, then rerun."
-                )
+            token = health["instance_id"]
+        if (
+            health.get("action_dim") != 6
+            or health.get("fps") != 10
+            or health.get("original_space") != ("normalized" if args.policy == "smolvla" else "physical")
+            or health.get("rtc") is not (args.inference_type == "rtc")
+            or health.get("history_size") != (5 if args.policy == "video_vam" else 1)
+            or health.get("action_units") != ["degrees"] * 5 + ["range_0_100"]
+            or not isinstance(health.get("horizon"), int)
+            or health["horizon"] <= args.execution_horizon
+        ):
+            raise RuntimeError("Server advertises incompatible or missing action metadata")
+        client = VideoVAMRPCClient(
+            policy=args.policy, port=args.port, timeout=args.rpc_timeout, health=health
+        )
         if args.dry_run:
             _run_dry(args, client)
         else:
             _run_rollout(args, client)
+        succeeded = True
     finally:
-        if args.stop_server or (started_here and not args.keep_server):
-            print(f"stopping tmux session {TMUX_SESSION}", flush=True)
-            _stop_server()
-        elif started_here and args.keep_server:
-            print(f"leaving {TMUX_SESSION} running on {SSH_HOST}", flush=True)
-        elif _session_exists() and args.keep_server:
-            print(f"leaving existing {TMUX_SESSION} running on {SSH_HOST}", flush=True)
+        if token and (args.stop_server or (owned and (not args.keep_server or not succeeded))):
+            try:
+                _manage(args, "stop", token)
+            except Exception as exc:
+                warnings.warn(f"Could not confirm managed-server cleanup: {exc}", stacklevel=1)
     return 0
 
 

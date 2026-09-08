@@ -7,11 +7,12 @@ HELPER = REPO_ROOT / "scripts/video_vam/cosmos_cuda_env.sh"
 LAUNCHER = REPO_ROOT / "scripts/video_vam/run_smoke_test_cosmos_extractor.sh"
 CACHE_LAUNCHER = REPO_ROOT / "scripts/video_vam/run_build_cosmos_feature_cache.sh"
 TRAIN_LAUNCHER = REPO_ROOT / "scripts/video_vam/run_train_cosmos_world2action_overfit.sh"
+RPC_LAUNCHER = REPO_ROOT / "scripts/video_vam/run_rpc_server.sh"
 EVAL_LAUNCHER = REPO_ROOT / "scripts/video_vam/run_evaluate_cosmos_world2action_cache.sh"
 
 
 def test_video_vam_shell_scripts_have_valid_bash_syntax():
-    for script in (HELPER, LAUNCHER, CACHE_LAUNCHER, TRAIN_LAUNCHER, EVAL_LAUNCHER):
+    for script in (HELPER, LAUNCHER, CACHE_LAUNCHER, TRAIN_LAUNCHER, EVAL_LAUNCHER, RPC_LAUNCHER):
         subprocess.run(["bash", "-n", str(script)], check=True)
 
 
@@ -47,3 +48,11 @@ def test_diagnostic_launchers_source_environment_and_forward_arguments():
         launcher_text = launcher.read_text()
         assert 'source "${_script_dir}/cosmos_cuda_env.sh"' in launcher_text
         assert f'{script_name}" "$@"' in launcher_text
+
+
+def test_rpc_launcher_forwards_args_without_exclusive_gpu_lock():
+    text = RPC_LAUNCHER.read_text()
+    assert 'scripts/video_vam/rpc_server.py "$@"' in text
+    assert "acquire_gpu_lock" not in text
+    assert "source scripts/video_vam/gpu_lock.sh" not in text
+    assert "flock" not in text
