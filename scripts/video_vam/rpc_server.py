@@ -172,8 +172,9 @@ class RPCApplication:
             if args.joint_limits_min is not None:
                 config.joint_limits_min = args.joint_limits_min
                 config.joint_limits_max = args.joint_limits_max
-            if config.joint_limits_min is None or config.joint_limits_max is None:
-                raise ValueError("video_vam requires --joint-limits-min and --joint-limits-max")
+            elif config.joint_limits_min is None or config.joint_limits_max is None:
+                config.joint_limits_min = [-180.0, -180.0, -180.0, -180.0, -180.0, 0.0]
+                config.joint_limits_max = [180.0, 180.0, 180.0, 180.0, 180.0, 100.0]
             self.backend = VideoVAMPolicy.from_pretrained(args.checkpoint, config=config)
             self.policy = self.backend
             self.horizon = 30

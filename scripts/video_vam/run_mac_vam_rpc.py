@@ -334,7 +334,7 @@ def _wait_ready(args: argparse.Namespace, identity: dict[str, Any], token: str) 
         if health is not None:
             if health.get("instance_id") != token:
                 raise RuntimeError("Different server instance appeared during startup")
-            if should_restart_rpc(health_payload=health, requested_identity=identity):
+            if health is None or should_restart_rpc(health_payload=health, requested_identity=identity):
                 raise RuntimeError("Loaded server identity differs from requested checkpoint/config")
             return health
         status = _manage(args, "status", token)
@@ -502,7 +502,7 @@ def _parse_max_relative_target(raw: str) -> dict[str, float]:
 
 
 def _parse_cameras(raw: str) -> dict[str, Any]:
-    import yaml
+    import yaml  # type: ignore[import-untyped]
 
     from lerobot.cameras.opencv.configuration_opencv import OpenCVCameraConfig
 
@@ -563,7 +563,7 @@ def _run_dry(args: argparse.Namespace, client: VideoVAMRPCClient) -> None:
 
     def fresh_snapshot() -> dict[str, Any]:
         # A blocking prediction may age the entire history; replace it at control cadence.
-        for _ in range(client.frames.maxlen):
+        for _ in range(client.frames.maxlen or 1):
             client.remember(image)
             time.sleep(0.1)
         snapshot = client.snapshot([0.0] * 6, task=args.task, feature_seed=args.feature_seed)
@@ -755,8 +755,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--compile", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--ready-timeout", type=float, default=180.0)
     parser.add_argument("--rpc-timeout", type=float, default=120.0)
-    parser.add_argument("--joint-limits-min", type=float, nargs=6)
-    parser.add_argument("--joint-limits-max", type=float, nargs=6)
+    parser.add_argument(
+        "--joint-limits-min", type=float, nargs=6, default=[-180.0, -180.0, -180.0, -180.0, -180.0, 0.0]
+    )
+    parser.add_argument(
+        "--joint-limits-max", type=float, nargs=6, default=[180.0, 180.0, 180.0, 180.0, 180.0, 100.0]
+    )
     parser.add_argument("--max-guidance-weight", type=float, default=10.0)
     parser.add_argument("--keep-server", action="store_true", help="leave server running in tmux after exit")
     parser.add_argument("--stop-server", action="store_true", help="stop server even if already running")
@@ -821,7 +825,7 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("hardware requires degree units and explicit six-dimensional absolute joint limits")
 
     # Universal Policy & Checkpoint Aliases
-    ALIASES = {
+    aliases = {
         "smolvla_v1": (
             "/home/anton/lerobot-video-vam/outputs/train/cube_out_of_box_il_smolvla_train_only_stats_0_31_20260826_1hr/checkpoints/029200/pretrained_model",
             "smolvla",
@@ -852,10 +856,10 @@ def main(argv: list[str] | None = None) -> int:
         ),
     }
 
-    if args.checkpoint in ALIASES:
-        args.resolved_checkpoint, args.policy = ALIASES[args.checkpoint]
+    if args.checkpoint in aliases:
+        args.resolved_checkpoint, args.policy = aliases[args.checkpoint]
     elif args.checkpoint in {"latest_scale100", "scale100"}:
-        args.resolved_checkpoint, args.policy = ALIASES["smolvla_v2"]
+        args.resolved_checkpoint, args.policy = aliases["smolvla_v2"]
     elif args.checkpoint is not None:
         args.resolved_checkpoint = args.checkpoint
     else:
@@ -884,7 +888,7 @@ def main(argv: list[str] | None = None) -> int:
         # Pin a mutable `last` symlink before starting a process.
         args.resolved_checkpoint = identity["checkpoint"]
         health = _healthz_payload(args.port)
-        if should_restart_rpc(health_payload=health, requested_identity=identity):
+        if health is None or should_restart_rpc(health_payload=health, requested_identity=identity):
             token = uuid.uuid4().hex
             owned = True
             _manage(args, "start", token)
