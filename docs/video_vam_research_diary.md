@@ -1988,8 +1988,9 @@ The codebase is being updated to enforce:
 - **Hardware Observations**:
   - The client-server RPC loop and 10 Hz RTC execution streamed smoothly without software failure.
   - **Cosmos 3 Edge Video-LoRA** demonstrated the best qualitative trajectory behavior and lowest offline loss, moving closest to the target.
-  - **Failure Mode**: None of the policies achieved a reliable physical grasp. The primary failure cause was severe **visual covariate shift** between demonstration recording conditions and live testing (ambient room lighting, shadows, and subtle camera mounting angle differences).
-  - **Root Cause**: Offline caching with stride 3 discarded 67% of temporal demonstration frames and prevented any dynamic visual data augmentations during training.
+  - **Failure Mode**: None of the policies achieved a reliable physical grasp. While trajectories approached the target area, the end-effector lacked the millimeter precision required to grasp the cube under live conditions.
+  - **Working Hypothesis (Not Proven Root Cause)**: Visual covariate shift between demonstration recording conditions and live testing (lighting, shadows, and minor camera mounting angle differences) is a suspected contributor to trajectory drift. Other plausible factors include robot kinematic calibration variance, gripper closing threshold dynamics, and demonstration distribution limits.
+  - **Experimental Bet**: Offline caching with stride 3 discarded 67% of temporal demonstration frames and precluded visual data augmentation. Training online with stride 1 and temporally coherent augmentations is an empirical test to see whether visual invariance improves generalization.
 
 ### 2. Strategy: Online Video Extraction with Coherent Data Augmentation
 
