@@ -701,6 +701,8 @@ def _run_single_episode(
     upper = torch.tensor(args.joint_limits_max)
     last_action = None
     starved_ticks = 0
+    ticks_sent = 0
+    snapshot_ticks = 0
 
     next_tick = time.monotonic()
     previous_observation = None
@@ -729,9 +731,8 @@ def _run_single_episode(
                 else:
                     if ((actions < lower) | (actions > upper)).any().item():
                         raise RuntimeError("Action chunk exceeds absolute joint limits")
-                    delay = planned_inference_delay(latency, args.fps) if running and rtc else 0
-                    if delay >= horizon:
-                        raise RuntimeError("Inference exceeded the action horizon")
+                    exact_delay = ticks_sent - snapshot_ticks if running and rtc else 0
+                    delay = min(max(0, exact_delay), horizon - 1)
                     queue.merge(original, actions, delay)
                     if running:
                         latencies.add(latency)
@@ -758,10 +759,12 @@ def _run_single_episode(
                         inference_delay=delay,
                     )
                     started = time.monotonic()
+                    snapshot_ticks = ticks_sent
                     future = executor.submit(client.request, snapshot)
             step = queue.get() if running else None
             if step is not None:
                 starved_ticks = 0
+                ticks_sent += 1
                 action = _chunk_to_action(step.tolist())
                 sent = robot.send_action(action)
                 last_action = action
@@ -923,8 +926,8 @@ def main(argv: list[str] | None = None) -> int:
         "--inference.rtc.execution_horizon",
         dest="execution_horizon",
         type=int,
-        default=10,
-        help="RTC leftover prefix length (default 10).",
+        default=20,
+        help="RTC leftover prefix length and blending window (default 20).",
     )
     parser.add_argument(
         "--prefetch-steps",
