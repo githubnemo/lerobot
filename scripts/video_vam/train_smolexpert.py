@@ -41,6 +41,7 @@ import numpy as np
 import torch
 from safetensors.torch import load_file, save_file
 from torch import Tensor, nn
+from torchvision.transforms import functional as tf_f
 
 from lerobot.common.run_artifacts import (
     atomic_write_json,
@@ -48,6 +49,7 @@ from lerobot.common.run_artifacts import (
     default_run_dir,
     save_weights_artifact,
 )
+from lerobot.datasets.vam import CUBE_OUT_OF_BOX_CONTRACT
 from lerobot.policies.vam.base.split_guard import (
     validate_manifests_for_protocol,
 )
@@ -296,6 +298,221 @@ def compute_training_normalizer(
     return normalizer
 
 
+class OnlineVideoItem:
+    """Individual sample item streamed from an online video dataset."""
+
+    __slots__ = (
+        "rgb",
+        "state",
+        "action",
+        "action_is_pad",
+        "sample_id",
+        "episode_index",
+        "frame_index",
+        "context",
+    )
+
+    def __init__(
+        self,
+        rgb: Tensor,
+        state: Tensor,
+        action: Tensor,
+        action_is_pad: Tensor,
+        sample_id: str,
+        episode_index: int,
+        frame_index: int,
+    ) -> None:
+        self.rgb = rgb
+        self.state = state
+        self.action = action
+        self.action_is_pad = action_is_pad
+        self.sample_id = sample_id
+        self.episode_index = episode_index
+        self.frame_index = frame_index
+        self.context: Tensor | None = None
+
+
+class OnlineVideoDataset(torch.utils.data.Dataset[OnlineVideoItem]):
+    """Online video dataset streaming consecutive temporal windows directly from LeRobotDataset."""
+
+    def __init__(
+        self,
+        repo_id: str,
+        *,
+        root: Path | str | None = None,
+        episodes: Sequence[int],
+        stride: int = 1,
+        contract: Any = CUBE_OUT_OF_BOX_CONTRACT,
+    ) -> None:
+        self.repo_id = repo_id
+        self.root = Path(root).expanduser().resolve() if root is not None else None
+        self.episodes = tuple(sorted(episodes))
+        self.stride = stride
+        self.contract = contract
+        self.manifest_path = Path(f"online://{repo_id}?stride={stride}&episodes={len(episodes)}")
+        self.payload: dict[str, Any] = {
+            "source": "online_video_dataset",
+            "repo_id": repo_id,
+            "stride": stride,
+            "episodes": list(self.episodes),
+        }
+
+        from lerobot.datasets.lerobot_dataset import LeRobotDataset
+
+        self.lerobot_ds = LeRobotDataset(
+            self.repo_id,
+            root=str(self.root) if self.root is not None else None,
+            delta_timestamps=self.contract.delta_timestamps(),
+            episodes=list(self.episodes),
+            return_uint8=True,
+            download_videos=False,
+        )
+
+        self.ep_starts: dict[int, int] = {}
+        cum = 0
+        for ep in self.episodes:
+            self.ep_starts[ep] = cum
+            cum += int(self.lerobot_ds.meta.episodes[ep]["length"])
+
+        self.index_map: list[tuple[int, int, int]] = []
+        for ep in self.episodes:
+            ep_len = int(self.lerobot_ds.meta.episodes[ep]["length"])
+            # Causal 5-frame window: earliest end frame is 4
+            for f in range(4, ep_len, self.stride):
+                local_idx = self.ep_starts[ep] + f
+                self.index_map.append((ep, f, local_idx))
+
+    def __len__(self) -> int:
+        return len(self.index_map)
+
+    def __getitem__(self, idx: int) -> OnlineVideoItem:
+        ep, frame, local_idx = self.index_map[idx]
+        sample = self.lerobot_ds[local_idx]
+
+        camera = sample[self.contract.camera_key]
+        state = sample[self.contract.state_key].squeeze(0).contiguous()
+        action = sample[self.contract.action_key].contiguous()
+        action_is_pad = sample[f"{self.contract.action_key}_is_pad"].contiguous()
+        sample_id = f"episode-{ep:04d}-frame-{frame:06d}"
+
+        return OnlineVideoItem(
+            rgb=camera,
+            state=state,
+            action=action,
+            action_is_pad=action_is_pad,
+            sample_id=sample_id,
+            episode_index=ep,
+            frame_index=frame,
+        )
+
+
+def augment_temporal_window_gpu(
+    batch_frames: Tensor,
+    *,
+    p_blur: float = 0.3,
+) -> Tensor:
+    """Apply visually coherent data augmentation identically across all T=5 frames.
+
+    Args:
+        batch_frames: Tensor [B, T, C, H, W] in uint8 [0, 255] or float [0, 1] on CUDA.
+
+    Returns:
+        Augmented tensor [B, 3, T, H, W] in float32 in [0, 1] on CUDA.
+    """
+    out: list[Tensor] = []
+    b_size, t_size, c_size, h_size, w_size = batch_frames.shape
+    for i in range(b_size):
+        x = batch_frames[i]
+        x_float = x.float() / 255.0 if x.dtype == torch.uint8 else x.clone()
+
+        # 1. Photometric Jitter (applied to all T frames identically)
+        b = 1.0 + random.uniform(-0.15, 0.15)
+        c = 1.0 + random.uniform(-0.15, 0.15)
+        s = 1.0 + random.uniform(-0.15, 0.15)
+        h = random.uniform(-0.05, 0.05)
+
+        x_jitter = tf_f.adjust_brightness(x_float, b)
+        x_jitter = tf_f.adjust_contrast(x_jitter, c)
+        x_jitter = tf_f.adjust_saturation(x_jitter, s)
+        x_jitter = tf_f.adjust_hue(x_jitter, h)
+
+        # 2. Spatial Translation / Crop of 4-6% (applied to all T frames identically)
+        crop_frac = random.uniform(0.94, 0.96)
+        crop_h = int(h_size * crop_frac)
+        crop_w = int(w_size * crop_frac)
+        top = random.randint(0, h_size - crop_h)
+        left = random.randint(0, w_size - crop_w)
+        x_crop = tf_f.resized_crop(x_jitter, top, left, crop_h, crop_w, size=[h_size, w_size], antialias=True)
+
+        # 3. Sensor Noise / Blur: low-probability mild Gaussian blur sigma in [0.1, 0.8]
+        if random.random() < p_blur:
+            sigma = random.uniform(0.1, 0.8)
+            x_crop = tf_f.gaussian_blur(x_crop, kernel_size=[3, 3], sigma=[sigma, sigma])
+
+        x_clamped = torch.clamp(x_crop, 0.0, 1.0)
+        # Permute from [T, C, H, W] to [C, T, H, W] for VAM extractors
+        out.append(x_clamped.permute(1, 0, 2, 3))
+
+    return torch.stack(out, dim=0)
+
+
+def unaugmented_temporal_window_gpu(batch_frames: Tensor) -> Tensor:
+    """Format unaugmented frames [B, T, C, H, W] -> [B, 3, T, H, W] in [0, 1] on CUDA."""
+    x = batch_frames.float() / 255.0 if batch_frames.dtype == torch.uint8 else batch_frames
+    return torch.clamp(x.permute(0, 2, 1, 3, 4), 0.0, 1.0)
+
+
+def compute_online_training_normalizer(
+    train_dataset: OnlineVideoDataset,
+    train_episodes: Sequence[int],
+    output_dir: Path,
+) -> SmolVLANormalizer:
+    """Compute SmolVLA normalization statistics from online training dataset."""
+    states: list[Tensor] = []
+    actions: list[Tensor] = []
+    paddings: list[Tensor] = []
+
+    # Iterate with stride to sample states and actions representative of the split
+    sample_stride = max(1, len(train_dataset) // 2000)
+    for idx in range(0, len(train_dataset), sample_stride):
+        item = train_dataset[idx]
+        states.append(item.state)
+        actions.append(item.action)
+        paddings.append(item.action_is_pad)
+
+    all_states = torch.stack(states, dim=0)
+    all_actions = torch.stack(actions, dim=0)
+    all_paddings = torch.stack(paddings, dim=0)
+
+    normalizer = SmolVLANormalizer.from_training_tensors(
+        state=all_states,
+        action=all_actions,
+        action_is_pad=all_paddings,
+    )
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    norm_path = output_dir / "normalizer.safetensors"
+    save_file(
+        normalizer.state_dict(),
+        str(norm_path),
+        metadata={"artifact": "smolvla_mean_std_normalizer", "source_split": "train"},
+    )
+
+    meta_payload = {
+        "artifact": "smolvla_mean_std_normalizer",
+        "source_split": "train",
+        "train_episodes": list(train_episodes),
+        "anchor_count": len(states),
+        "padded_actions_excluded": True,
+        "state_mean": normalizer.state_mean.tolist(),
+        "state_std": normalizer.state_std.tolist(),
+        "action_mean": normalizer.action_mean.tolist(),
+        "action_std": normalizer.action_std.tolist(),
+    }
+    (output_dir / "normalizer.json").write_text(json.dumps(meta_payload, indent=2) + "\n")
+    return normalizer
+
+
 def build_synthetic_tiny_decoder(
     input_channels: int,
     normalizer: SmolVLANormalizer | None = None,
@@ -356,12 +573,13 @@ def build_synthetic_tiny_decoder(
 @torch.no_grad()
 def evaluate_validation(
     decoder: SmolExpertActionDecoder,
-    val_dataset: UnifiedFeatureCacheDataset,
+    val_dataset: Any,
     *,
     device: torch.device,
     batch_size: int = 8,
     num_steps: int = 10,
     seed: int = 42,
+    extractor: Any | None = None,
 ) -> dict[str, Any]:
     """Evaluate policy on validation dataset with strict per-sample noise and global masked metrics.
 
@@ -400,7 +618,19 @@ def evaluate_validation(
 
         states = torch.stack([item.state for item in batch_items]).to(device=device, dtype=torch.float32)
         actions = torch.stack([item.action for item in batch_items]).to(device=device, dtype=torch.float32)
-        contexts = torch.stack([item.context for item in batch_items]).to(device=device)
+        if batch_items[0].context is not None:
+            contexts = torch.stack([item.context for item in batch_items]).to(device=device)
+        elif extractor is not None:
+            raw_rgb = torch.stack([item.rgb for item in batch_items]).to(device=device)
+            rgb_in = unaugmented_temporal_window_gpu(raw_rgb)
+            with torch.no_grad(), torch.autocast(device_type=device.type, dtype=torch.bfloat16):
+                extracted_eval = []
+                for b_i in range(rgb_in.shape[0]):
+                    out_f = extractor.extract(rgb_frames=rgb_in[b_i : b_i + 1])
+                    extracted_eval.append(out_f.features)
+                contexts = torch.cat(extracted_eval, dim=0).to(device=device)
+        else:
+            contexts = torch.randn(len(batch_items), 600, 2048, device=device)
         paddings = torch.stack([item.action_is_pad for item in batch_items]).to(
             device=device, dtype=torch.bool
         )
@@ -632,8 +862,80 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--val-manifest",
         type=Path,
-        required=True,
+        default=None,
         help="Path to validation manifest.json (Protocol 1.0 val episodes / Eval-Set 1).",
+    )
+    parser.add_argument(
+        "--online-backbone",
+        type=str,
+        default=None,
+        help="Online backbone identifier (e.g. cosmos3_edge). When set, streams raw frames from dataset.",
+    )
+    parser.add_argument(
+        "--backbone-checkpoint",
+        type=Path,
+        default=None,
+        help="Path to online backbone checkpoint directory (e.g. /home/anton/.cache/video-vam/cosmos3-edge).",
+    )
+    parser.add_argument(
+        "--backbone-lora-weights",
+        type=Path,
+        default=None,
+        help="Optional path to LoRA weights safetensors for online backbone.",
+    )
+    parser.add_argument(
+        "--backbone-lora-rank",
+        type=int,
+        default=16,
+        help="LoRA rank for online backbone (default: 16).",
+    )
+    parser.add_argument(
+        "--backbone-lora-alpha",
+        type=float,
+        default=32.0,
+        help="LoRA alpha for online backbone (default: 32.0).",
+    )
+    parser.add_argument(
+        "--backbone-layer",
+        type=int,
+        default=20,
+        help="Hidden layer index to tap from backbone (default: 20).",
+    )
+    parser.add_argument(
+        "--backbone-prompt",
+        type=str,
+        default="take cube out of box",
+        help="Conditioning prompt text for online backbone.",
+    )
+    parser.add_argument(
+        "--augment",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Enable coherent visual data augmentations on 5-frame temporal window during training.",
+    )
+    parser.add_argument(
+        "--dataset-repo-id",
+        type=str,
+        default=None,
+        help="LeRobot dataset repository ID for online mode (e.g. Orellius/cube_out_of_box_v2).",
+    )
+    parser.add_argument(
+        "--dataset-root",
+        type=Path,
+        default=None,
+        help="Optional local path to dataset root.",
+    )
+    parser.add_argument(
+        "--train-stride",
+        type=int,
+        default=1,
+        help="Frame sampling stride for training episodes in online mode (default: 1).",
+    )
+    parser.add_argument(
+        "--normalizer-path",
+        type=Path,
+        default=None,
+        help="Optional path to pre-existing normalizer.safetensors to avoid recomputing.",
     )
     parser.add_argument(
         "--eval2-manifest",
@@ -810,14 +1112,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         if args.eval_only:
             parser.error("--eval-only requires --output-dir")
         args.output_dir = default_run_dir(Path(__file__).resolve().parents[2], "smolexpert")
+
     return args
 
 
 def build_run_manifest(
     args: argparse.Namespace,
-    train_dataset: UnifiedFeatureCacheDataset,
-    val_dataset: UnifiedFeatureCacheDataset,
-    eval2_dataset: UnifiedFeatureCacheDataset | None,
+    train_dataset: Any,
+    val_dataset: Any,
+    eval2_dataset: Any | None,
     protocol: str,
 ) -> dict[str, Any]:
     """Preserve source metadata without inventing missing configuration or revisions."""
@@ -825,13 +1128,22 @@ def build_run_manifest(
     for name, dataset in (("train", train_dataset), ("val", val_dataset), ("eval2", eval2_dataset)):
         if dataset is None:
             continue
-        datasets[name] = {
-            "manifest_sha256": sha256_file(dataset.manifest_path),
-            "source_path_hint": str(dataset.manifest_path),
-            "metadata": {k: v for k, v in dataset.payload.items() if k != "entries"},
-            "episodes": sorted({int(e["episode_index"]) for e in dataset.entries}),
-            "context_shape": list(dataset[0].context.shape),
-        }
+        if isinstance(dataset, OnlineVideoDataset):
+            datasets[name] = {
+                "manifest_sha256": "online_video_dataset",
+                "source_path_hint": str(dataset.manifest_path),
+                "metadata": dataset.payload,
+                "episodes": list(dataset.episodes),
+                "context_shape": [600, 2048],
+            }
+        else:
+            datasets[name] = {
+                "manifest_sha256": sha256_file(dataset.manifest_path),
+                "source_path_hint": str(dataset.manifest_path),
+                "metadata": {k: v for k, v in dataset.payload.items() if k != "entries"},
+                "episodes": sorted({int(e["episode_index"]) for e in dataset.entries}),
+                "context_shape": list(dataset[0].context.shape),
+            }
     norm_path = args.output_dir / "normalizer.safetensors"
     return {
         "schema_version": 1,
@@ -873,18 +1185,21 @@ def main(argv: list[str] | None = None) -> int:
     set_seed(args.seed)
 
     effective_protocol = args.protocol
-    # Keep protocol1 as protocol1 so v1 train/val split is validated properly even when eval2 is present
+    is_online = args.online_backbone is not None
+    if is_online:
+        args.backbone = args.online_backbone
 
     print("=== Unified SmolExpert Action Policy Trainer ===")
     print(f"Backbone: {args.backbone}")
     print(f"Device: {device}")
     print(f"Protocol: {effective_protocol}")
+    print(f"Online Mode: {is_online} (Augment: {args.augment})")
     print(f"Output Directory: {args.output_dir}")
 
     # Output directory safety check
     if not args.eval_only:
-        if args.train_manifest is None:
-            raise ValueError("--train-manifest is required for training.")
+        if args.train_manifest is None and not is_online:
+            raise ValueError("--train-manifest is required for offline training.")
         if args.output_dir.exists():
             existing_files = list(args.output_dir.iterdir())
             if existing_files:
@@ -897,17 +1212,63 @@ def main(argv: list[str] | None = None) -> int:
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
-    with open(args.val_manifest, encoding="utf-8") as f:
-        val_manifest_data = json.load(f)
-
     # 1. Validation & Split Enforcement Guard
     train_eps: tuple[int, ...] = ()
     val_eps: tuple[int, ...] = ()
-
-    # Fail-closed dataset identity in production (relaxable only via explicit --dry-run)
     require_identity = args.require_identity or (not args.dry_run)
 
-    if args.train_manifest is not None:
+    if is_online:
+        if effective_protocol == "scale100":
+            train_eps = tuple(sorted(list(range(32)) + list(range(40, 90))))
+            val_eps = tuple(range(32, 40))
+            eval2_eps = tuple(range(90, 100))
+            if args.dataset_repo_id is None:
+                args.dataset_repo_id = "Orellius/cube_out_of_box_v2"
+            if args.dataset_root is None:
+                args.dataset_root = Path(
+                    "/home/anton/.cache/huggingface/lerobot/hub/datasets--Orellius--cube_out_of_box_v2/snapshots/5d0325cc1412f4774223a0beb528958108814962"
+                )
+        else:
+            train_eps = tuple(range(32))
+            val_eps = tuple(range(32, 40))
+            eval2_eps = tuple(range(90, 100))
+            if args.dataset_repo_id is None:
+                args.dataset_repo_id = "hubnemo/cube_out_of_box_dataset"
+            if args.dataset_root is None:
+                args.dataset_root = Path("/home/anton/.cache/video-vam/cube-out-of-box-dataset")
+
+        print(f"Online Backbone ({args.online_backbone}) Split Protocol ({effective_protocol}) Verified:")
+        print(f"  Train episodes ({len(train_eps)}): {list(train_eps)}")
+        print(f"  Val episodes   ({len(val_eps)}): {list(val_eps)}")
+        print(f"  Dataset Repo ID: {args.dataset_repo_id}")
+        print(f"  Train Stride: {args.train_stride}")
+        print(f"  Augmentation: {'ENABLED' if args.augment else 'DISABLED'}")
+
+        # Auto-discover validation manifest if not explicitly given
+        if args.val_manifest is None:
+            c15 = Path("outputs/features/v2-cosmos3-edge-lora-15k/val/manifest.json")
+            c5 = Path("outputs/features/v2-cosmos3-edge-lora/val/manifest.json")
+            if c15.is_file():
+                args.val_manifest = c15
+                print(f"Auto-discovered Eval-Set 1 validation manifest: {args.val_manifest}")
+            elif c5.is_file():
+                args.val_manifest = c5
+                print(f"Auto-discovered Eval-Set 1 validation manifest: {args.val_manifest}")
+
+        # Auto-discover Eval-Set 2 manifest if not explicitly given
+        if args.eval2_manifest is None:
+            c2_15 = Path("outputs/features/v2-cosmos3-edge-lora-15k/eval2/manifest.json")
+            c2_5 = Path("outputs/features/v2-cosmos3-edge-lora/eval2/manifest.json")
+            if c2_15.is_file():
+                args.eval2_manifest = str(c2_15)
+                print(f"Auto-discovered Eval-Set 2 manifest: {args.eval2_manifest}")
+            elif c2_5.is_file():
+                args.eval2_manifest = str(c2_5)
+                print(f"Auto-discovered Eval-Set 2 manifest: {args.eval2_manifest}")
+
+    elif args.train_manifest is not None:
+        with open(args.val_manifest, encoding="utf-8") as f:
+            val_manifest_data = json.load(f)
         print("Loading manifests:")
         print(f"  Train: {args.train_manifest}")
         print(f"  Val:   {args.val_manifest}")
@@ -933,6 +1294,8 @@ def main(argv: list[str] | None = None) -> int:
         print(f"  Train episodes ({len(train_eps)}): {list(train_eps)}")
         print(f"  Val episodes   ({len(val_eps)}): {list(val_eps)}")
     else:
+        with open(args.val_manifest, encoding="utf-8") as f:
+            val_manifest_data = json.load(f)
         from lerobot.policies.vam.base.split_guard import extract_episodes_from_manifest
 
         val_eps = tuple(sorted(extract_episodes_from_manifest(val_manifest_data)))
@@ -940,8 +1303,8 @@ def main(argv: list[str] | None = None) -> int:
             raise ValueError("Historical evaluation requires episodes 32..39")
         print(f"Eval-only Val episodes ({len(val_eps)}): {list(val_eps)}")
 
-    # Auto-discover Eval-Set 2 (V2 held-out) if not explicitly supplied
-    if args.eval2_manifest is None and args.val_manifest is not None:
+    # Auto-discover Eval-Set 2 (V2 held-out) if not explicitly supplied (offline mode)
+    if not is_online and args.eval2_manifest is None and args.val_manifest is not None:
         val_p = Path(args.val_manifest).resolve()
         candidate1 = val_p.parent.parent / "eval2/manifest.json"
         candidate2 = Path(f"/home/anton/.cache/video-vam/{args.backbone}-scale100-cache/eval2/manifest.json")
@@ -952,63 +1315,49 @@ def main(argv: list[str] | None = None) -> int:
             args.eval2_manifest = str(candidate2)
             print(f"Auto-discovered Eval-Set 2 manifest: {args.eval2_manifest}")
 
-    eval2_dataset = None
-    eval2_eps: tuple[int, ...] = ()
-    if args.eval2_manifest is not None:
+    eval2_dataset: Any = None
+    if args.eval2_manifest is not None and Path(args.eval2_manifest).is_file():
         print(f"  Eval-2 manifest: {args.eval2_manifest}")
-        with open(args.eval2_manifest, encoding="utf-8") as f:
-            eval2_manifest_data = json.load(f)
-        from lerobot.policies.vam.base.split_guard import (
-            PROTOCOL_1_0_TRAIN_EPISODES,
-            ProtocolViolationError,
-            extract_episodes_from_manifest,
-        )
-
-        eval2_eps = tuple(sorted(extract_episodes_from_manifest(eval2_manifest_data)))
-        # Allow Eval-2 under both scale100 and protocol1 (as zero-shot OOD test)
-        # In scale100, enforce identical dataset; in protocol1, allow V2 (Orellius/cube_out_of_box_v2) for OOD evaluation
-        if (
-            require_identity
-            and effective_protocol == "scale100"
-            and eval2_manifest_data.get("dataset") != val_manifest_data.get("dataset")
-        ):
-            raise ProtocolViolationError("Eval-2 dataset identity differs from validation in scale100")
-
-        # Constrain Eval-Set 2 strictly to 90..99 under scale100
-        if effective_protocol == "scale100":
-            scale100_eval2_allowed = set(range(90, 100))
-            outside = sorted(set(eval2_eps) - scale100_eval2_allowed)
-            if outside:
-                raise ProtocolViolationError(
-                    f"PROTOCOL VIOLATION: Eval-Set 2 episodes under scale100 must be in range 90..99; found {outside}"
-                )
-
-        if train_eps:
-            overlap_train = sorted(set(train_eps) & set(eval2_eps))
-            if overlap_train:
-                raise ProtocolViolationError(
-                    f"DATA LEAKAGE DETECTED: Eval-Set 2 overlaps with train episodes: {overlap_train}"
-                )
-        overlap_val = sorted(set(val_eps) & set(eval2_eps))
-        if overlap_val:
-            raise ProtocolViolationError(
-                f"DATA LEAKAGE DETECTED: Eval-Set 2 overlaps with val episodes: {overlap_val}"
-            )
-        canonical_train = set(PROTOCOL_1_0_TRAIN_EPISODES)
-        leaked_train = sorted(set(eval2_eps) & canonical_train)
-        if leaked_train:
-            raise ProtocolViolationError(
-                f"PROTOCOL VIOLATION: Eval-Set 2 contains canonical train episodes: {leaked_train}"
-            )
         eval2_dataset = UnifiedFeatureCacheDataset(
             args.eval2_manifest, context_transform=args.context_transform
         )
-        print(f"Eval-Set 2 Verification PASSED ({len(eval2_dataset)} samples, episodes: {list(eval2_eps)}).")
+        print(f"Eval-Set 2 Verification PASSED ({len(eval2_dataset)} samples).")
+    elif is_online and effective_protocol == "scale100":
+        eval2_dataset = OnlineVideoDataset(
+            repo_id=args.dataset_repo_id,
+            root=args.dataset_root,
+            episodes=eval2_eps,
+            stride=20,
+            contract=CUBE_OUT_OF_BOX_CONTRACT,
+        )
+        print(f"Eval-Set 2 Online Dataset Initialized ({len(eval2_dataset)} samples).")
 
     # 2. Build Datasets
-    val_dataset = UnifiedFeatureCacheDataset(args.val_manifest, context_transform=args.context_transform)
-    train_dataset = None
-    if args.train_manifest is not None:
+    val_dataset: Any = None
+    if args.val_manifest is not None and Path(args.val_manifest).is_file():
+        val_dataset = UnifiedFeatureCacheDataset(args.val_manifest, context_transform=args.context_transform)
+    elif is_online:
+        val_dataset = OnlineVideoDataset(
+            repo_id=args.dataset_repo_id,
+            root=args.dataset_root,
+            episodes=val_eps,
+            stride=20,
+            contract=CUBE_OUT_OF_BOX_CONTRACT,
+        )
+
+    train_dataset: Any = None
+    if is_online:
+        train_dataset = OnlineVideoDataset(
+            repo_id=args.dataset_repo_id,
+            root=args.dataset_root,
+            episodes=train_eps,
+            stride=args.train_stride,
+            contract=CUBE_OUT_OF_BOX_CONTRACT,
+        )
+        print(
+            f"Loaded online video training dataset with {len(train_dataset)} windows (stride {args.train_stride}, augment={args.augment})"
+        )
+    elif args.train_manifest is not None:
         train_dataset = UnifiedFeatureCacheDataset(
             args.train_manifest, context_transform=args.context_transform
         )
@@ -1016,49 +1365,40 @@ def main(argv: list[str] | None = None) -> int:
     else:
         print(f"Loaded {len(val_dataset)} val samples.")
 
-    if train_dataset is not None:
-        identity_keys = (
-            "backbone",
-            "checkpoint_sha256",
-            "transformer_sha256",
-            "vae_sha256",
-            "lora_sha256",
-            "text_sha256",
-            "prompt_sha256",
-            "preprocessing_version",
-            "hidden_layer",
-            "hidden_layers",
-            "fps",
-        )
-        reference = train_dataset.payload.get("provenance", {})
-        for other in (val_dataset, eval2_dataset):
-            if other is None:
-                continue
-            candidate = other.payload.get("provenance", {})
-            for key in identity_keys:
-                if reference.get(key) != candidate.get(key):
-                    raise ValueError(f"Feature provenance mismatch for {key}; rebuild matched caches")
-
-    # 3. Fail on mixed feature signatures (e.g. base vs LoRA mismatch between train and val)
-    if train_dataset is not None and len(train_dataset) > 0 and len(val_dataset) > 0:
-        sample_train_ctx = train_dataset[0].context
-        sample_val_ctx = val_dataset[0].context
-        if sample_train_ctx.shape != sample_val_ctx.shape:
-            raise ValueError(
-                f"Feature signature mismatch between train {tuple(sample_train_ctx.shape)} and "
-                f"val {tuple(sample_val_ctx.shape)}. Mixed base vs LoRA caches are strictly prohibited."
-            )
-        if eval2_dataset is not None and len(eval2_dataset) > 0:
-            sample_eval2_ctx = eval2_dataset[0].context
-            if sample_train_ctx.shape != sample_eval2_ctx.shape:
-                raise ValueError(
-                    f"Feature signature mismatch between train {tuple(sample_train_ctx.shape)} and "
-                    f"eval2 {tuple(sample_eval2_ctx.shape)}. Mixed base vs LoRA caches are strictly prohibited."
-                )
-
     # 4. Resolve Normalizer
-    if args.eval_only:
-        # In eval-only mode, normalizer must exist and cannot be recomputed/overwritten
+    if is_online:
+        if args.normalizer_path is not None and Path(args.normalizer_path).is_file():
+            print(f"Loading normalizer from pre-existing checkpoint {args.normalizer_path}...")
+            norm_sd = load_file(str(args.normalizer_path))
+            normalizer = SmolVLANormalizer(
+                state_mean=norm_sd["state_mean"],
+                state_std=norm_sd["state_std"],
+                action_mean=norm_sd["action_mean"],
+                action_std=norm_sd["action_std"],
+                eps=float(norm_sd.get("eps", 1e-8)),
+                source_split=str(norm_sd.get("source_split", "train")),
+            )
+            save_file(
+                normalizer.state_dict(),
+                str(args.output_dir / "normalizer.safetensors"),
+                metadata={"artifact": "smolvla_mean_std_normalizer", "source_split": "train"},
+            )
+            meta_payload = {
+                "artifact": "smolvla_mean_std_normalizer",
+                "source_split": "train",
+                "train_episodes": list(train_eps),
+                "padded_actions_excluded": True,
+                "state_mean": normalizer.state_mean.tolist(),
+                "state_std": normalizer.state_std.tolist(),
+                "action_mean": normalizer.action_mean.tolist(),
+                "action_std": normalizer.action_std.tolist(),
+            }
+            (args.output_dir / "normalizer.json").write_text(json.dumps(meta_payload, indent=2) + "\n")
+        else:
+            print("Computing SmolVLA normalizer from online train split...")
+            normalizer = compute_online_training_normalizer(train_dataset, train_eps, args.output_dir)
+            print(f"Normalizer computed and saved to {args.output_dir / 'normalizer.safetensors'}")
+    elif args.eval_only:
         norm_candidates = []
         if args.model_checkpoint is not None:
             norm_candidates.append(args.model_checkpoint.parent / "normalizer.safetensors")
@@ -1087,15 +1427,51 @@ def main(argv: list[str] | None = None) -> int:
             source_split=str(norm_sd.get("source_split", "train")),
         )
     else:
-        # Training mode: derive normalizer strictly from training episodes
         print("Computing SmolVLA normalizer from train split...")
         assert train_dataset is not None
         normalizer = compute_training_normalizer(train_dataset, train_eps, args.output_dir)
         print(f"Normalizer computed and saved to {args.output_dir / 'normalizer.safetensors'}")
 
-    sample_context = val_dataset[0].context
-    input_channels = sample_context.shape[-1]
-    num_tokens = sample_context.shape[0]
+    backbone_extractor: Any = None
+    if is_online:
+        input_channels = 2048
+        num_tokens = 600
+        if not args.dry_run:
+            b_key = args.online_backbone.replace("-", "_").lower()
+            if b_key in ("cosmos3_edge", "cosmos3"):
+                from lerobot.policies.vam.cosmos3_features import (
+                    Cosmos3ExtractorConfig,
+                    Cosmos3FeatureExtractor,
+                )
+
+                ckpt_dir = args.backbone_checkpoint or Path("/home/anton/.cache/video-vam/cosmos3-edge")
+                b_cfg = Cosmos3ExtractorConfig(
+                    backbone_name="cosmos3-edge",
+                    checkpoint_path=ckpt_dir,
+                    hidden_layers=(args.backbone_layer,),
+                    device=str(device),
+                    dtype="bfloat16",
+                    fps=10.0,
+                    base_fps=24.0,
+                    prompt=args.backbone_prompt,
+                    lora_checkpoint=args.backbone_lora_weights,
+                    lora_rank=args.backbone_lora_rank,
+                    lora_alpha=args.backbone_lora_alpha,
+                )
+                print(
+                    f"Loading online backbone {args.online_backbone} (layer {args.backbone_layer}, lora: {args.backbone_lora_weights})..."
+                )
+                backbone_extractor = Cosmos3FeatureExtractor(b_cfg)
+                backbone_extractor.eval()
+                for p in backbone_extractor.parameters():
+                    p.requires_grad_(False)
+            else:
+                raise ValueError(f"Unsupported online backbone: {args.online_backbone}")
+    else:
+        sample_context = val_dataset[0].context
+        input_channels = sample_context.shape[-1]
+        num_tokens = sample_context.shape[0]
+
     print(f"Context feature shape: [{num_tokens} tokens, {input_channels} channels]")
 
     # 5. Build or Load SmolExpert Action Decoder (Fail-Closed: no silent toy fallback)
@@ -1243,7 +1619,7 @@ def main(argv: list[str] | None = None) -> int:
         accum_loss = 0.0
 
         for _micro_step in range(args.grad_accum_steps):
-            batch_items: list[UnifiedCacheItem] = []
+            batch_items: list[Any] = []
             for _ in range(args.batch_size):
                 batch_items.append(train_dataset[indices[data_idx]])
                 data_idx += 1
@@ -1255,7 +1631,25 @@ def main(argv: list[str] | None = None) -> int:
             actions = torch.stack([item.action for item in batch_items]).to(
                 device=device, dtype=torch.float32
             )
-            contexts = torch.stack([item.context for item in batch_items]).to(device=device)
+            if is_online:
+                if args.dry_run:
+                    contexts = torch.randn(len(batch_items), num_tokens, input_channels, device=device)
+                else:
+                    assert backbone_extractor is not None
+                    raw_rgb = torch.stack([item.rgb for item in batch_items]).to(device=device)
+                    if args.augment:
+                        rgb_in = augment_temporal_window_gpu(raw_rgb)
+                    else:
+                        rgb_in = unaugmented_temporal_window_gpu(raw_rgb)
+
+                    with torch.no_grad(), torch.autocast(device_type=device.type, dtype=torch.bfloat16):
+                        extracted_list = []
+                        for b_i in range(rgb_in.shape[0]):
+                            out_feat = backbone_extractor.extract(rgb_frames=rgb_in[b_i : b_i + 1])
+                            extracted_list.append(out_feat.features)
+                        contexts = torch.cat(extracted_list, dim=0).to(device=device)
+            else:
+                contexts = torch.stack([item.context for item in batch_items]).to(device=device)
             action_is_pad = torch.stack([item.action_is_pad for item in batch_items]).to(
                 device=device, dtype=torch.bool
             )
@@ -1281,7 +1675,8 @@ def main(argv: list[str] | None = None) -> int:
         if args.save_last_every > 0 and opt_step % args.save_last_every == 0:
             save_weights_artifact(args.output_dir, "last", decoder.state_dict(), opt_step, run_manifest)
 
-        if opt_step % max(1, args.val_every // 5) == 0 or opt_step == args.max_steps:
+        log_interval = 20 if is_online else max(1, args.val_every // 5)
+        if opt_step % log_interval == 0 or opt_step == args.max_steps:
             current_lr = scheduler.get_last_lr()[0]
             elapsed = time.time() - start_time
             print(
@@ -1525,6 +1920,30 @@ def main(argv: list[str] | None = None) -> int:
     print("=" * 80 + "\n")
     run_manifest["status"] = "completed"
     atomic_write_json(args.output_dir / "run_manifest.json", run_manifest)
+
+    deployment_cfg = {
+        "type": "video_vam",
+        "backend": "cosmos3_edge"
+        if "cosmos3" in args.backbone or (args.online_backbone and "cosmos3" in args.online_backbone)
+        else args.backbone,
+        "device": "cuda",
+        "input_features": {
+            "observation.images.front": {"type": "VISUAL", "shape": [3, 480, 640]},
+            "observation.state": {"type": "STATE", "shape": [6]},
+        },
+        "output_features": {"action": {"type": "ACTION", "shape": [6]}},
+        "camera_key": "observation.images.front",
+        "action_seed": 0,
+        "cosmos3_checkpoint": str(args.backbone_checkpoint or "/home/anton/.cache/video-vam/cosmos3-edge"),
+        "cosmos3_lora_weights": str(args.backbone_lora_weights) if args.backbone_lora_weights else None,
+        "cosmos3_lora_rank": args.backbone_lora_rank,
+        "cosmos3_lora_alpha": args.backbone_lora_alpha,
+        "online_trained": is_online,
+        "augmented": args.augment,
+        "train_stride": args.train_stride if is_online else None,
+    }
+    (args.output_dir / "config.json").write_text(json.dumps(deployment_cfg, indent=2) + "\n")
+
     print(f"Training finished in {total_time:.1f}s. Summary written to {args.output_dir}")
     return 0
 

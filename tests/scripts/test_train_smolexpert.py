@@ -575,3 +575,76 @@ def test_output_default_and_explicit_path(monkeypatch, tmp_path):
     assert explicit.output_dir == Path("custom")
     with pytest.raises(SystemExit):
         trainer.parse_args(["--val-manifest", "val.json", "--eval-only"])
+
+
+def test_augment_temporal_window_gpu():
+    from scripts.video_vam.train_smolexpert import (
+        augment_temporal_window_gpu,
+        unaugmented_temporal_window_gpu,
+    )
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    batch = torch.randint(0, 256, (2, 5, 3, 480, 640), dtype=torch.uint8, device=device)
+    unaug = unaugmented_temporal_window_gpu(batch)
+    assert unaug.shape == (2, 3, 5, 480, 640)
+    assert 0.0 <= unaug.min().item() <= unaug.max().item() <= 1.0
+
+    aug = augment_temporal_window_gpu(batch, p_blur=0.5)
+    assert aug.shape == (2, 3, 5, 480, 640)
+    assert 0.0 <= aug.min().item() <= aug.max().item() <= 1.0
+
+
+def test_online_backbone_dry_run(tmp_path: Path):
+    from scripts.video_vam.train_smolexpert import main as train_smolexpert_main
+
+    out_dir = tmp_path / "online_out"
+    val_dir = tmp_path / "val_cache"
+    val_dir.mkdir()
+    f_val = _create_mock_cache_item(
+        val_dir,
+        "val_0.safetensors",
+        context=torch.randn(600, 2048),
+        state=torch.zeros(ACTION_DIM),
+        action=torch.zeros(ACTION_HORIZON, ACTION_DIM),
+        action_is_pad=torch.zeros(ACTION_HORIZON, dtype=torch.bool),
+    )
+    val_m = val_dir / "manifest.json"
+    val_m.write_text(
+        json.dumps(
+            {
+                "entries": [
+                    {"safetensors": f_val.name, "episode_index": 32, "frame_index": 0, "sample_id": "v0"}
+                ]
+            }
+        )
+    )
+
+    ret = train_smolexpert_main(
+        [
+            "--online-backbone",
+            "cosmos3_edge",
+            "--val-manifest",
+            str(val_m),
+            "--output-dir",
+            str(out_dir),
+            "--dry-run",
+            "--device",
+            "cpu",
+            "--augment",
+            "--max-steps",
+            "2",
+            "--val-every",
+            "1",
+            "--batch-size",
+            "2",
+            "--protocol",
+            "scale100",
+        ]
+    )
+    assert ret == 0
+    assert (out_dir / "best.safetensors").is_file()
+    assert (out_dir / "normalizer.safetensors").is_file()
+    assert (out_dir / "config.json").is_file()
+    cfg = json.loads((out_dir / "config.json").read_text())
+    assert cfg["online_trained"] is True
+    assert cfg["augmented"] is True
