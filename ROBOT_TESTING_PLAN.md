@@ -32,26 +32,21 @@ This document outlines the step-by-step physical test protocol for the SO-100 / 
 
 Run each model from `/Users/antonwiehe/lerobot` on the MacBook:
 
-### 🥇 1. Cosmos 3 Edge Video-LoRA (~80 ms) — Benchmark Leader
+### 🥇 1. Cosmos 3 Edge Video-LoRA — Benchmark Leader
 
-The Scale-100 benchmark champion. Highest accuracy (13.62° V1 / 17.12° V2), lowest latency (~80 ms), and uses 600 unpooled spatiotemporal tokens.
+The Scale-100 benchmark champion. Highest accuracy (13.62° V1 / 17.12° V2) and uses 600 unpooled spatiotemporal tokens.
 
 ```bash
 # Dry run verification:
 .venv/bin/python scripts/video_vam/run_mac_vam_rpc.py --checkpoint cosmos3_lora --dry-run
 
-# Live physical rollout:
-.venv/bin/python scripts/video_vam/run_mac_vam_rpc.py \
-    --checkpoint cosmos3_lora \
-    --robot.type=so101_follower \
-    --robot.port=/dev/tty.usbmodem5A460820701 \
-    --robot.id=so101 \
-    --duration=30 --task="take cube out of box"
+# Live physical rollout (continuous 45s episodes with smooth base reset):
+.venv/bin/python scripts/video_vam/run_mac_vam_rpc.py --checkpoint cosmos3_lora
 ```
 
 ---
 
-### 🥈 2. Cosmos 2B T=2 Distilled (~204 ms) — Representation Distillation Winner
+### 🥈 2. Cosmos 2B T=2 Distilled — Representation Distillation Winner
 
 The core breakthrough of the project: closes the performance gap to the heavy $T=16$ teacher (CosSim 0.81, loss 8.06) while running at full real-time 2-frame speed (~204 ms).
 
@@ -60,12 +55,7 @@ The core breakthrough of the project: closes the performance gap to the heavy $T
 .venv/bin/python scripts/video_vam/run_mac_vam_rpc.py --checkpoint cosmos2b_t2_distilled --dry-run
 
 # Live physical rollout:
-.venv/bin/python scripts/video_vam/run_mac_vam_rpc.py \
-    --checkpoint cosmos2b_t2_distilled \
-    --robot.type=so101_follower \
-    --robot.port=/dev/tty.usbmodem5A460820701 \
-    --robot.id=so101 \
-    --duration=30 --task="take cube out of box"
+.venv/bin/python scripts/video_vam/run_mac_vam_rpc.py --checkpoint cosmos2b_t2_distilled
 ```
 
 ---

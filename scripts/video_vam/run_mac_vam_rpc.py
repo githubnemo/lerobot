@@ -89,13 +89,15 @@ ACTION_NAMES = (
     "gripper.pos",
 )
 MOTOR_NAMES = tuple(name.removesuffix(".pos") for name in ACTION_NAMES)
-DEFAULT_CAMERAS = "{front: {type: opencv, index_or_path: 0, width: 640, height: 480, fps: 30}}"
+DEFAULT_PORT_PATH = "/dev/tty.usbmodem5A460820701"
+DEFAULT_ROBOT_ID = "shabby"
+DEFAULT_CAMERAS = "{front: {type: opencv, index_or_path: 1, width: 640, height: 480, fps: 30, warmup_s: 5}}"
 DEFAULT_MAX_RELATIVE_TARGET = {
-    "shoulder_pan": 30.0,
-    "shoulder_lift": 30.0,
-    "elbow_flex": 30.0,
-    "wrist_flex": 30.0,
-    "wrist_roll": 30.0,
+    "shoulder_pan": 45.0,
+    "shoulder_lift": 45.0,
+    "elbow_flex": 45.0,
+    "wrist_flex": 45.0,
+    "wrist_roll": 45.0,
     "gripper": 50.0,
 }
 
@@ -617,9 +619,42 @@ def _make_robot(args: argparse.Namespace) -> Any:
         cameras=args.robot_cameras,
         use_degrees=True,
         max_relative_target=args.robot_max_relative_target,
-        disable_torque_on_disconnect=True,
+        disable_torque_on_disconnect=False,
     )
     return make_robot_from_config(config)
+
+
+def _soft_release_torque(robot: Any) -> None:
+    """Softly releases motor torques one by one from end-effector to base."""
+    import contextlib
+
+    if not hasattr(robot, "bus") or not robot.bus.is_connected:
+        return
+    release_order = ["gripper", "wrist_roll", "wrist_flex", "elbow_flex", "shoulder_lift", "shoulder_pan"]
+    for motor in release_order:
+        with contextlib.suppress(Exception):
+            robot.bus.disable_torque(motor)
+            time.sleep(0.15)
+
+
+def _smooth_move_to(robot: Any, target_state: list[float], duration_s: float = 3.5, fps: int = 20) -> None:
+    """Smoothly moves the arm from its current position to target_state using cosine ease-in-out."""
+    try:
+        obs = robot.get_observation()
+        start_pos = [obs[name] for name in ACTION_NAMES]
+        steps = max(1, int(duration_s * fps))
+        period = 1.0 / fps
+        for i in range(1, steps + 1):
+            t0 = time.monotonic()
+            alpha = (1.0 - math.cos(math.pi * (i / steps))) / 2.0
+            interp = [s + alpha * (t - s) for s, t in zip(start_pos, target_state, strict=True)]
+            action = _chunk_to_action(interp)
+            robot.send_action(action)
+            elapsed = time.monotonic() - t0
+            if elapsed < period:
+                time.sleep(period - elapsed)
+    except Exception as exc:
+        warnings.warn(f"Failed to complete smooth transition: {exc}", stacklevel=2)
 
 
 def _disconnect_robot(robot: Any) -> None:
@@ -639,16 +674,19 @@ def _disconnect_robot(robot: Any) -> None:
                 errors.append(exc)
     if robot.bus.is_connected:
         try:
-            robot.bus.disconnect(disable_torque=True)
+            robot.bus.disconnect(disable_torque=False)
         except Exception as exc:
             errors.append(exc)
     if errors:
         raise RuntimeError(f"Partial robot disconnect failed: {errors}")
 
 
-def _run_rollout(args: argparse.Namespace, client: VideoVAMRPCClient) -> None:
-    robot = _make_robot(args)
-    executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="vam-rpc")
+def _run_single_episode(
+    robot: Any,
+    args: argparse.Namespace,
+    client: VideoVAMRPCClient,
+    executor: ThreadPoolExecutor,
+) -> None:
     future: Future[dict[str, Any]] | None = None
     rtc = args.inference_type == "rtc"
     queue = ActionQueue(RTCConfig(enabled=rtc, execution_horizon=args.execution_horizon))
@@ -663,15 +701,10 @@ def _run_rollout(args: argparse.Namespace, client: VideoVAMRPCClient) -> None:
     upper = torch.tensor(args.joint_limits_max)
     last_action = None
     starved_ticks = 0
+
+    next_tick = time.monotonic()
+    previous_observation = None
     try:
-        # Do not open an interactive calibration workflow from an autonomous launcher.
-        if not robot.calibration:
-            raise RuntimeError("Existing robot calibration is required; calibrate separately")
-        robot.connect(calibrate=False)
-        if not robot.is_calibrated:
-            raise RuntimeError("Robot calibration mismatch; calibrate separately")
-        next_tick = time.monotonic()
-        previous_observation = None
         while time.monotonic() < deadline:
             obs = robot.get_observation()
             observed_at = time.monotonic()
@@ -716,7 +749,7 @@ def _run_rollout(args: argparse.Namespace, client: VideoVAMRPCClient) -> None:
                     previous = queue.get_left_over() if rtc and running else None
                     delay = planned_inference_delay(latencies.max(), args.fps) if previous is not None else 0
                     if previous is not None and delay >= len(previous):
-                        raise RuntimeError("Insufficient action prefix to cover inference")
+                        delay = max(0, len(previous) - 1)
                     snapshot = client.snapshot(
                         state,
                         task=args.task,
@@ -750,10 +783,58 @@ def _run_rollout(args: argparse.Namespace, client: VideoVAMRPCClient) -> None:
     finally:
         if future is not None:
             future.cancel()
+
+
+def _run_rollout(args: argparse.Namespace, client: VideoVAMRPCClient) -> None:
+    robot = _make_robot(args)
+    executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="vam-rpc")
+    home_pose: list[float] | None = None
+    try:
+        # Do not open an interactive calibration workflow from an autonomous launcher.
+        if not robot.calibration:
+            raise RuntimeError("Existing robot calibration is required; calibrate separately")
+        robot.connect(calibrate=False)
+        if not robot.is_calibrated:
+            raise RuntimeError("Robot calibration mismatch; calibrate separately")
+
+        # Capture initial pose as the reference base position for resets
+        init_obs = robot.get_observation()
+        home_pose = [init_obs[name] for name in ACTION_NAMES]
+        print(f"[BASE POSE] Recorded initial pose as home: {[f'{x:.1f}°' for x in home_pose]}")
+
+        episodes = 0
+        target_episodes = args.num_episodes if args.num_episodes > 0 else float("inf")
+        while episodes < target_episodes:
+            episodes += 1
+            print(f"\n{'=' * 55}")
+            print(f"🎬 Starting Episode {episodes} (Duration: {args.duration:.0f}s)")
+            print(f"{'=' * 55}")
+
+            _run_single_episode(robot, args, client, executor)
+
+            if episodes < target_episodes:
+                print(f"\n[RESET] Episode {episodes} complete. Smoothly returning to base position...")
+                _smooth_move_to(robot, home_pose, duration_s=args.home_duration)
+                print(f"[RESET] Base position reached. Reset the scene ({args.reset_time:.0f}s)...")
+                countdown_start = time.monotonic()
+                while time.monotonic() - countdown_start < args.reset_time:
+                    remaining = args.reset_time - (time.monotonic() - countdown_start)
+                    print(f"  ⏳ Reset countdown: {int(remaining) + 1}s...", end="\r", flush=True)
+                    time.sleep(0.5)
+                print("\n  ✅ Reset countdown complete! Starting next episode.")
+                client.frames.clear()
+                client.frame_times.clear()
+    except KeyboardInterrupt:
+        print("\n\n[INTERRUPT] Received Ctrl+C. Stopping episode loop...")
+    finally:
+        if home_pose is not None and robot.is_connected:
+            print("[SHUTDOWN] Returning smoothly to base position...")
+            _smooth_move_to(robot, home_pose, duration_s=args.home_duration)
+        print("[SHUTDOWN] Softly releasing motor torques sequentially...")
+        _soft_release_torque(robot)
         try:
             _disconnect_robot(robot)
         finally:
-            # Running subprocesses have hard deadlines. Hardware disconnect never waits on RPC.
             executor.shutdown(wait=True, cancel_futures=True)
 
 
@@ -761,9 +842,14 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
-    parser.add_argument("--policy", choices=("smolvla", "video_vam"), default="smolvla", help="Model policy")
     parser.add_argument(
-        "--checkpoint", type=str, default=None, help="Custom checkpoint path or 'latest_scale100'"
+        "--policy", choices=("smolvla", "video_vam"), default="video_vam", help="Model policy"
+    )
+    parser.add_argument(
+        "--checkpoint",
+        type=str,
+        default="cosmos3_lora",
+        help="Model alias ('cosmos3_lora', 'cosmos2b_t2_distilled', 'smolvla_v2') or path (default 'cosmos3_lora')",
     )
     parser.add_argument(
         "--port", type=int, default=DEFAULT_PORT, help=f"RPC port on abakus (default {DEFAULT_PORT})"
@@ -779,21 +865,51 @@ def main(argv: list[str] | None = None) -> int:
         "--joint-limits-max", type=float, nargs=6, default=[180.0, 180.0, 180.0, 180.0, 180.0, 100.0]
     )
     parser.add_argument("--max-guidance-weight", type=float, default=10.0)
-    parser.add_argument("--keep-server", action="store_true", help="leave server running in tmux after exit")
+    parser.add_argument(
+        "--keep-server",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="leave server running in tmux after exit for fast subsequent runs (default True)",
+    )
     parser.add_argument("--stop-server", action="store_true", help="stop server even if already running")
     parser.add_argument(
         "--dry-run", action="store_true", help="test RPC connection without connecting motors"
     )
     parser.add_argument("--robot.type", dest="robot_type", default="so101_follower")
     parser.add_argument(
-        "--robot.port", dest="robot_port", default=None, help="Serial port (/dev/tty.usbmodem*)"
+        "--robot.port", dest="robot_port", default=None, help=f"Serial port (default: {DEFAULT_PORT_PATH})"
     )
-    parser.add_argument("--robot.id", dest="robot_id", default="so101")
+    parser.add_argument(
+        "--robot.id",
+        dest="robot_id",
+        default=DEFAULT_ROBOT_ID,
+        help=f"Robot ID (default: {DEFAULT_ROBOT_ID})",
+    )
     parser.add_argument("--robot.use_degrees", dest="robot_use_degrees", type=_bool_arg, default=True)
     parser.add_argument("--robot.cameras", dest="robot_cameras_raw", default=DEFAULT_CAMERAS)
     parser.add_argument("--robot.max_relative_target", dest="robot_max_relative_target_raw", default=None)
     parser.add_argument("--fps", type=int, default=10)
-    parser.add_argument("--duration", type=float, default=30.0)
+    parser.add_argument(
+        "--duration", type=float, default=45.0, help="Rollout duration per episode (default 45s)"
+    )
+    parser.add_argument(
+        "--num-episodes",
+        type=int,
+        default=-1,
+        help="Number of episodes (-1 for continuous loop until Ctrl+C, default -1)",
+    )
+    parser.add_argument(
+        "--reset-time",
+        type=float,
+        default=6.0,
+        help="Pause in seconds between episodes to reset the scene (default 6.0)",
+    )
+    parser.add_argument(
+        "--home-duration",
+        type=float,
+        default=3.5,
+        help="Duration in seconds for smooth transition back to base position (default 3.5)",
+    )
     parser.add_argument("--task", default="take cube out of box")
     parser.add_argument("--strategy.type", dest="strategy_type", default="base")
     parser.add_argument(
@@ -813,8 +929,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--prefetch-steps",
         type=int,
-        default=12,
-        help="Action-queue threshold to trigger background prefetch (default 12)",
+        default=22,
+        help="Action-queue threshold to trigger background prefetch (default 22)",
     )
     parser.add_argument("--feature-seed", type=int, default=0)
     args = parser.parse_args(argv)
@@ -880,17 +996,29 @@ def main(argv: list[str] | None = None) -> int:
     elif args.checkpoint is not None:
         args.resolved_checkpoint = args.checkpoint
     else:
-        args.resolved_checkpoint = (
-            DEFAULT_SMOLVLA_CHECKPOINT if args.policy == "smolvla" else DEFAULT_COSMOS_CHECKPOINT
-        )
+        args.resolved_checkpoint, args.policy = aliases["cosmos3_lora"]
+
+    # Cosmos 2B models require --no-compile to merge LoRA cleanly before execution
+    if "cosmos2b" in args.resolved_checkpoint:
+        args.compile = False
 
     if not args.dry_run:
         if not args.robot_port:
-            raise SystemExit(
-                "Hardware rollout requires --robot.port (e.g. --robot.port=/dev/tty.usbmodemXXXX)"
-            )
+            import glob
+            from pathlib import Path
+
+            if Path(DEFAULT_PORT_PATH).exists():
+                args.robot_port = DEFAULT_PORT_PATH
+            else:
+                detected = sorted(glob.glob("/dev/tty.usbmodem*"))
+                if detected:
+                    args.robot_port = detected[0]
+                else:
+                    raise SystemExit(
+                        "Hardware rollout requires a connected follower robot (/dev/tty.usbmodem*)"
+                    )
         if not args.robot_id:
-            raise SystemExit("Hardware rollout requires --robot.id")
+            args.robot_id = DEFAULT_ROBOT_ID
         if args.robot_max_relative_target_raw:
             args.robot_max_relative_target = _parse_max_relative_target(args.robot_max_relative_target_raw)
         else:
