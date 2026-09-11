@@ -1,195 +1,102 @@
-# AGENTS.md: Developer & Agent Guide for `lerobot-video-vam`
+This file provides guidance to AI agents when working with code in this repository.
 
-This document serves as the **definitive instruction manual, architectural contract, and evaluation guide** for any AI coding agent or engineer working in this repository (`/home/anton/lerobot-video-vam`). All conventions, contracts, and evaluation protocols defined here are strictly binding.
+> **User-facing help → [`AGENT_GUIDE.md`](./AGENT_GUIDE.md)** (SO-101 setup, recording, picking a policy, training duration, eval — with copy-pasteable commands).
 
----
+## Project Overview
 
-## 1. Project Mission & Core Overview
+LeRobot is a PyTorch-based library for real-world robotics, providing datasets, pretrained policies, and tools for training, evaluation, data collection, and robot control. It integrates with Hugging Face Hub for model/dataset sharing.
 
-`lerobot-video-vam` couples generative video diffusion and flow-matching foundation models (Diffusion Transformers / DiTs) with robotics action decoders (specifically SmolVLA / SmolExpert action heads) for physical robot manipulation.
+## Tech Stack
 
-### Supported World Model Backbones
+Python 3.12+ · PyTorch · Hugging Face (datasets, Hub, accelerate) · draccus (config/CLI) · Gymnasium (envs) · uv (package management)
 
-- **NVIDIA Cosmos-Predict2-2B** (Bidirectional DiT with causal video VAE; 4x temporal downsampling)
-- **NVIDIA Cosmos 3 Edge** (3.37B measured dense parameters, 2048 hidden dim, 16 heads, 28 layers, Dual-Pathway MoT)
-- **NVIDIA Cosmos-1.0-Diffusion-7B** (Diffusers 3D DiT)
-- **NVIDIA Cosmos-1.0-Diffusion-14B** (Diffusers DiT with FP8 linear weights & CPU-CUDA block streaming)
-- **Lightricks LTX-Video-2.5-22B** (Distilled DiT + causal 3D VAE)
-- **Black Forest Labs FLUX.2 [klein] 9B** (Multi-reference hybrid double/single-stream DiT)
-
-### Primary Benchmark
-
-- **Standard Dataset**: `hubnemo/cube_out_of_box_dataset` (SO-101 robotic arm, 6-DoF, 40 episodes, 6,536 frames at 10 FPS, revision `243370c3c08bcbd860133c4a0d658ea7c1d2e77e`).
-- **Scaling Dataset**: `Orellius/cube_out_of_box_v2` (100 episodes, 12,163 frames).
-
----
-
-## 2. Tech Stack & Environment Commands
-
-- **Environment**: Python 3.12+, PyTorch 2.x, CUDA (BF16 / FP8 support).
-- **Packaging**: Managed strictly with [`uv`](https://github.com/astral-sh/uv). Always prefix commands with `uv run`.
+## Development Setup
 
 ```bash
-# Environment sync
-uv sync --locked --extra test --extra dev   # Base + testing + dev tools
-uv sync --locked --extra all                # Full dependency suite
-
-# Testing
-uv run pytest tests/policies/test_vam_base_abstractions.py -svv   # Base abstraction test suite
-uv run pytest tests/policies/test_cosmos3_features.py -svv        # Cosmos 3 feature test suite
-uv run pytest tests/policies/test_cosmos3_lora.py -svv            # Cosmos 3 LoRA test suite
-uv run pytest tests -svv --maxfail=10                              # Unit test suite
-
-# Formatting and Linting
-uv run pre-commit run --all-files
+uv sync --locked                            # Base dependencies
+uv sync --locked --extra test --extra dev   # Test + dev tools
+uv sync --locked --extra all                # Everything
+git lfs install && git lfs pull             # Test artifacts
 ```
 
----
-
-## 3. System Architecture & Base Abstractions (`src/lerobot/policies/vam/base/`)
-
-All Video Action Model (VAM) components must inherit from and conform to the standardized abstractions in `src/lerobot/policies/vam/base/`.
-
-### 3.1 `BaseVAMExtractor` (`src/lerobot/policies/vam/base/extractor.py`)
-
-#### Core Contract Guarantees:
-
-1. **True VAE Latent Encoding**:
-   Subclasses must implement `encode_latents(rgb_frames: Tensor) -> Tensor`. RGB inputs `[B, 3, T, H, W]` must pass through the backbone's true VAE (e.g. `AutoencoderKLCosmos` or LTX causal VAE).
-   - **STRICT PROHIBITION**: Heuristic spatial downsampling or bilinear mock padding (e.g. `F.interpolate(..., size=(32,32))` zero-padded to 16 channels) is **strictly forbidden**. It bypasses the latent representation space and raises `VAEContractViolationError`.
-   - **Architectural Reality**: Base abstractions alone do **not** magically ensure correctness; each concrete child extractor must correctly invoke its native VAE, apply per-channel latent normalization, and respect posterior modes.
-2. **Intermediate Block Tapping**:
-   Subclasses must implement `forward_transformer_blocks(latents, text_conditioning, timestep) -> dict[int, Tensor]` to return tapped hidden representations keyed by layer index.
-3. **Standardized 3D Spatiotemporal Grid & Pooling**:
-   `BaseVAMExtractor.extract()` automatically executes:
-   - Latent encoding via true VAE.
-   - Transformer forward pass through targeted layers.
-   - Spatiotemporal 3D grid alignment via `compute_grid_shape(latents)`.
-   - Spatial token pooling via `pool_spatial_tokens(flat_tokens, grid_shape, factor)`.
-   - 3D grid coordinate calculation `compute_3d_grid_coordinates(grid_shape, batch_size)`.
-4. **Unified Output Container**:
-   Returns `VAMExtractionOutput` containing `features`, `features_by_layer`, `grid_coords`, `grid_shape`, and `provenance`.
-
----
-
-### 3.2 `BaseLoRALinear` & Video-LoRA (`src/lerobot/policies/vam/base/lora.py`)
-
-Unified parameter-efficient fine-tuning (PEFT) framework:
-
-- Formulated as $y = W_{\text{base}} x + \frac{\alpha}{r} (B \cdot A) x$ with $B=0$ at initialization.
-- Fully compatible with FP32, BF16, and FP8 (`torch.float8_e4m3fn`) linear base weights.
-
----
-
-### 3.3 Protocol Split Guard (`src/lerobot/policies/vam/base/split_guard.py`)
-
-- Verifies that train and validation episode sets are **strictly disjoint**.
-- Validates that manifests comply with episode boundaries.
-- Blocks execution if in-memory frame-level random splitting is detected.
-
----
-
-## 4. Strict Protocol 1.0 Evaluation Rules
-
-### 4.1 Prohibition of Frame-Level Random Splits
-
-> **CRITICAL RULE**: **NEVER** use `torch.utils.data.random_split` or frame-level random splitting across robotic trajectory datasets.
-
-In demonstration datasets, extraction at stride 3 produces temporally adjacent observation windows (e.g. frame $t$ and frame $t+3$, separated by only 300 ms). Splitting frames randomly between training and validation allows trivial trajectory memorization rather than testing out-of-distribution physical generalization. Historical runs that used random frame splits reported artificial numbers (9.46°–10.99°) and are permanently retracted.
-
-### 4.2 Canonical Protocol 1.0 Specification
-
-- **Training Set**: Strictly **Episodes 0 to 31** (32 demonstrations, ~1,572 extraction windows at stride 3).
-- **Validation Set**: Strictly **Episodes 32 to 39** (8 held-out demonstrations, exactly 88 fixed validation anchors at stride 20).
-- **Dataset Shift**: Episodes 32–39 exhibit an operator/setup changepoint (+19.96° on Joint 2, -29.47° on Joint 3). True generalizable models must bridge this shift.
-
----
-
-## 5. Standard CLI Conventions
-
-### 5.1 Standard Extraction: `build_vam_feature_cache.py`
+## Key Commands
 
 ```bash
-uv run python scripts/video_vam/build_vam_feature_cache.py \
-    --backbone cosmos14b \
-    --checkpoint-path /home/anton/.cache/video-vam/cosmos-14b \
-    --dataset-repo-id hubnemo/cube_out_of_box_dataset \
-    --train-episodes 0-31 \
-    --val-episodes 32-39 \
-    --train-stride 3 \
-    --val-stride 20 \
-    --pool-spatial 2 \
-    --output-dir /home/anton/.cache/video-vam/features/cosmos14b_protocol1
+uv run pytest tests -svv --maxfail=10                 # All tests
+DEVICE=cuda make test-end-to-end                      # All E2E tests
+pre-commit run --all-files                           # Lint + format (ruff, typos, bandit, etc.)
 ```
 
-_(Note: Always use `--dataset-repo-id` as the canonical CLI argument)._
+## Architecture (`src/lerobot/`)
 
-### 5.2 Standard Training: `train_smolexpert.py`
+- **`scripts/`** — CLI entry points (`lerobot-train`, `lerobot-eval`, `lerobot-record`, etc.), mapped in `pyproject.toml [project.scripts]`.
+- **`configs/`** — Dataclass configs parsed by draccus. `train.py` has `TrainPipelineConfig` (top-level). `policies.py` has `PreTrainedConfig` base. Polymorphism via `draccus.ChoiceRegistry` with `@register_subclass("name")` decorators.
+- **`policies/`** — Each policy in its own subdir. All inherit `PreTrainedPolicy` (`nn.Module` + `HubMixin`) from `pretrained.py`. Factory with lazy imports in `factory.py`.
+- **`processor/`** — Data transformation pipeline. `ProcessorStep` base with registry. `DataProcessorPipeline` / `PolicyProcessorPipeline` chain steps.
+- **`datasets/`** — `LeRobotDataset` (episode-aware sampling + video decoding) and `LeRobotDatasetMetadata`.
+- **`envs/`** — `EnvConfig` base in `configs.py`, factory in `factory.py`. Each env subclass defines `gym_kwargs` and `create_envs()`.
+- **`robots/`, `motors/`, `cameras/`, `teleoperators/`** — Hardware abstraction layers.
+- **`types.py`** and **`configs/types.py`** — Core type aliases and feature type definitions.
 
-```bash
-uv run python scripts/video_vam/train_smolexpert.py \
-    --backbone cosmos14b \
-    --train-manifest /home/anton/.cache/video-vam/features/cosmos14b_protocol1/train/manifest.json \
-    --val-manifest /home/anton/.cache/video-vam/features/cosmos14b_protocol1/val/manifest.json \
-    --context-transform auto \
-    --batch-size 8 \
-    --grad-accum-steps 1 \
-    --lr 1e-4 \
-    --lr-scheduler cosine \
-    --warmup-steps 1000 \
-    --patience 20 \
-    --val-every 1000 \
-    --max-steps 50000 \
-    --output-dir /home/anton/.cache/video-vam/runs/smolexpert-cosmos14b
-```
+## Repository Structure (outside `src/`)
 
-### 5.3 Action Masking (`action_is_pad`) & Normalization
+- **`tests/`** — Pytest suite organized by module. Fixtures in `tests/fixtures/`, mocks in `tests/mocks/`. Hardware tests use skip decorators from `tests/utils.py`. E2E tests via `Makefile` write to `tests/outputs/`.
+- **`.github/workflows/`** — CI: `quality.yml` (pre-commit), `fast_tests.yml` (base deps, every PR), `full_tests.yml` (all extras + E2E + GPU, post-approval), `latest_deps_tests.yml` (daily lockfile upgrade), `security.yml` (TruffleHog), `release.yml` (PyPI publish on tags).
+- **`docs/source/`** — HF documentation (`.mdx` files). Per-policy READMEs, hardware guides, tutorials. Built separately via `docs-requirements.txt` and CI workflows.
+- **`examples/`** — End-user tutorials and scripts organized by use case (dataset creation, training, hardware setup).
+- **`docker/`** — Dockerfiles for user (`Dockerfile.user`) and CI (`Dockerfile.internal`).
+- **`benchmarks/`** — Performance benchmarking scripts.
+- **Root files**: `pyproject.toml` (single source of truth for deps, build, tool config), `Makefile` (E2E test targets), `uv.lock`, `CONTRIBUTING.md` & `README.md` (general information).
 
-1. **Normalizer Derivation**: `SmolVLANormalizer` must be computed strictly from unpadded actions in training episodes (0–31). Validation episodes must never contaminate normalizer statistics.
-2. **Loss & Metric Masking**: Flow-matching loss and evaluation RMSE must strictly mask padded tokens (`valid = ~paddings`). Padded tokens contribute zero error and zero denominator weight.
+## Notes
 
----
-
-## 6. Evaluation Rigor & Metric Reporting
-
-### 6.1 Standard Metrics
-
-All action errors are reported in the benchmark's **mixed-unit aggregate convention**:
-
-- Dimensions 0–4 (Arm Joints 1–5): Physical degrees ($^\circ$).
-- Dimension 5 (Gripper): Stored percentage / position ($[0, 100]$).
-
-| Metric                 | Definition                                                                         | Purpose                                 |
-| :--------------------- | :--------------------------------------------------------------------------------- | :-------------------------------------- |
-| **Full-30 Mixed RMSE** | Global RMSE across all valid scalar positions over 30 steps (offsets $0 \dots 29$) | Primary rank metric                     |
-| **H1 RMSE**            | RMSE at immediate step offset 0 ($t$)                                              | Measures single-step reactive precision |
-| **First-5 RMSE**       | Mean RMSE across offsets $0 \dots 4$ ($t \dots t+4$, first 500 ms)                 | Measures trajectory smoothness          |
-| **Per-Joint RMSE**     | Individual RMSE values for each of the 6 robot DoFs                                | Identifies specific joint regressions   |
-
-### 6.2 Evaluation Invariants
-
-- **Per-Sample Seed Batch Invariance**: Each sample receives a deterministic seed derived via stable hash `int(hashlib.sha256(f"{evaluation_seed}:{sample_id}".encode()).hexdigest()[:8], 16) % (2**31 - 1)`. Output is invariant to batch size.
-- **Global Error Summation**: Accumulate squared errors globally across the entire evaluation set before taking the square root. **Never average per-batch RMSEs**.
-- **Optimizer Step Alignment**: Learning rate warmup and early stopping count actual optimizer steps when gradient accumulation is used.
-- **Fail-Closed Validation**: Reject manifests with mismatched dataset revision hashes or overlapping episode splits.
-- **Actual Checkpoint Resume**: Resume operations must restore full optimizer, scheduler, and step states.
+- **Mypy is gradual**: strict only for `lerobot.envs`, `lerobot.configs`, `lerobot.optim`, `lerobot.model`, `lerobot.cameras`, `lerobot.motors`, `lerobot.transport`. Add type annotations when modifying these modules.
+- **Imports**: prefer top-level imports; relative (`from .sibling import X`) across sibling files within a module, absolute (`from lerobot.module import X`) across modules.
+- **Optional dependencies**: many policies, envs, and robots are behind extras (e.g., `lerobot[aloha]`, see `pyproject.toml`). Guard optional imports with `TYPE_CHECKING or _foo_available` at module top + a `require_package(...)` check at use time. Reuse the `_foo_available` flags in `utils/import_utils.py`; don't call `is_package_available`.
+- **Video decoding**: datasets can store observations as video files. `LeRobotDataset` handles frame extraction, but tests need ffmpeg installed.
+- **Prioritize use of `uv run`** to execute Python commands (not raw `python` or `pip`).
 
 ---
 
-## 7. Core Documentation References
+## Agent Delegation & Model Conventions
 
-- **`docs/video_vam_roadmap.md`**: Strategic priorities, research bets, and execution roadmap.
-- **`docs/video_vam_correctness_audit.md`**: Authoritative source of truth for bugs, data leakage, VAE bypasses, and validation integrity.
-- **`docs/video_vam_action_rmse_protocol.md`**: Frozen Protocol 1.0 metrics, horizons, and evaluation equations.
-- **`docs/video_vam_cube_out_of_box_leaderboard.md`**: Append-only results ledger with explicit retraction annotations.
-- **`docs/video_vam_technical_report.md`**: Deep-dive technical synthesis of world models for physical robot control.
-- **`docs/video_vam_research_diary.md`**: Historical research log.
+Parent-model tokens should be used primarily for judgment, architecture, and review.
+
+- **Subagent Model**: Always use **Gemini 3.8 Flash** as the subagent model.
+- **Exploration (Parallel)**: Delegate broad codebase exploration to one or more parallel explore subagents. Provide precise briefs requesting relevant paths, symbols, data flows, and constraints.
+- **Design & Architecture**: Decide the solution at the orchestrator/parent level. Define affected files, interfaces, behavior, and invariants.
+- **Implementation**: Delegate multi-file or substantial edits with an explicit implementation specification. Review the resulting diff and resume the same subagent for corrections.
+- **Small Changes**: Make trivial, low-risk edits directly when delegation overhead is greater than the work.
+- **Keep Output Concise**: Keep user-facing messages compact and outcome-first. Do not paste entire files or redundant command outputs.
 
 ---
 
-## 8. Rules of Engagement for Coding Agents
+## Search & Tool Discipline
 
-1. **Do Not Reintroduce Pseudo-Latents or Frame Splits**: Never use `F.interpolate` mocks or `torch.utils.data.random_split`.
-2. **Preserve Historical Integrity**: Never delete historical ledger entries; annotate invalid runs with clear retraction notices.
-3. **Verify via Tests**: Run `uv run pytest tests/policies/test_vam_base_abstractions.py` and component tests before declaring edits complete.
-4. **No Unverified Claims**: Do not invent test pass counts or benchmark numbers.
+- **Bounded Searches**: When using `grep`, **ALWAYS** provide `include_pattern` (e.g. `src/lerobot/**/*.py`, `tests/**/*.py`). Never run unbounded regex searches across the entire repo for generic terms.
+- Prefer `find_path` for locating files by filename before searching file contents.
+- Delegate broad, exploratory searches to an exploration subagent so raw tool matches do not flood the primary context window.
+
+---
+
+## Scope & Autonomy
+
+- Implement explicit, low-risk requests completely without unnecessary confirmation.
+- Ask questions only when ambiguity materially affects behavior, scope, robot hardware safety, or destructive actions.
+- Use the minimal viable interpretation when ambiguity is minor.
+
+---
+
+## Communication Modes
+
+If user prompt ends with:
+
+- `GATHER`: Gather information only. Use explore subagents for broad investigation. Report relevant files, symbols, flows, and conventions. Do not recommend or implement a solution.
+- `EXECUTE`: Provide a short list of possible approaches. Briefly elaborate the three strongest options. Select one and proceed when the choice is clear; ask only if the decision is materially the user's to make.
+
+---
+
+## Git Hygiene
+
+- **Branches**: New branch names use `feat-ABC` or `fix-ABC` (avoid slashes if possible).
+- **Commits**: Never amend commits; create follow-up commits. Do not commit or push unless explicitly requested.

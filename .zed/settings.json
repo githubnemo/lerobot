@@ -1,0 +1,148 @@
+{
+  "agent": {
+    "default_model": {
+      "provider": "google",
+      "model": "gemini-3.8-flash",
+      "enable_thinking": true
+    },
+    "favorite_models": [
+      {
+        "provider": "google",
+        "model": "gemini-3.8-flash"
+      },
+      {
+        "provider": "Azure",
+        "model": "gpt-6-astra",
+        "enable_thinking": true,
+        "effort": "high"
+      }
+    ],
+    "auto_compact": {
+      "enabled": true,
+      "threshold": "80%"
+    },
+    "compaction_model": {
+      "provider": "google",
+      "model": "gemini-3.7-flash"
+    }
+  },
+  "language_models": {
+    "google": {
+      "available_models": [
+        {
+          "name": "gemini-3.8-flash",
+          "display_name": "Gemini 3.8 Flash",
+          "max_tokens": 1048576,
+          "mode": {
+            "type": "thinking"
+          }
+        },
+        {
+          "name": "gemini-3.7-flash",
+          "display_name": "Gemini 3.7 Flash",
+          "max_tokens": 1048576,
+          "mode": {
+            "type": "thinking"
+          }
+        }
+      ]
+    },
+    "openai_compatible": {
+      "Azure": {
+        "api_url": "https://dev-collaido-openai.openai.azure.com/openai/responses?api-version=2025-04-01-preview#azure",
+        "available_models": [
+          {
+            "name": "gpt-6-astra",
+            "display_name": "GPT-6 Astra",
+            "max_tokens": 1000000,
+            "max_output_tokens": 128000,
+            "reasoning_effort": "medium",
+            "capabilities": {
+              "chat_completions": false,
+              "tools": true,
+              "images": false,
+              "parallel_tool_calls": true,
+              "prompt_cache_key": false,
+              "interleaved_reasoning": false,
+              "max_tokens_parameter": false
+            }
+          }
+        ]
+      }
+    }
+  },
+  "context_servers": {
+    "google-search": {
+      "command": "node",
+      "args": [
+        "--env-file=.env",
+        "-e",
+        "import(\"child_process\").then(cp => cp.spawn(\"npx\", [\"-y\", \"@kybrcore/gemini-search-mcp\"], { stdio: \"inherit\", env: process.env }))"
+      ]
+    },
+    "context7-docs": {
+      "command": "bunx",
+      "args": [
+        "--bun",
+        "@upstash/context7-mcp"
+      ]
+    },
+    "sequential-thinking": {
+      "command": "bunx",
+      "args": [
+        "--bun",
+        "@modelcontextprotocol/server-sequential-thinking"
+      ]
+    },
+    "memory-graph": {
+      "command": "bunx",
+      "args": [
+        "--bun",
+        "@modelcontextprotocol/server-memory"
+      ]
+    },
+    "ripgrep": {
+      "command": "bunx",
+      "args": [
+        "--bun",
+        "mcp-ripgrep"
+      ]
+    }
+  },
+  "file_scan_exclusions": [
+    "**/.git",
+    "**/.venv",
+    "**/node_modules",
+    "**/worktrees",
+    "**/.pytest_cache",
+    "**/.ruff_cache",
+    "**/public_test_data",
+    "**/video-vam-previews",
+    "**/videos",
+    "**/dist",
+    "**/build",
+    "**/*.map",
+    "**/*.min.js",
+    "**/*.min.css",
+    "**/*.parquet",
+    "**/*.pkl",
+    "**/*.onnx*",
+    "**/cache/**",
+    "**/.cache/**",
+    "**/dashboard_data/**",
+    "**/output/**",
+    "**/test-results/**"
+  ],
+  "lsp": {
+    "basedpyright": {
+      "settings": {
+        "basedpyright": {
+          "analysis": {
+            "diagnosticMode": "openFilesOnly",
+            "autoSearchPaths": false
+          }
+        }
+      }
+    }
+  }
+}

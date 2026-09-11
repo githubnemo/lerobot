@@ -50,7 +50,6 @@ import uuid
 import warnings
 from collections import deque
 from concurrent.futures import Future, ThreadPoolExecutor
-from io import BytesIO
 from typing import Any
 
 import torch
@@ -107,9 +106,11 @@ SSH_OPTIONS = [
     "-o",
     "ConnectTimeout=10",
     "-o",
-    "ControlMaster=no",
+    "ControlMaster=auto",
     "-o",
-    "ControlPath=none",
+    "ControlPersist=10m",
+    "-o",
+    "ControlPath=/tmp/ssh_mux_%h_%p_%r",
 ]
 MANAGED_OWNER = "lerobot-video-vam-rpc-v2"
 
@@ -388,9 +389,15 @@ class VideoVAMRPCClient:
 
     @staticmethod
     def _png_b64(frame: Any) -> str:
-        stream = BytesIO()
-        frame.save(stream, format="PNG")
-        return base64.b64encode(stream.getvalue()).decode("ascii")
+        import cv2
+        import numpy as np
+
+        arr = frame if isinstance(frame, np.ndarray) else np.array(frame)
+        bgr = cv2.cvtColor(arr, cv2.COLOR_RGB2BGR) if arr.ndim == 3 and arr.shape[2] == 3 else arr
+        success, enc = cv2.imencode(".jpg", bgr, [cv2.IMWRITE_JPEG_QUALITY, 95])
+        if not success:
+            raise RuntimeError("Failed to encode frame to JPEG")
+        return base64.b64encode(enc).decode("ascii")
 
     def remember(self, frame: Any, *, timestamp: float | None = None) -> None:
         self.frames.append(self._image(frame))
@@ -654,6 +661,8 @@ def _run_rollout(args: argparse.Namespace, client: VideoVAMRPCClient) -> None:
     running = False
     lower = torch.tensor(args.joint_limits_min)
     upper = torch.tensor(args.joint_limits_max)
+    last_action = None
+    starved_ticks = 0
     try:
         # Do not open an interactive calibration workflow from an autonomous launcher.
         if not robot.calibration:
@@ -679,6 +688,7 @@ def _run_rollout(args: argparse.Namespace, client: VideoVAMRPCClient) -> None:
                 result = future.result()
                 original, actions = _chunks_from_result(result, horizon)
                 latency = time.monotonic() - started
+                print(f"[RPC] Chunk received: {latency:.3f}s (phase: {phase}, queue: {queue.qsize()})")
                 future = None
                 if phase == "warmup":
                     # Compilation latency is not a runtime estimate; request a fresh observation next.
@@ -690,8 +700,9 @@ def _run_rollout(args: argparse.Namespace, client: VideoVAMRPCClient) -> None:
                     if delay >= horizon:
                         raise RuntimeError("Inference exceeded the action horizon")
                     queue.merge(original, actions, delay)
-                    latencies.add(latency)
-                    if not running:
+                    if running:
+                        latencies.add(latency)
+                    else:
                         running = True
                         phase = "running"
                         deadline = time.monotonic() + args.duration
@@ -717,15 +728,21 @@ def _run_rollout(args: argparse.Namespace, client: VideoVAMRPCClient) -> None:
                     future = executor.submit(client.request, snapshot)
             step = queue.get() if running else None
             if step is not None:
+                starved_ticks = 0
                 action = _chunk_to_action(step.tolist())
                 sent = robot.send_action(action)
+                last_action = action
                 actual = _finite_state([sent[name] for name in ACTION_NAMES])
                 if max(abs(a - b) for a, b in zip(actual, step.tolist(), strict=True)) > 1e-3:
                     raise RuntimeError("Robot safety limiter clipped a command; stopping rollout")
             elif running and rtc:
-                raise RuntimeError(
-                    "RTC action queue exhausted; stopping instead of retrying stale observations"
-                )
+                if future is not None and starved_ticks < 15 and last_action is not None:
+                    starved_ticks += 1
+                    robot.send_action(last_action)
+                else:
+                    raise RuntimeError(
+                        "RTC action queue exhausted; stopping instead of retrying stale observations"
+                    )
             next_tick = _next_tick(next_tick, time.monotonic(), period)
             _sleep_until(min(next_tick, deadline))
         if not running:
