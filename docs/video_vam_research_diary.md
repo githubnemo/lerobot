@@ -1977,3 +1977,33 @@ The codebase is being updated to enforce:
   2. Teacher unpooled `cond_frames` target extraction & T=2 direct distillation.
   3. Distilled T=2 feature cache extraction & SmolExpert training.
   4. Standard Protocol 1.0 evaluation and verified artifact preservation.
+
+---
+
+## 2026-09-11 — Physical Robot Evaluation, Visual Covariate Shift & Online Coherent Data Augmentation
+
+### 1. Physical Hardware Evaluation (SO-101 on `cube_out_of_box`)
+
+- **Policies Tested**: Cosmos 3 Edge Video-LoRA (~80 ms), Cosmos 2B (=2$ distilled / undistilled), and SmolVLA (v1 and v2) via client-server SSH RPC with Real-Time Chunking (RTC) at 10 Hz.
+- **Hardware Observations**:
+  - The client-server RPC loop and 10 Hz RTC execution streamed smoothly without software failure.
+  - **Cosmos 3 Edge Video-LoRA** demonstrated the best qualitative trajectory behavior and lowest offline loss, moving closest to the target.
+  - **Failure Mode**: None of the policies achieved a reliable physical grasp. The primary failure cause was severe **visual covariate shift** between demonstration recording conditions and live testing (ambient room lighting, shadows, and subtle camera mounting angle differences).
+  - **Root Cause**: Offline caching with stride 3 discarded 67% of temporal demonstration frames and prevented any dynamic visual data augmentations during training.
+
+### 2. Strategy: Online Video Extraction with Coherent Data Augmentation
+
+- **Hypothesis**: Training SmolExpert on raw, dynamically augmented video frames with stride 1 (9,122 consecutive 5-frame temporal windows) will make the policy invariant to lighting, shadow, and camera angle offsets.
+- **Augmentation Pipeline**:
+  - Applied on GPU per 5-frame window 0$:
+    - Photometric jitter: Random brightness ($\pm 15\%$), contrast ($\pm 15\%$), saturation ($\pm 15\%$), subtle hue ($\pm 5\%$).
+    - Spatial crop/translation: Random 4–6% resized crop simulating camera mounting offsets.
+    - Sensor noise: Mild Gaussian blur ($\sigma \in [0.1, 0.8]$).
+  - **Critical Invariant**: Augmentations are applied **identically across all =5$ frames** within each temporal window to preserve physical and temporal coherence.
+  - **Clean Benchmark Safeguard**: Validation and evaluation splits (Eval-1: 32–39, Eval-2: 90–99) remain **strictly unaugmented** for untainted, comparable benchmark tracking.
+
+### 3. Next Steps & Execution Sequence
+
+1. **Active Run**: Training Cosmos 3 Edge Video-LoRA online with augmentations on Scale-100 (`Orellius/cube_out_of_box_v2`, stride 1) to measure validation loss/RMSE impact against offline baselines.
+2. **Follow-up Run**: Train the identical online data augmentation recipe on the cleaner historical V1 dataset (`hubnemo/cube_out_of_box_dataset`, episodes 0–31).
+3. **Outcome**: Produces two robust, visually augmented candidate policies for the next physical robot testing session.
