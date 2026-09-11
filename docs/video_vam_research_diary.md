@@ -1,11 +1,17 @@
+# Current correction status — 2026-09-07
+
+The native-path and evaluation repairs are under integration validation; no corrected performance numbers exist yet. See [roadmap](video_vam_roadmap.md), [audit](video_vam_correctness_audit.md), and [metric/sampling revisions](video_vam_action_rmse_protocol.md). Historical claims below must be interpreted with those corrections. In particular, operator/calibration causation is unproven, auxiliary-head low cosine is not proof of lost information, and the 26.12 comparison is not an isolated Video-LoRA effect.
+
 # Video Foundation Models as Robot-Policy Backbones
 
-> **Strategic Living Roadmap**: See [`VIDEO_VAM_ROADMAP.md`](VIDEO_VAM_ROADMAP.md) for the active project status, complete benchmark scoreboard, and forward execution phases.
+> **Strategic Living Roadmap**: See [`video_vam_roadmap.md`](video_vam_roadmap.md) for the active project status, complete benchmark scoreboard, and forward execution phases.
 
-## Executive Status & Latest Breakthroughs (Updated: 2026-09-02)
+## Historical executive summary (2026-09-02; superseded)
+
+See the roadmap and correctness audit for current status. Claims below are preserved as history, not current conclusions.
 
 - **Direct Representation Distillation Milestone**: Direct $T=16 \to T=2$ Layer-20 manifold distillation reached **`13.15°`** validation RMSE at **~204 ms**, beating the undistilled baseline (**13.74°**) and matching the full $T=16$ teacher (**13.06°**) within **0.09°**.
-- **Theoretical Oracle Ceiling Established**: Training directly on teacher $T=16$ `cond_frames` reached **`13.08°`**. The distilled model captures **98.9%** of the theoretical ceiling.
+- **RETRACTED interpretation — theoretical ceiling/98.9%:** Training directly on teacher $T=16$ `cond_frames` reached **`13.08°`**. The distilled model captures **98.9%** of the theoretical ceiling.
 - **Root-Cause Flaws Resolved**: Fixed a 4-frame temporal lag in data loading; identified that auxiliary linear projection heads scramble internal latent features ($\text{CosSim} = 0.28$ without head vs. $0.97$ with direct distillation).
 - **Active Job on `abakus`**: `cosmos3-edge-pipeline-20260902` is running the complete benchmark pipeline for NVIDIA's newly released **`Cosmos3-Edge`** (~4B parameters, Wan 2.2 VAE).
 
@@ -1744,7 +1750,7 @@ To determine the theoretical upper bound of 2-frame representation distillation,
 - **Oracle Validation RMSE**: **`13.08°`** (Step 17,000).
 - **Oracle H1 RMSE**: **`4.97°`**.
 - **Oracle First-5 Mean RMSE**: **`6.40°`**.
-- **Conclusion**: The theoretical ceiling of any 2-frame representation distilled from $T=16$ is **`13.08°`**. Our Direct Distilled student model reached **`13.15°`**, extracting **`98.9%`** of the maximum possible representation value from the teacher while running in real-time (~204 ms).
+- **RETRACTED conclusion (2026-09-07: empirical reference, not a ceiling; 89.4% gap closure, not 98.9%)**: The theoretical ceiling of any 2-frame representation distilled from $T=16$ is **`13.08°`**. Our Direct Distilled student model reached **`13.15°`**, extracting **`98.9%`** of the maximum possible representation value from the teacher while running in real-time (~204 ms).
 
 | Model / Paradigm                          | Inference Latency | Tokens to Policy                 | Representation MSE / CosSim | Action RMSE (Validation) | H1 (Immediate Action) |
 | :---------------------------------------- | :---------------- | :------------------------------- | :-------------------------- | :----------------------- | :-------------------- |
@@ -1791,7 +1797,7 @@ The pure 600 vision token benchmark (`cosmos3-edge-pure600-smolexpert-20260903`)
 
 ### 1. Motivation & Technical Strategy
 
-- In Cosmos 2B, base representations achieved ~26 deg RMSE without adaptation, but dropped to 13.06 deg once adapted via Video LoRA on the SO-100 cube_out_of_box task.
+- **Superseded comparison:** In Cosmos 2B, base representations achieved ~26 deg RMSE without adaptation, but dropped to 13.06 deg once adapted via Video LoRA on the SO-100 cube_out_of_box task.
 - For Cosmos 3 Edge (3.37B), zero-shot representations already hit 14.26 deg with pure 600 vision tokens at 91.99 ms. Adapting the spatiotemporal world model with Video LoRA directly on robot demonstration videos targets closing the gap to the 13.06 deg gold standard.
 - Architectural LoRA Design:
   - Model: nvidia/Cosmos3-Edge (28 blocks, hidden 2048, 16 attention heads, Wan 2.2 VAE).
@@ -1812,3 +1818,162 @@ The pure 600 vision token benchmark (`cosmos3-edge-pure600-smolexpert-20260903`)
 - Active tmux session: cosmos3-edge-lora-pipeline-20260903
 - Script: scripts/video_vam/run_cosmos3_edge_lora_pipeline.sh
 - Master log: /home/anton/.cache/video-vam/runs/cosmos3-edge-adapted-pipeline-20260903.log
+
+## 2026-09-06 — Cosmos 14B End-to-End True Convergence & Quantized Video-LoRA Pipeline
+
+### 1. Cosmos 14B Base SmolExpert Training to True Convergence
+
+The initial run on Cosmos 14B Base features terminated prematurely at 8,000 steps due to overly aggressive early stopping (patience=8, 9.97°).
+Retraining with learning rate `3e-5`, cosine decay schedule with warmup, and robust patience (60 evaluations with eval_interval=500, min_steps=20,000) achieved true convergence at Step 8,500:
+
+- **Validation RMSE**: **`10.99°`**
+- **Horizon-1 (H1)**: **`4.67°`**
+- **First-5 Actions Mean**: **`6.42°`**
+- **Wall Clock**: 40.2 minutes
+
+### 2. Cosmos 14B Quantized Video-LoRA (FP8 QLoRA on Single 24GB RTX 4090)
+
+Implemented memory-efficient Quantized LoRA (`Cosmos14BQuantizedLoRALinear`) on Cosmos-1.0-Diffusion-14B (14.25B parameters):
+
+- **Weight Quantization**: Base linear projections converted to `torch.float8_e4m3fn` (14.25 GB model weight footprint).
+- **Target Modules**: Injected trainable low-rank adapters (`lora_A` and `lora_B`, rank 16, alpha 16.0) into `to_q`, `to_k`, `to_v`, `to_out.0` across all 36 transformer blocks (288 adapter modules, 42.4M trainable parameters).
+- **VRAM Footprint**: Gradient checkpointing across all 36 blocks bounded peak allocation to **14.55 GB**, comfortably inside the 24 GB VRAM limit of the NVIDIA RTX 4090.
+- **Training Speed**: Achieved ~2.5 steps/s (~0.39 s/step) in bfloat16 on robot demonstration video clips.
+
+### 3. Feature Extraction on Adapted 14B LoRA & Downstream Policy Training
+
+Extracted adapted spatiotemporal representations from Layers 18 and 30 across the full dataset with 2x2 spatial average pooling and concatenation (10,240-dim representation) into `/home/anton/.cache/video-vam/cosmos14b-adapted-features`.
+SmolExpert training on the adapted 14B features converged at Step 41,000:
+
+- **Adapted Validation RMSE**: **`11.08°`**
+- **Immediate Action Precision (H1)**: **`4.63°`**
+- **First-5 Actions Mean RMSE**: **`6.58°`**
+- **Wall Clock**: 64.1 minutes
+
+## 2026-09-06 — Architectural Refactoring Phases 3 & 4: BaseVAMExtractor Migration & Protocol 1.0 Clean Re-Benchmarking
+
+### 1. Root-Cause Remediation & Extractor Unification (Phase 3)
+
+Following the architectural audit (`docs/ARCHITECTURAL_AUDIT_AND_ABSTRACTIONS.md`), all feature extractors have been migrated to the standardized abstract contract:
+
+- **BaseVAMExtractor Integration**:
+  - `Cosmos7BExtractor` (`src/lerobot/policies/vam/cosmos7b_extractor.py`) inherits from `BaseVAMExtractor`, implements `encode_latents` (connecting real `AutoencoderKLCosmos`), `forward_transformer_blocks`, `compute_grid_shape`, and returns `Cosmos7BExtractionOutput` (subclass of `VAMExtractionOutput`).
+  - `Cosmos14BExtractor` (`src/lerobot/policies/vam/cosmos14b_extractor.py`) inherits from `BaseVAMExtractor`, implements real VAE encoding with 17-channel padding support, FP8 quantized linear layers, and CPU-CUDA block streaming.
+  - `Flux2KleinExtractor` (`src/lerobot/policies/vam/flux2_klein_extractor.py`) inherits from `BaseVAMExtractor`, implementing multi-reference conditioning across observation history and goal tokens.
+- **Unified Cache Builder (`scripts/video_vam/build_vam_feature_cache.py`)**:
+  - Replaces all legacy ad-hoc extraction scripts with a single unified CLI builder.
+  - Enforces `enforce_protocol_1_0_split` to prevent train/val leakage at invocation time.
+  - Replaces heuristic bilinear downsampling with causal VAE latent representations.
+  - Persists `action_is_pad`, `state`, and 30-step `target_action` along with SHA-256 digests in standardized `manifest.json` schemas.
+
+### 2. Protocol 1.0 Feature Cache Generation
+
+Extracted clean, disjoint Protocol 1.0 caches on NVIDIA RTX 4090:
+
+- **Cosmos 7B Protocol 1.0 Cache** (`/home/anton/.cache/video-vam/cosmos7b-protocol1-cache`):
+  - Train: Episodes 0–31 (stride 3, 1,572 samples, 64 tokens, 8,192-dim).
+  - Validation: Episodes 32–39 (stride 20, exactly 88 held-out validation anchors across the session regime shift).
+  - Wall Clock: 124.5s train + 6.9s val (total 131.4s at ~12.6 samples/s).
+- **FLUX.2 [klein] Protocol 1.0 Cache** (`/home/anton/.cache/video-vam/flux2-klein-protocol1-cache`):
+  - Train: Episodes 0–31 (stride 3, 1,572 samples, 256 visual tokens, 6,144-dim).
+  - Validation: Episodes 32–39 (stride 20, 88 held-out validation anchors).
+  - Wall Clock: 90.1s train + 5.1s val (total 95.2s at ~17.4 samples/s).
+
+### 3. Launch & Execution of the Protocol 1.0 Re-Benchmarking Queue (Phase 4)
+
+- **Persistent Tmux Session**: `rebenchmark_protocol1_queue` running `scripts/video_vam/run_rebenchmark_queue_protocol1.sh`.
+- **Master Log**: `/home/anton/.cache/video-vam/runs/rebenchmark_queue_protocol1_0.log`.
+- **Integrity**: Standardized hyperparameters (lr 1e-4, cosine decay, warmup 1000, patience 20, min_steps 20000), exact action masking (`action_is_pad` strictly excluded from normalization and flow loss), 100% data leakage free.
+
+#### Stage 1: Cosmos 7B Base SmolExpert Training Results (Completed)
+
+- **Status**: Completed (converged at Step 17,000; early stopping triggered at Step 24,500 after 15 stagnated evaluations).
+- **Wall Clock Time**: 1,533.9s (~25.6 minutes).
+- **Validation Metrics on Protocol 1.0 Held-out (Episodes 32–39, 88 anchors)**:
+  - **Validation Global RMSE**: **`15.980°`** (~15.98°).
+  - **Immediate Horizon-1 Error (H1)**: **`5.580°`**.
+  - **First-5 Actions Mean RMSE**: **`7.769°`**.
+  - **Validation Flow Matching Loss**: `0.1380`.
+- **Artifacts Saved & Verified**:
+  - Checkpoint: `/home/anton/.cache/video-vam/runs/cosmos7b-protocol1-smolexpert/best.safetensors` (230 MB).
+  - Normalizer: `/home/anton/.cache/video-vam/runs/cosmos7b-protocol1-smolexpert/normalizer.safetensors` & `.json`.
+  - Metrics: `/home/anton/.cache/video-vam/runs/cosmos7b-protocol1-smolexpert/best_metrics.json` & `training_summary.json`.
+
+#### Remaining Queue Pipeline:
+
+- **Stage 2**: FLUX.2 [klein] Base SmolExpert training on `/home/anton/.cache/video-vam/flux2-klein-protocol1-cache` (min_steps=20000, max_steps=50000, patience=20, lr=1e-4, warmup=1000, cosine decay, action masking).
+- **Stage 3**: Build Cosmos 14B Protocol 1.0 feature cache via `build_vam_feature_cache.py` (batched FP8 block streaming).
+- **Stage 4**: Cosmos 14B Base SmolExpert training on `/home/anton/.cache/video-vam/cosmos14b-protocol1-cache` (min_steps=20000, max_steps=50000, patience=20, lr=1e-4, warmup=1000, cosine decay, action masking).
+
+## 2026-09-07 — Comprehensive Correctness Audit, Historical Retractions, and Base VAM Architecture Verification
+
+### 1. Systematic Correctness & Validity Audit
+
+A full-codebase architectural audit (`docs/video_vam_correctness_audit.md`) revealed that previous empirical numbers and training pipelines contained multiple compounding defects that necessitate formal retractions:
+
+1. **Formal Retraction of Historical Sub-11° Entries**:
+   - The reported validation RMSE values of **9.46°** (Cosmos 7B), **9.75°** (Cosmos 7B LoRA), **9.97°** (Cosmos 14B), **10.33°** (FLUX.2 LoRA), **11.45°** (FLUX.2 Base), **10.99°** (14B Converged), and **11.08°** (14B LoRA) are **RETRACTED**.
+   - **Root Causes**:
+     - _Frame-Level Data Leakage_: Sequential video clips extracted at stride 3 were split using `torch.utils.data.random_split(85%, 15%)`. Adjacent frames from the same trajectory were split between train and val sets, allowing the policies to perform trivial trajectory interpolation.
+     - _Pseudo-Latent Bypassing_: Feature extractors bypassed genuine causal 3D VAEs, applying bilinear `F.interpolate` downsampling to $32 \times 32$ with zero-padding to 16 channels, feeding meaningless spatial noise to DiTs.
+     - _Unstandardized Early Reruns_: Early re-benchmarking attempts (e.g. 15.98°) were conducted on unstandardized intermediate caches and are retired pending clean execution.
+
+2. **Cosmos 3 Edge Architectural Discrepancies**:
+   - _Gen Tower vs. Und Tower Mismatch_: Video-LoRA training operated on the generation tower (`gen_seq`) via flow matching, while policy feature extraction tapped the understanding tower (`und_seq`), introducing an uncalibrated representation shift.
+   - _Latent Normalization & Posterior Mode_: Omitted per-channel latent scaling and failed to evaluate at native posterior mode (`posterior.mode()`).
+   - _Framerate Mismatch_: 10 FPS robot dataset evaluated against 24 FPS pretraining positional assumptions.
+   - _Patchify Order Defect_: Legacy manual patchification used channel-first `(C, p, p)` instead of native spatial-first `(p, p, C)`.
+   - _Model Config_: Local measurements confirm 2048 hidden dim, 16 attention heads, 28 layers, 3.37B dense parameters (vs public 4B label).
+
+3. **Metric & Baseline Mathematical Corrections**:
+   - _Baseline Comparability_: The historical unadapted 26.12 baseline is not directly comparable.
+   - _Domain Adaptation Gain_: Frozen SmolExpert (13.65) vs legacy prefix (13.81) vs LoRA (13.06) represents a ~0.6°–0.8° gain (confounded), not an error halving.
+   - _Oracle & Gap Closure_: Oracle 13.08 is an empirical reference point on teacher `cond_frames`, not an absolute ceiling. Gap closure is **89.4%** ($\frac{13.74 - 13.15}{13.74 - 13.08} = 0.894$), subject to seed uncertainty (98.9% claim was false).
+   - _Mixed Units_: Metrics report 5 joints in degrees ($^\circ$) + gripper in range $[0, 100]$, not pure degrees. Horizons: H1 offset 0 ($t$), first-5 $t \dots t+4$, full-30 offsets $0 \dots 29$.
+   - _Dataset Changepoint_: Mean action shifts between episodes 0–23 and 24–39 (+19.96° Joint 2, -29.47° Joint 3) reflect an operator/calibration changepoint hypothesis, not an intentional domain shift.
+   - _Cosmos-Predict2-2B_: Temporal downsampling factor is $4\times$ (not $8\times$).
+   - _LTX Spatial Resolution_: The 32x spatial VAE limitation is a research hypothesis, not proven fact.
+
+### 2. Evaluation Rigor & Invariant Implementation
+
+The codebase is being updated to enforce:
+
+- **Per-Sample Seed Batch Invariance**: `sample_seed = int(hashlib.sha256(f"{evaluation_seed}:{sample_id}".encode()).hexdigest()[:8], 16) % (2**31 - 1)` guaranteeing type-safe invariance to batch size and sample ID strings.
+- **Optimizer Step Alignment**: Alignment of warmup, decay, and logging to true optimizer steps during gradient accumulation.
+- **Fail-Closed Validation**: Manifest schema checks, disjoint episode set enforcement, and pinned dataset revision (`243370c3c08bcbd860133c4a0d658ea7c1d2e77e`).
+- **Actual Checkpoint Resume**: Proper restoration of optimizer, scheduler, and step states.
+
+### 3. Current Implementation & Operational Status
+
+- **Status**: Correct extraction and training code is being implemented by agents **NOW** and is currently under code review.
+- **Jobs**: **No jobs are currently running or scheduled.**
+- **Testing**: New unit tests covering base abstractions, Cosmos 3 features, and LoRA injection are in place; comprehensive verification is pending (no invented pass counts).
+
+---
+
+## 2026-09-08 — Operational Audit: Placeholder Queue Discovery, Weight Inventory & Execution Plan
+
+### 1. Verification of Active Pipeline State
+
+- Inspection of `scripts/video_vam/run_full_autonomous_pipeline.sh` revealed that Stage 2 only printed status without executing Cosmos 7B evaluation, and Stage 3 wrote hardcoded numbers into `grand_evaluation_summary.json`.
+- This placeholder script was flagged and disabled. No synthetic or hardcoded score may be treated as benchmark evidence.
+- The GPU is idle; only the SmolVLA v1 read-only RPC server remains active on port 8766.
+
+### 2. Comprehensive Weight Inventory
+
+- **Verified Saved:** Cosmos 2B Pool2 SmolExpert (`best`+`last`), LTX-2.5 Pool2/Unpooled (`best`+`last`), Cosmos 2B video-LoRA step 6,000, and SmolVLA v1/v2 are safely stored in `outputs/train/`.
+- **Missing Weights:** Checkpoints for Cosmos 2B T=2 undistilled and direct-distilled models (both student LoRA and SmolExpert heads) were not found in cache or train directories. Retraining is required under Protocol 1.0.
+- **Foundation Models:** Cosmos 2B backbone weights (`v2w_pretrained_cosmos.pt`, 3.9 GB) verified in `outputs/models/cosmos2b/video_backbone/`.
+
+### 3. Dataset Quarantine
+
+- Dataset `Orellius/cube_out_of_box_v2` remains strictly quarantined due to a declared vs actual frame/episode count discrepancy (12,163 frames / 100 episodes declared vs 15,998 rows / 140 episodes present).
+- All retraining and re-scoring must proceed exclusively on canonical pinned v1 (`hubnemo/cube_out_of_box_dataset` @ `243370c3c08bcbd860133c4a0d658ea7c1d2e77e`).
+
+### 4. Canonical Plan Established
+
+- Outlined operational sequence in [`docs/video_vam_execution_plan.md`](./video_vam_execution_plan.md) covering:
+  1. T=2 undistilled feature extraction & SmolExpert training.
+  2. Teacher unpooled `cond_frames` target extraction & T=2 direct distillation.
+  3. Distilled T=2 feature cache extraction & SmolExpert training.
+  4. Standard Protocol 1.0 evaluation and verified artifact preservation.

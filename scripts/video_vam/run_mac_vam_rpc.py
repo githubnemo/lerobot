@@ -820,11 +820,42 @@ def main(argv: list[str] | None = None) -> int:
     if not args.dry_run and (not args.robot_use_degrees or args.joint_limits_min is None):
         parser.error("hardware requires degree units and explicit six-dimensional absolute joint limits")
 
-    # Resolve checkpoints
-    if args.checkpoint in {"latest_scale100", "scale100"}:
-        if args.policy != "smolvla":
-            parser.error("Scale-100 alias is only valid for SmolVLA")
-        args.resolved_checkpoint = SCALE100_SMOLVLA_CHECKPOINT
+    # Universal Policy & Checkpoint Aliases
+    ALIASES = {
+        "smolvla_v1": (
+            "/home/anton/lerobot-video-vam/outputs/train/cube_out_of_box_il_smolvla_train_only_stats_0_31_20260826_1hr/checkpoints/029200/pretrained_model",
+            "smolvla",
+        ),
+        "smolvla_v2": (
+            "/home/anton/lerobot-video-vam/outputs/train/cube_out_of_box_scale100_smolvla_1hr/checkpoints/025000/pretrained_model",
+            "smolvla",
+        ),
+        "cosmos2b_t16": (
+            "/home/anton/lerobot-video-vam/outputs/train/cube-out-of-box-cosmos-pool2-smolexpert",
+            "video_vam",
+        ),
+        "cosmos2b_t2_undistilled": (
+            "/home/anton/lerobot-video-vam/outputs/train/cosmos2b-t2-undistilled-smolexpert",
+            "video_vam",
+        ),
+        "cosmos2b_t2_distilled": (
+            "/home/anton/lerobot-video-vam/outputs/train/cosmos2b-t2-distilled-smolexpert",
+            "video_vam",
+        ),
+        "cosmos3_base": (
+            "/home/anton/lerobot-video-vam/outputs/train/cosmos3-edge-undseq-smolexpert",
+            "video_vam",
+        ),
+        "cosmos3_lora": (
+            "/home/anton/lerobot-video-vam/outputs/train/v2-cosmos3-edge-lora-smolexpert",
+            "video_vam",
+        ),
+    }
+
+    if args.checkpoint in ALIASES:
+        args.resolved_checkpoint, args.policy = ALIASES[args.checkpoint]
+    elif args.checkpoint in {"latest_scale100", "scale100"}:
+        args.resolved_checkpoint, args.policy = ALIASES["smolvla_v2"]
     elif args.checkpoint is not None:
         args.resolved_checkpoint = args.checkpoint
     else:

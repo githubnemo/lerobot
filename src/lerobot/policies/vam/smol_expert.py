@@ -553,10 +553,11 @@ class SmolExpertActionDecoder(nn.Module):
         """Strictly load a checkpoint emitted by ``train_smolexpert_on_cosmos.py``."""
         path = resolve_checkpoint(checkpoint)
         expected = self.state_dict()
-        prefix = "model."
-        expected_keys = {prefix + name for name in expected}
         with safe_open(str(path), framework="pt", device="cpu") as handle:
             actual_keys = set(handle.keys())
+            has_model_prefix = any(k.startswith("model.") for k in actual_keys)
+            prefix = "model." if has_model_prefix else ""
+            expected_keys = {prefix + name for name in expected}
             missing = sorted(expected_keys - actual_keys)
             unexpected = sorted(actual_keys - expected_keys)
             if missing or unexpected:

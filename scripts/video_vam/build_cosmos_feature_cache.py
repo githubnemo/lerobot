@@ -71,7 +71,6 @@ from scripts.video_vam.smoke_test_cosmos_extractor import (
     _cuda_peak,
     _episode_row,
     _git_commit,
-    _relative_index,
     _runtime,
     _synchronize,
     conditioning_description,
@@ -118,6 +117,7 @@ def _parse_lora_blocks(value: str) -> tuple[int, ...]:
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--dataset-repo-id", type=str, default=CUBE_OUT_OF_BOX_CONTRACT.repo_id)
     parser.add_argument("--root", type=Path, default=DEFAULT_DATASET_ROOT)
     parser.add_argument("--episodes", type=int, nargs="+", default=[0])
     parser.add_argument("--max-samples", type=int)
@@ -719,19 +719,25 @@ def build(args: argparse.Namespace) -> Path:
                 },
             }
         )
+    rev = (
+        CUBE_OUT_OF_BOX_CONTRACT.revision
+        if args.dataset_repo_id == CUBE_OUT_OF_BOX_CONTRACT.repo_id
+        else None
+    )
     dataset = LeRobotDataset(
-        CUBE_OUT_OF_BOX_CONTRACT.repo_id,
+        args.dataset_repo_id,
         root=args.root.expanduser(),
         episodes=list(args.episodes),
         delta_timestamps=CUBE_OUT_OF_BOX_CONTRACT.delta_timestamps(),
-        revision=CUBE_OUT_OF_BOX_CONTRACT.revision,
+        revision=rev,
         return_uint8=True,
         download_videos=False,
     )
-    metadata_report = validate_metadata(dataset.meta, CUBE_OUT_OF_BOX_CONTRACT)
-    metadata_report.raise_if_invalid()
-    if dataset.revision != CUBE_OUT_OF_BOX_CONTRACT.revision:
-        raise ValueError(f"dataset revision is {dataset.revision!r}, expected pinned revision")
+    if args.dataset_repo_id == CUBE_OUT_OF_BOX_CONTRACT.repo_id:
+        metadata_report = validate_metadata(dataset.meta, CUBE_OUT_OF_BOX_CONTRACT)
+        metadata_report.raise_if_invalid()
+        if dataset.revision != CUBE_OUT_OF_BOX_CONTRACT.revision:
+            raise ValueError(f"dataset revision is {dataset.revision!r}, expected pinned revision")
 
     prompt_start = time.perf_counter()
     prompt_artifact = load_prompt_embedding(args.prompt.expanduser())
@@ -799,6 +805,12 @@ def build(args: argparse.Namespace) -> Path:
     load_seconds = time.perf_counter() - load_start
     load_peak = _cuda_peak(device)
 
+    ep_cum_starts = {}
+    cum = 0
+    for ep in args.episodes:
+        ep_cum_starts[ep] = cum
+        cum += int(dataset.meta.episodes[ep]["length"])
+
     entries: list[dict[str, Any]] = []
     total_extract_seconds = 0.0
     total_extract_allocated = 0
@@ -841,7 +853,10 @@ def build(args: argparse.Namespace) -> Path:
         else:
             if (path.exists() or path.with_suffix(".json").exists()) and not args.overwrite:
                 raise FileExistsError(f"Refusing to overwrite existing cache; pass --overwrite: {path}")
-            sample = dataset[_relative_index(dataset, frame)]
+            from_idx = int(_episode_row(dataset, episode)["dataset_from_index"])
+            frame_in_ep = frame - from_idx
+            local_idx = ep_cum_starts[episode] + frame_in_ep
+            sample = dataset[local_idx]
             prepared = prepare_sample(sample, frame_index=frame, config=CUBE_OUT_OF_BOX_CONTRACT)
             timing = run_timed_extraction(
                 extractor,

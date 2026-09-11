@@ -91,6 +91,10 @@ class VideoVAMConfig(PreTrainedConfig):
     cosmos_use_cuda_graphs: bool = False
     cosmos_state_t: int = 16
     cosmos_fp8_linear: bool = False
+    cosmos_context_transform: str = "pool2"
+    cosmos_lora_weights: Path | None = None
+    cosmos3_checkpoint: Path = Path("/home/anton/.cache/video-vam/cosmos3-edge")
+    cosmos3_lora_weights: Path | None = None
 
     ltx_transformer: Path = DEFAULT_LTX_TRANSFORMER
     ltx_vae: Path = DEFAULT_LTX_VAE
@@ -116,7 +120,13 @@ class VideoVAMConfig(PreTrainedConfig):
         self.ltx_transformer = Path(self.ltx_transformer)
         self.ltx_vae = Path(self.ltx_vae)
         self.ltx_prompt = Path(self.ltx_prompt)
-        if self.backend not in {"cosmos", "ltx"}:
+        if self.cosmos_lora_weights is not None:
+            self.cosmos_lora_weights = Path(self.cosmos_lora_weights)
+        if self.cosmos3_checkpoint is not None:
+            self.cosmos3_checkpoint = Path(self.cosmos3_checkpoint)
+        if self.cosmos3_lora_weights is not None:
+            self.cosmos3_lora_weights = Path(self.cosmos3_lora_weights)
+        if self.backend not in {"cosmos", "cosmos3_edge", "ltx"}:
             raise ValueError("backend must be 'cosmos' or 'ltx'")
         if self.cosmos_state_t not in (2, 16):
             raise ValueError("cosmos_state_t must be 2 (observed-only) or 16")

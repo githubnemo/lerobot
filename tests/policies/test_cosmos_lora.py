@@ -261,3 +261,48 @@ def test_lora_roundtrip_across_activation_checkpoint_wrapper(tmp_path):
     actual = lora_state_dict(target)
     assert expected.keys() == actual.keys()
     assert all(torch.equal(expected[name], actual[name]) for name in expected)
+
+
+def test_cosmos_lora_cosmos3_dual_pathway_dispatch():
+    from lerobot.policies.vam.cosmos_lora import (
+        DUAL_PATHWAY_TARGET_MODULES,
+        GEN_TARGET_MODULES,
+        UND_TARGET_MODULES,
+        inject_cosmos3_lora,
+    )
+    from tests.policies.test_cosmos3_lora import _MockCosmos3Transformer
+
+    expected_und = {
+        "self_attn.to_q",
+        "self_attn.to_k",
+        "self_attn.to_v",
+        "self_attn.to_out",
+        "mlp.gate_proj",
+        "mlp.up_proj",
+        "mlp.down_proj",
+    }
+    assert expected_und == set(UND_TARGET_MODULES)
+
+    expected_gen = {
+        "self_attn.add_q_proj",
+        "self_attn.add_k_proj",
+        "self_attn.add_v_proj",
+        "self_attn.to_add_out",
+        "mlp_moe_gen.gate_proj",
+        "mlp_moe_gen.up_proj",
+        "mlp_moe_gen.down_proj",
+    }
+    assert expected_gen == set(GEN_TARGET_MODULES)
+    assert set(DUAL_PATHWAY_TARGET_MODULES) == expected_und | expected_gen
+    assert callable(inject_cosmos3_lora)
+
+    # Verify inject_lora dispatches to inject_cosmos3_lora on transformer with layers
+    transformer = _MockCosmos3Transformer(num_layers=2)
+    wrapped = inject_lora(transformer, rank=4, alpha=8.0)
+
+    # 14 dual-pathway modules * 2 layers = 28 modules
+    assert len(wrapped) == 28
+
+    for name, p in transformer.named_parameters():
+        if p.requires_grad:
+            assert any(target in name for target in DUAL_PATHWAY_TARGET_MODULES)

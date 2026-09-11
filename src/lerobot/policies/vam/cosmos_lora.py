@@ -112,10 +112,24 @@ def inject_lora(
 ) -> tuple[str, ...]:
     """Wrap intended attention/MLP projections in selected Cosmos blocks.
 
-    Wrapping is performed from the LeRobot-owned module, so the vendored source
-    and its manifest are not modified.  Existing base weights retain their
-    dtype; the new adapter parameters are always fp32.
+    For Cosmos 3 architectures (exposing ``layers``), injects LoRA into the
+    MoT dual-pathway linear projections (understanding pathway ``und_seq`` and
+    generation pathway ``gen_seq``).
+
+    For Cosmos Predict2 architectures (exposing ``blocks``), wraps intended 28-block
+    projections.  Existing base weights retain their dtype; adapter parameters are fp32.
     """
+    if hasattr(model, "layers") and not hasattr(model, "blocks"):
+        from lerobot.policies.vam.cosmos3_lora import inject_cosmos3_lora
+
+        return tuple(
+            inject_cosmos3_lora(
+                model,
+                rank=rank,
+                alpha=float(alpha) if alpha is not None else 32.0,
+                block_indices=block_indices,
+            )
+        )
     if not hasattr(model, "blocks") or len(model.blocks) != 28:
         raise ValueError("Cosmos Predict2 LoRA injection requires exactly 28 DiT blocks")
     if block_indices is None:
@@ -185,7 +199,13 @@ def merge_lora_file_into_base(model: nn.Module, lora_path: str | Path) -> dict[s
         or float(alpha) <= 0
     ):
         raise ValueError(f"LoRA provenance alpha must be finite and positive: {sidecar_path}")
-    adapter_names = inject_lora(model, rank=rank, alpha=float(alpha))
+    from safetensors import safe_open
+
+    with safe_open(str(path), framework="pt", device="cpu") as handle:
+        block_keys = [k for k in handle.keys() if k.startswith("blocks.")]
+        detected_blocks = sorted({int(k.split(".")[1]) for k in block_keys if k.split(".")[1].isdigit()})
+    block_indices = detected_blocks if detected_blocks else None
+    adapter_names = inject_lora(model, rank=rank, alpha=float(alpha), block_indices=block_indices)
     load_lora_state_dict(model, path)
     merge_lora_into_base(model)
     return {
@@ -568,3 +588,38 @@ def capture_prediction_and_layer20(backbone: nn.Module, **kwargs: Any) -> tuple[
     if not captured:
         raise RuntimeError("layer-20 hook did not observe a block output")
     return prediction, captured[0]
+
+
+_COSMOS3_EXPORTS = frozenset(
+    {
+        "UND_TARGET_MODULES",
+        "GEN_TARGET_MODULES",
+        "DUAL_PATHWAY_TARGET_MODULES",
+        "ALL_TARGET_MODULES",
+        "COSMOS3_UND_TARGET_MODULES",
+        "COSMOS3_GEN_TARGET_MODULES",
+        "COSMOS3_DUAL_PATHWAY_TARGET_MODULES",
+        "inject_cosmos3_lora",
+        "cosmos3_lora_state_dict",
+        "save_cosmos3_lora",
+        "load_cosmos3_lora",
+    }
+)
+
+
+def __getattr__(name: str) -> Any:
+    if name in _COSMOS3_EXPORTS:
+        from lerobot.policies.vam import cosmos3_lora
+
+        if name == "COSMOS3_UND_TARGET_MODULES":
+            return cosmos3_lora.UND_TARGET_MODULES
+        if name == "COSMOS3_GEN_TARGET_MODULES":
+            return cosmos3_lora.GEN_TARGET_MODULES
+        if name == "COSMOS3_DUAL_PATHWAY_TARGET_MODULES":
+            return cosmos3_lora.DUAL_PATHWAY_TARGET_MODULES
+        return getattr(cosmos3_lora, name)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
+def __dir__() -> list[str]:
+    return sorted(list(globals().keys()) + list(_COSMOS3_EXPORTS))

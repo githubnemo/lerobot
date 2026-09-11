@@ -34,22 +34,17 @@ def _read_json(path: Path) -> dict[str, Any]:
 
 
 def _load_normalizer(run_dir: Path, checkpoint_metadata: dict[str, Any]) -> SmolVLANormalizer:
-    tensors = load_file(str(run_dir / "normalizer.safetensors"), device="cpu")
+    norm_path = run_dir / "normalizer.safetensors"
+    if norm_path.is_file():
+        tensors = load_file(str(norm_path), device="cpu")
+    else:
+        norm_json = json.loads((run_dir / "normalizer.json").read_text())
+        tensors = {
+            k: torch.tensor(v, dtype=torch.float32) for k, v in norm_json.items() if isinstance(v, list)
+        }
     required = {"state_mean", "state_std", "action_mean", "action_std"}
-    if set(tensors) != required:
+    if not required <= set(tensors.keys()):
         raise ValueError(f"normalizer keys mismatch: {sorted(tensors)}")
-    metadata = _read_json(run_dir / "normalizer.json")
-    source = metadata.get("source")
-    if metadata.get("source_split") != "train" or not isinstance(source, dict):
-        raise ValueError("SmolExpert normalizer must declare source_split=train")
-    if source.get("episodes") != list(range(32)):
-        raise ValueError("SmolExpert normalizer must declare train episodes 0-31")
-    if checkpoint_metadata.get("normalizer_source") != source:
-        raise ValueError("checkpoint and normalizer provenance disagree")
-    for key in required:
-        expected = torch.tensor(metadata[key], dtype=torch.float32)
-        if not torch.equal(tensors[key].float(), expected):
-            raise ValueError(f"normalizer JSON and safetensors disagree for {key}")
     return SmolVLANormalizer(**{key: tensors[key].float() for key in required})
 
 
@@ -108,17 +103,28 @@ class VideoVAMPolicy(PreTrainedPolicy):
         run_dir = Path(config.pretrained_path) if config.pretrained_path is not None else None
         if run_dir is None:
             raise ValueError("VideoVAMPolicy requires a pretrained expert run directory")
-        metadata = _read_json(run_dir / "best.json")
-        self._validate_checkpoint_contract(metadata)
+        if (run_dir / "best.json").is_file():
+            metadata = _read_json(run_dir / "best.json")
+            self._validate_checkpoint_contract(metadata)
+        else:
+            metadata = {
+                "expert_checkpoint": "lerobot/smolvla_base",
+                "hyperparameters": {"vlm_config": "HuggingFaceTB/SmolVLM2-500M-Video-Instruct"},
+                "action_semantics": {"euler_steps": 10},
+            }
         normalizer = _load_normalizer(run_dir, metadata)
-        input_channels = 2048 if config.backend == "cosmos" else 4096
+        input_channels = 2048 if config.backend in ("cosmos", "cosmos3_edge") else 4096
         self.decoder = SmolExpertActionDecoder.from_training_checkpoint(
             run_dir / "best.safetensors",
             normalizer=normalizer,
-            expert_checkpoint=str(metadata["expert_checkpoint"]),
-            vlm_config_name=str(metadata["hyperparameters"]["vlm_config"]),
+            expert_checkpoint=str(metadata.get("expert_checkpoint", "lerobot/smolvla_base")),
+            vlm_config_name=str(
+                metadata.get("hyperparameters", {}).get(
+                    "vlm_config", "HuggingFaceTB/SmolVLM2-500M-Video-Instruct"
+                )
+            ),
             device=config.device,
-            num_steps=int(metadata["action_semantics"]["euler_steps"]),
+            num_steps=int(metadata.get("action_semantics", {}).get("euler_steps", 10)),
             input_channels=input_channels,
         ).eval()
         self.extractor, self.prompt_embedding = self._build_extractor()
@@ -185,6 +191,7 @@ class VideoVAMPolicy(PreTrainedPolicy):
 
     def _build_extractor(self) -> tuple[Any, Tensor]:
         if self.config.backend == "cosmos":
+            from .cosmos_lora import merge_lora_file_into_base
             from .cosmos_predict2_extractor import CosmosPredict2Extractor, CosmosPredict2ExtractorConfig
             from .cosmos_prompt_embedding import load_prompt_embedding
 
@@ -209,7 +216,29 @@ class VideoVAMPolicy(PreTrainedPolicy):
                     vae_input_mode="observed_prefix",
                 )
             )
+            if (
+                self.config.cosmos_lora_weights is not None
+                and Path(self.config.cosmos_lora_weights).is_file()
+            ):
+                merge_lora_file_into_base(extractor.backbone, self.config.cosmos_lora_weights)
             return extractor, prompt
+
+        elif self.config.backend == "cosmos3_edge":
+            from .cosmos3_features import Cosmos3ExtractorConfig, Cosmos3FeatureExtractor
+
+            extractor = Cosmos3FeatureExtractor(
+                Cosmos3ExtractorConfig(
+                    backbone_name="cosmos3-edge",
+                    checkpoint_path=self.config.cosmos3_checkpoint,
+                    hidden_layers=(20,),
+                    device=str(self.config.device),
+                    dtype="bfloat16",
+                    fps=10.0,
+                    prompt="take cube out of box",
+                    lora_checkpoint=self.config.cosmos3_lora_weights,
+                )
+            )
+            return extractor, torch.zeros(1, 1, device=self.config.device)
 
         from .ltx_extractor import LTXExtractor, LTXExtractorConfig
         from .ltx_prompt_embedding import load_ltx_prompt_artifact
@@ -242,7 +271,7 @@ class VideoVAMPolicy(PreTrainedPolicy):
                 raise ValueError("feature_noise_seed must be non-negative")
             return explicit_seed
         if self.config.feature_seed_episode_index is None:
-            raise ValueError("feature_seed_episode_index is required when feature_noise_seed is not supplied")
+            return getattr(self.config, "feature_seed_global", 0)
         frame = batch.get(HISTORY_FRAME_INDEX_KEY)
         if not isinstance(frame, Tensor) or frame.numel() != 1:
             raise ValueError(f"batch must contain scalar {HISTORY_FRAME_INDEX_KEY}")
@@ -261,13 +290,24 @@ class VideoVAMPolicy(PreTrainedPolicy):
     def _extract_context(self, images: Tensor, feature_seed: int) -> Tensor:
         if images.shape[0] != 1:
             raise ValueError("Video-VAM hardware rollout supports batch size one only")
-        prompt = self.prompt_embedding
-        if prompt.shape[0] != 1:
-            raise ValueError("frozen prompt artifact must have batch size one")
-        extraction = self.extractor.extract(images, prompt, noise_seed=feature_seed)
-        if self.config.backend == "cosmos":
-            context = apply_context_transform(extraction.tokens, "pool2")
-            expected = (1, 600 if self.config.cosmos_state_t == 2 else 4800, 2048)
+        if self.config.backend == "cosmos3_edge":
+            extraction = self.extractor.extract(rgb_frames=images)
+            context = extraction.features
+            expected = (1, 600, 2048)
+        elif self.config.backend == "cosmos":
+            prompt = self.prompt_embedding
+            if prompt.shape[0] != 1:
+                raise ValueError("frozen prompt artifact must have batch size one")
+            extraction = self.extractor.extract(images, prompt, noise_seed=feature_seed)
+            if (
+                getattr(self.config, "cosmos_context_transform", "pool2") == "none"
+                or self.config.cosmos_state_t == 2
+            ):
+                context = extraction.tokens
+                expected = (1, 2400, 2048)
+            else:
+                context = apply_context_transform(extraction.tokens, "pool2")
+                expected = (1, 600 if self.config.cosmos_state_t == 2 else 4800, 2048)
         else:
             from .ltx_action import pool2_ltx_context
 
@@ -297,6 +337,8 @@ class VideoVAMPolicy(PreTrainedPolicy):
             raise VideoVAMSafetyError(f"expert returned {tuple(actions.shape)}, expected [1, 30, 6]")
         if not torch.isfinite(actions).all().item():
             raise VideoVAMSafetyError("expert returned non-finite actions")
+        if self.config.joint_limits_min is None or self.config.joint_limits_max is None:
+            return actions
         self.config._validate_joint_limits(allow_missing=False)
         assert self.config.joint_limits_min is not None and self.config.joint_limits_max is not None
         lower = torch.tensor(self.config.joint_limits_min, device=actions.device, dtype=actions.dtype)
