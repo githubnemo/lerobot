@@ -2008,3 +2008,16 @@ The codebase is being updated to enforce:
 1. **Active Run**: Training Cosmos 3 Edge Video-LoRA online with augmentations on Scale-100 (`Orellius/cube_out_of_box_v2`, stride 1) to measure validation loss/RMSE impact against offline baselines.
 2. **Follow-up Run**: Train the identical online data augmentation recipe on the cleaner historical V1 dataset (`hubnemo/cube_out_of_box_dataset`, episodes 0–31).
 3. **Outcome**: Produces two robust, visually augmented candidate policies for the next physical robot testing session.
+
+### 4. Scale-100 Augmented Results & V1 Transfer Hypothesis
+
+- **Scale-100 Run Outcome**: Completed 22,500 steps. Early stopping saved `best.safetensors` at step 12,500.
+  - Flow-matching loss dropped by 46% (`0.1990` -> `0.1083`).
+  - Eval-1 RMSE: `15.480°` (vs `13.50°` offline static).
+  - Eval-2 RMSE: `17.234°` (matching `17.20°` offline static despite training under continuous visual perturbation).
+- **Hypothesis for Clean V1 + Augmentation**:
+  - The clean historical V1 dataset has higher demonstration consistency than V2, but unaugmented V1 models overfit to V1 camera/lighting conditions.
+  - Training V1 **with coherent visual augmentations** should force visual invariance, leading to a measurable generalization improvement on the out-of-distribution V2 held-out set (Eval-Set 2, episodes 90–99).
+- **Execution**: Active session `c3-online-aug-v1-train` (`outputs/train/v1-cosmos3-edge-lora-online-aug-smolexpert`).
+  - Stride 1 = 4,688 temporal windows.
+  - Auto-discovered and evaluating both Eval-Set 1 (V1 held-out 32–39) and Eval-Set 2 (V2 held-out 90–99) at each 500-step checkpoint.
