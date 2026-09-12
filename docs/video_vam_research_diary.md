@@ -2021,3 +2021,13 @@ The codebase is being updated to enforce:
 - **Execution**: Active session `c3-online-aug-v1-train` (`outputs/train/v1-cosmos3-edge-lora-online-aug-smolexpert`).
   - Stride 1 = 4,688 temporal windows.
   - Auto-discovered and evaluating both Eval-Set 1 (V1 held-out 32–39) and Eval-Set 2 (V2 held-out 90–99) at each 500-step checkpoint.
+
+### 5. Training Curve Analysis: Augmentation Regularization vs Overfitting Dynamics
+
+- **Validation Flow-Loss Divergence**:
+  - In the unaugmented run, validation flow loss on held-out samples reached a minimum around step 5,000 (`~0.082`) and then steadily deteriorated to `0.230` by step 45,000—revealing severe overfitting to static feature vectors.
+  - The augmented model prevented this divergence, keeping validation flow loss well-bounded (`~0.138`) and training loss higher (`~0.02` vs `~0.005`), confirming that dynamic visual noise acts as an effective regularizer.
+- **Convergence Timeline**:
+  - The augmented model found its optimal representation early (Step 12,500) and remained flat for 10,000 subsequent steps until the 20-evaluation patience limit triggered early stopping at Step 22,500.
+  - On out-of-distribution Eval-Set 2 (eps 90–99), the augmented model reached `17.23°`, matching the static baseline (`17.20°`) despite continuous visual perturbation.
+- **Active Job**: `c3-online-aug-v1-train` is actively training on `abakus` across the clean historical V1 dataset (Stride 1, 4,688 windows) with dual evaluation active.
