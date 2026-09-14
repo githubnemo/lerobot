@@ -908,6 +908,18 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Conditioning prompt text for online backbone.",
     )
     parser.add_argument(
+        "--backbone-tokenizer",
+        type=Path,
+        default=None,
+        help="Path to tokenizer for online backbone (e.g. Cosmos 2B tokenizer.pth).",
+    )
+    parser.add_argument(
+        "--backbone-prompt-embedding",
+        type=Path,
+        default=None,
+        help="Path to precomputed prompt embedding for online backbone (e.g. Cosmos 2B t5-11b.safetensors).",
+    )
+    parser.add_argument(
         "--augment",
         action=argparse.BooleanOptionalAction,
         default=False,
@@ -1245,26 +1257,58 @@ def main(argv: list[str] | None = None) -> int:
         print(f"  Augmentation: {'ENABLED' if args.augment else 'DISABLED'}")
 
         # Auto-discover validation manifest if not explicitly given
+        b_k = args.online_backbone.replace("-", "_").lower()
         if args.val_manifest is None:
-            c15 = Path("outputs/features/v2-cosmos3-edge-lora-15k/val/manifest.json")
-            c5 = Path("outputs/features/v2-cosmos3-edge-lora/val/manifest.json")
-            if c15.is_file():
-                args.val_manifest = c15
-                print(f"Auto-discovered Eval-Set 1 validation manifest: {args.val_manifest}")
-            elif c5.is_file():
-                args.val_manifest = c5
-                print(f"Auto-discovered Eval-Set 1 validation manifest: {args.val_manifest}")
+            if "cosmos3" in b_k:
+                c15 = Path("outputs/features/v2-cosmos3-edge-lora-15k/val/manifest.json")
+                c5 = Path("outputs/features/v2-cosmos3-edge-lora/val/manifest.json")
+                if c15.is_file():
+                    args.val_manifest = c15
+                    print(f"Auto-discovered Eval-Set 1 validation manifest: {args.val_manifest}")
+                elif c5.is_file():
+                    args.val_manifest = c5
+                    print(f"Auto-discovered Eval-Set 1 validation manifest: {args.val_manifest}")
+            elif any(k in b_k for k in ("cosmos2b", "cosmos_2b", "cosmos_t2", "cosmos")):
+                c_c2b = Path("outputs/features/v2-cosmos2b-t2-undistilled/val/manifest.json")
+                if c_c2b.is_file():
+                    args.val_manifest = c_c2b
+                    print(f"Auto-discovered Eval-Set 1 validation manifest: {args.val_manifest}")
+            elif any(k in b_k for k in ("flux2", "flux")):
+                c_flux = Path("/home/anton/.cache/video-vam/flux2-klein-scale100-cache/val/manifest.json")
+                if c_flux.is_file():
+                    args.val_manifest = c_flux
+                    print(f"Auto-discovered Eval-Set 1 validation manifest: {args.val_manifest}")
 
         # Auto-discover Eval-Set 2 manifest if not explicitly given
         if args.eval2_manifest is None:
-            c2_15 = Path("outputs/features/v2-cosmos3-edge-lora-15k/eval2/manifest.json")
-            c2_5 = Path("outputs/features/v2-cosmos3-edge-lora/eval2/manifest.json")
-            if c2_15.is_file():
-                args.eval2_manifest = str(c2_15)
-                print(f"Auto-discovered Eval-Set 2 manifest: {args.eval2_manifest}")
-            elif c2_5.is_file():
-                args.eval2_manifest = str(c2_5)
-                print(f"Auto-discovered Eval-Set 2 manifest: {args.eval2_manifest}")
+            if args.val_manifest is not None:
+                val_p = Path(args.val_manifest).resolve()
+                cand = val_p.parent.parent / "eval2/manifest.json"
+                if cand.is_file():
+                    args.eval2_manifest = str(cand)
+                    print(f"Auto-discovered Eval-Set 2 manifest: {args.eval2_manifest}")
+            if args.eval2_manifest is None:
+                if "cosmos3" in b_k:
+                    c2_15 = Path("outputs/features/v2-cosmos3-edge-lora-15k/eval2/manifest.json")
+                    c2_5 = Path("outputs/features/v2-cosmos3-edge-lora/eval2/manifest.json")
+                    if c2_15.is_file():
+                        args.eval2_manifest = str(c2_15)
+                        print(f"Auto-discovered Eval-Set 2 manifest: {args.eval2_manifest}")
+                    elif c2_5.is_file():
+                        args.eval2_manifest = str(c2_5)
+                        print(f"Auto-discovered Eval-Set 2 manifest: {args.eval2_manifest}")
+                elif any(k in b_k for k in ("cosmos2b", "cosmos_2b", "cosmos_t2", "cosmos")):
+                    c2_c2b = Path("outputs/features/v2-cosmos2b-t2-undistilled/eval2/manifest.json")
+                    if c2_c2b.is_file():
+                        args.eval2_manifest = str(c2_c2b)
+                        print(f"Auto-discovered Eval-Set 2 manifest: {args.eval2_manifest}")
+                elif any(k in b_k for k in ("flux2", "flux")):
+                    c2_flux = Path(
+                        "/home/anton/.cache/video-vam/flux2-klein-scale100-cache/eval2/manifest.json"
+                    )
+                    if c2_flux.is_file():
+                        args.eval2_manifest = str(c2_flux)
+                        print(f"Auto-discovered Eval-Set 2 manifest: {args.eval2_manifest}")
 
     elif args.train_manifest is not None:
         with open(args.val_manifest, encoding="utf-8") as f:
@@ -1433,44 +1477,204 @@ def main(argv: list[str] | None = None) -> int:
         print(f"Normalizer computed and saved to {args.output_dir / 'normalizer.safetensors'}")
 
     backbone_extractor: Any = None
-    if is_online:
-        input_channels = 2048
-        num_tokens = 600
-        if not args.dry_run:
-            b_key = args.online_backbone.replace("-", "_").lower()
-            if b_key in ("cosmos3_edge", "cosmos3"):
-                from lerobot.policies.vam.cosmos3_features import (
-                    Cosmos3ExtractorConfig,
-                    Cosmos3FeatureExtractor,
-                )
-
-                ckpt_dir = args.backbone_checkpoint or Path("/home/anton/.cache/video-vam/cosmos3-edge")
-                b_cfg = Cosmos3ExtractorConfig(
-                    backbone_name="cosmos3-edge",
-                    checkpoint_path=ckpt_dir,
-                    hidden_layers=(args.backbone_layer,),
-                    device=str(device),
-                    dtype="bfloat16",
-                    fps=10.0,
-                    base_fps=24.0,
-                    prompt=args.backbone_prompt,
-                    lora_checkpoint=args.backbone_lora_weights,
-                    lora_rank=args.backbone_lora_rank,
-                    lora_alpha=args.backbone_lora_alpha,
-                )
-                print(
-                    f"Loading online backbone {args.online_backbone} (layer {args.backbone_layer}, lora: {args.backbone_lora_weights})..."
-                )
-                backbone_extractor = Cosmos3FeatureExtractor(b_cfg)
-                backbone_extractor.eval()
-                for p in backbone_extractor.parameters():
-                    p.requires_grad_(False)
-            else:
-                raise ValueError(f"Unsupported online backbone: {args.online_backbone}")
+    if val_dataset is not None and getattr(val_dataset[0], "context", None) is not None:
+        sample_context = val_dataset[0].context
+        input_channels = sample_context.shape[-1]
+        num_tokens = sample_context.shape[0]
+    elif is_online:
+        b_key = args.online_backbone.replace("-", "_").lower()
+        if b_key in ("cosmos3_edge", "cosmos3"):
+            input_channels = 2048
+            num_tokens = 600
+        elif any(k in b_key for k in ("cosmos2b", "cosmos_2b", "cosmos_t2", "cosmos")):
+            input_channels = 2048
+            num_tokens = 2400
+        elif any(k in b_key for k in ("flux2", "flux")):
+            input_channels = 6144
+            num_tokens = 256
+        else:
+            raise ValueError(f"Unsupported online backbone: {args.online_backbone}")
     else:
         sample_context = val_dataset[0].context
         input_channels = sample_context.shape[-1]
         num_tokens = sample_context.shape[0]
+
+    if is_online and not args.dry_run:
+        b_key = args.online_backbone.replace("-", "_").lower()
+        if b_key in ("cosmos3_edge", "cosmos3"):
+            from lerobot.policies.vam.cosmos3_features import (
+                Cosmos3ExtractorConfig,
+                Cosmos3FeatureExtractor,
+            )
+
+            ckpt_dir = args.backbone_checkpoint or Path("/home/anton/.cache/video-vam/cosmos3-edge")
+            b_cfg = Cosmos3ExtractorConfig(
+                backbone_name="cosmos3-edge",
+                checkpoint_path=ckpt_dir,
+                hidden_layers=(args.backbone_layer,),
+                device=str(device),
+                dtype="bfloat16",
+                fps=10.0,
+                base_fps=24.0,
+                prompt=args.backbone_prompt,
+                lora_checkpoint=args.backbone_lora_weights,
+                lora_rank=args.backbone_lora_rank,
+                lora_alpha=args.backbone_lora_alpha,
+            )
+            print(
+                f"Loading online backbone {args.online_backbone} (layer {args.backbone_layer}, lora: {args.backbone_lora_weights})..."
+            )
+            backbone_extractor = Cosmos3FeatureExtractor(b_cfg)
+            backbone_extractor.eval()
+            for p in backbone_extractor.parameters():
+                p.requires_grad_(False)
+        elif any(k in b_key for k in ("cosmos2b", "cosmos_2b", "cosmos_t2", "cosmos")):
+            from types import SimpleNamespace
+
+            from lerobot.policies.vam.cosmos_predict2_extractor import (
+                CosmosPredict2Extractor,
+                CosmosPredict2ExtractorConfig,
+            )
+            from lerobot.policies.vam.cosmos_prompt_embedding import load_prompt_embedding
+
+            ckpt_pt = args.backbone_checkpoint or Path(
+                "/home/anton/.cache/video-vam/mimic-video-f2833903/video_backbone/v2w_pretrained_cosmos.pt"
+            )
+            tok_pth = args.backbone_tokenizer or Path(
+                "/home/anton/.cache/video-vam/mimic-video-f2833903/video_backbone/tokenizer/tokenizer.pth"
+            )
+            p_embed_path = args.backbone_prompt_embedding or Path(
+                "/home/anton/.cache/video-vam/prompt-embeddings/cube-out-of-box-t5-11b.safetensors"
+            )
+            prompt_art = load_prompt_embedding(p_embed_path)
+            prompt_embed_tensor = prompt_art.embedding.to(device=device, dtype=torch.bfloat16)
+
+            b_cfg = CosmosPredict2ExtractorConfig(
+                checkpoint_path=ckpt_pt,
+                tokenizer_path=tok_pth,
+                device=str(device),
+                dtype="bfloat16",
+                high_noise_sigma=10.0,
+                seed=args.seed,
+                state_t=2,
+                hidden_layer=args.backbone_layer if args.backbone_layer is not None else 20,
+                stop_after_step=0,
+                vae_input_mode="observed_prefix",
+            )
+            print(
+                f"Loading online backbone Cosmos 2B (T=2 mode, checkpoint: {ckpt_pt}, lora: {args.backbone_lora_weights})..."
+            )
+            raw_c2b_ext = CosmosPredict2Extractor(b_cfg)
+            if args.backbone_lora_weights is not None and Path(args.backbone_lora_weights).is_file():
+                from lerobot.policies.vam.cosmos_lora import inject_lora, load_lora_state_dict
+
+                inject_lora(
+                    raw_c2b_ext.backbone, rank=args.backbone_lora_rank, alpha=args.backbone_lora_alpha
+                )
+                load_lora_state_dict(
+                    raw_c2b_ext.backbone, Path(args.backbone_lora_weights).expanduser().resolve()
+                )
+                raw_c2b_ext.backbone.eval()
+                print(f"Loaded Cosmos 2B LoRA weights from {args.backbone_lora_weights}")
+
+            class OnlineCosmos2BWrapper:
+                def __init__(self, extractor: Any, prompt: Tensor) -> None:
+                    self.extractor = extractor
+                    self.prompt = prompt
+
+                def extract(self, rgb_frames: Tensor) -> Any:
+                    b = rgb_frames.shape[0]
+                    feats = []
+                    for i in range(b):
+                        out = self.extractor.extract(
+                            images=rgb_frames[i : i + 1], prompt_embedding=self.prompt
+                        )
+                        feats.append(out.tokens)
+                    return SimpleNamespace(features=torch.cat(feats, dim=0))
+
+                def parameters(self):
+                    return self.extractor.parameters()
+
+            backbone_extractor = OnlineCosmos2BWrapper(raw_c2b_ext, prompt_embed_tensor)
+        elif any(k in b_key for k in ("flux2", "flux")):
+            from types import SimpleNamespace
+
+            from torch.nn import functional as nn_f
+
+            from lerobot.policies.vam.flux2_klein_extractor import (
+                Flux2KleinExtractor,
+                Flux2KleinExtractorConfig,
+                prepare_multi_reference_conditioning,
+            )
+
+            b_cfg = Flux2KleinExtractorConfig(
+                checkpoint_path=args.backbone_checkpoint,
+                device=str(device),
+                dtype="bfloat16",
+                num_layers=8,
+                num_single_layers=0,
+                tap_location="junction",
+            )
+            print(
+                f"Loading online backbone FLUX.2 klein (tap_location: junction, lora: {args.backbone_lora_weights})..."
+            )
+            raw_flux_ext = Flux2KleinExtractor(config=b_cfg)
+            if args.backbone_lora_weights is not None and Path(args.backbone_lora_weights).is_file():
+                from lerobot.policies.vam.flux2_klein_lora import (
+                    Flux2KleinLoRAConfig,
+                    inject_flux2_klein_lora,
+                    load_flux2_klein_lora,
+                )
+
+                lora_cfg = Flux2KleinLoRAConfig(
+                    rank=args.backbone_lora_rank,
+                    alpha=args.backbone_lora_alpha,
+                    target_double_blocks=tuple(range(b_cfg.num_layers)),
+                    target_single_blocks=(),
+                )
+                inject_flux2_klein_lora(raw_flux_ext.transformer, lora_cfg)
+                load_flux2_klein_lora(
+                    raw_flux_ext.transformer, Path(args.backbone_lora_weights).expanduser().resolve()
+                )
+                print(f"Loaded FLUX.2 klein LoRA weights from {args.backbone_lora_weights}")
+
+            class OnlineFlux2KleinWrapper:
+                def __init__(self, extractor: Any, dev: torch.device) -> None:
+                    self.extractor = extractor
+                    self.dev = dev
+
+                def extract(self, rgb_frames: Tensor) -> Any:
+                    b = rgb_frames.shape[0]
+                    feats = []
+                    for i in range(b):
+                        rgb_5 = rgb_frames[i].permute(1, 0, 2, 3)
+                        rgb_norm = (rgb_5.float() - 0.5) * 2.0
+                        down = nn_f.interpolate(rgb_norm, size=(32, 32), mode="bilinear", align_corners=False)
+                        p48 = down.view(5, 3, 8, 4, 8, 4).permute(0, 1, 3, 5, 2, 4).reshape(5, 48, 8, 8)
+                        p128 = (
+                            nn_f.pad(p48, (0, 0, 0, 0, 0, 80))
+                            .unsqueeze(1)
+                            .to(device=self.dev, dtype=torch.bfloat16)
+                        )
+                        hist = [p128[k] for k in range(3)]
+                        target = p128[3]
+                        cond = prepare_multi_reference_conditioning(
+                            target_latent=target,
+                            observation_history=hist,
+                            joint_attention_dim=self.extractor.config.joint_attention_dim,
+                            device=self.dev,
+                            dtype=torch.bfloat16,
+                        )
+                        out = self.extractor.extract(cond_inputs=cond)
+                        feats.append(out.features)
+                    return SimpleNamespace(features=torch.cat(feats, dim=0))
+
+                def parameters(self):
+                    return self.extractor.parameters()
+
+            backbone_extractor = OnlineFlux2KleinWrapper(raw_flux_ext, device)
+        else:
+            raise ValueError(f"Unsupported online backbone: {args.online_backbone}")
 
     print(f"Context feature shape: [{num_tokens} tokens, {input_channels} channels]")
 
@@ -1590,6 +1794,7 @@ def main(argv: list[str] | None = None) -> int:
         batch_size=args.batch_size,
         num_steps=min(args.num_steps, 5 if args.dry_run else args.num_steps),
         seed=args.seed,
+        extractor=backbone_extractor,
     )
     print(
         f"Initial Val -> RMSE: {val_metrics['val_rmse']:.3f}, "
@@ -1694,6 +1899,7 @@ def main(argv: list[str] | None = None) -> int:
                 batch_size=args.batch_size,
                 num_steps=args.num_steps,
                 seed=args.seed,
+                extractor=backbone_extractor,
             )
             rmse = float(val_metrics["val_rmse"])
             arm_rmse = float(val_metrics["arm_rmse_deg"])
@@ -1720,6 +1926,7 @@ def main(argv: list[str] | None = None) -> int:
                     batch_size=args.batch_size,
                     num_steps=args.num_steps,
                     seed=args.seed + 1000,
+                    extractor=backbone_extractor,
                 )
                 eval2_rmse = float(eval2_metrics["val_rmse"])
                 eval2_arm = float(eval2_metrics["arm_rmse_deg"])
@@ -1840,6 +2047,7 @@ def main(argv: list[str] | None = None) -> int:
         batch_size=args.batch_size,
         num_steps=args.num_steps,
         seed=args.seed,
+        extractor=backbone_extractor,
     )
     final_eval2 = None
     if eval2_dataset is not None:
@@ -1850,6 +2058,7 @@ def main(argv: list[str] | None = None) -> int:
             batch_size=args.batch_size,
             num_steps=args.num_steps,
             seed=args.seed + 1000,
+            extractor=backbone_extractor,
         )
 
     dual_summary = {
@@ -1921,11 +2130,19 @@ def main(argv: list[str] | None = None) -> int:
     run_manifest["status"] = "completed"
     atomic_write_json(args.output_dir / "run_manifest.json", run_manifest)
 
+    backend_val = args.backbone
+    if is_online:
+        b_k = args.online_backbone.replace("-", "_").lower()
+        if "cosmos3" in b_k:
+            backend_val = "cosmos3_edge"
+        elif any(k in b_k for k in ("cosmos2b", "cosmos_2b", "cosmos_t2", "cosmos")):
+            backend_val = "cosmos"
+        elif any(k in b_k for k in ("flux2", "flux")):
+            backend_val = "flux2_klein"
+
     deployment_cfg = {
         "type": "video_vam",
-        "backend": "cosmos3_edge"
-        if "cosmos3" in args.backbone or (args.online_backbone and "cosmos3" in args.online_backbone)
-        else args.backbone,
+        "backend": backend_val,
         "device": "cuda",
         "input_features": {
             "observation.images.front": {"type": "VISUAL", "shape": [3, 480, 640]},
@@ -1934,14 +2151,49 @@ def main(argv: list[str] | None = None) -> int:
         "output_features": {"action": {"type": "ACTION", "shape": [6]}},
         "camera_key": "observation.images.front",
         "action_seed": 0,
-        "cosmos3_checkpoint": str(args.backbone_checkpoint or "/home/anton/.cache/video-vam/cosmos3-edge"),
-        "cosmos3_lora_weights": str(args.backbone_lora_weights) if args.backbone_lora_weights else None,
-        "cosmos3_lora_rank": args.backbone_lora_rank,
-        "cosmos3_lora_alpha": args.backbone_lora_alpha,
         "online_trained": is_online,
+        "online_backbone": args.online_backbone if is_online else None,
         "augmented": args.augment,
         "train_stride": args.train_stride if is_online else None,
     }
+    if "cosmos3" in backend_val:
+        deployment_cfg.update(
+            {
+                "cosmos3_checkpoint": str(
+                    args.backbone_checkpoint or "/home/anton/.cache/video-vam/cosmos3-edge"
+                ),
+                "cosmos3_lora_weights": str(args.backbone_lora_weights)
+                if args.backbone_lora_weights
+                else None,
+                "cosmos3_lora_rank": args.backbone_lora_rank,
+                "cosmos3_lora_alpha": args.backbone_lora_alpha,
+            }
+        )
+    elif backend_val == "cosmos":
+        deployment_cfg.update(
+            {
+                "cosmos_state_t": 2,
+                "cosmos_context_transform": "none",
+                "cosmos_checkpoint": str(
+                    args.backbone_checkpoint
+                    or "/home/anton/.cache/video-vam/mimic-video-f2833903/video_backbone/v2w_pretrained_cosmos.pt"
+                ),
+                "cosmos_lora_weights": str(args.backbone_lora_weights)
+                if args.backbone_lora_weights
+                else None,
+                "cosmos_lora_rank": args.backbone_lora_rank,
+                "cosmos_lora_alpha": args.backbone_lora_alpha,
+            }
+        )
+    elif backend_val == "flux2_klein":
+        deployment_cfg.update(
+            {
+                "flux2_tap_location": "junction",
+                "flux2_lora_weights": str(args.backbone_lora_weights) if args.backbone_lora_weights else None,
+                "flux2_lora_rank": args.backbone_lora_rank,
+                "flux2_lora_alpha": args.backbone_lora_alpha,
+            }
+        )
     (args.output_dir / "config.json").write_text(json.dumps(deployment_cfg, indent=2) + "\n")
 
     print(f"Training finished in {total_time:.1f}s. Summary written to {args.output_dir}")

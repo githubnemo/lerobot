@@ -990,6 +990,22 @@ def main(argv: list[str] | None = None) -> int:
             "/home/anton/lerobot-video-vam/outputs/train/v2-cosmos3-edge-lora-smolexpert",
             "video_vam",
         ),
+        "cosmos3_aug_v1": (
+            "/home/anton/lerobot-video-vam/outputs/train/v1-cosmos3-edge-lora-online-aug-smolexpert",
+            "video_vam",
+        ),
+        "cosmos3_aug_v2": (
+            "/home/anton/lerobot-video-vam/outputs/train/v2-cosmos3-edge-lora-online-aug-smolexpert",
+            "video_vam",
+        ),
+        "cosmos2b_aug_v2": (
+            "/home/anton/lerobot-video-vam/outputs/train/v2-cosmos2b-t2-online-aug-smolexpert",
+            "video_vam",
+        ),
+        "flux2_aug_v2": (
+            "/home/anton/lerobot-video-vam/outputs/train/v2-flux2-klein-online-aug-smolexpert",
+            "video_vam",
+        ),
     }
 
     if args.checkpoint in aliases:
