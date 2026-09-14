@@ -520,8 +520,19 @@ class Cosmos3FeatureExtractor(BaseVAMExtractor):
     ) -> dict[int, Tensor]:
         """Forward latents through Cosmos 3 Transformer and tap requested layer representations."""
 
-        if latents.shape[0] != 1:
-            raise ValueError("Packed Cosmos 3 extraction currently requires batch size one")
+        if latents.shape[0] > 1:
+            batched_tapped: dict[int, list[Tensor]] = {lyr: [] for lyr in self.config.hidden_layers}
+            for b_idx in range(latents.shape[0]):
+                single_tapped = self.forward_transformer_blocks(
+                    latents[b_idx : b_idx + 1],
+                    text_conditioning=text_conditioning,
+                    timestep=timestep,
+                )
+                for lyr in self.config.hidden_layers:
+                    batched_tapped[lyr].append(single_tapped[lyr])
+            return {lyr: torch.cat(tensors, dim=0) for lyr, tensors in batched_tapped.items()}
+        if latents.shape[0] == 0:
+            raise ValueError("latents cannot be empty")
         # 1. Patchify latents and project to transformer hidden dim
         packed_latent, grid_shape = patchify_and_pack_cosmos3_vision_latents(
             latents, patch_size=self.config.latent_patch_size

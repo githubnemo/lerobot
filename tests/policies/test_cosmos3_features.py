@@ -397,3 +397,30 @@ def test_cosmos3_extractor_end_to_end_and_unified_dataset_compat(tmp_path: Path)
     assert item.state.shape == (6,)
     assert item.action.shape == (30, 6)
     assert item.action_is_pad.shape == (30,)
+
+
+def test_cosmos3_extractor_compilation_and_batched():
+    config = Cosmos3ExtractorConfig(
+        backbone_name="cosmos3-edge",
+        hidden_layers=(2,),
+        num_layers=2,
+        device="cpu",
+        compile_dit=False,
+    )
+    dummy_trans = build_tiny_real_cosmos3_transformer(num_layers=2, hidden_size=64)
+    dummy_tokenizer = MagicMock()
+    dummy_tokenizer.return_value.input_ids = [1, 2, 3]
+    extractor = Cosmos3FeatureExtractor(
+        config=config,
+        transformer=dummy_trans,
+        tokenizer=dummy_tokenizer,
+    )
+    # Check compile_transformer method exists and runs
+    extractor.compile_transformer(mode="default")
+    assert hasattr(extractor, "compile_vae")
+
+    # Check forward_transformer_blocks handles batch > 1
+    latents_b2 = torch.randn(2, 48, 2, 8, 8)
+    tapped = extractor.forward_transformer_blocks(latents_b2)
+    assert 2 in tapped
+    assert tapped[2].shape[0] == 2
