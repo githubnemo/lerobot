@@ -386,6 +386,10 @@ class Cosmos3ExtractorConfig(BaseExtractorConfig):
     lora_checkpoint: str | Path | None = None
     lora_rank: int = 16
     lora_alpha: float = 32.0
+    compile_dit: bool = False
+    compile_vae: bool = False
+    dit_compile_mode: str = "default"
+    vae_compile_mode: str = "reduce-overhead"
     extra_kwargs: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
@@ -468,6 +472,12 @@ class Cosmos3FeatureExtractor(BaseVAMExtractor):
         self._cached_prompt_embeds: Tensor | None = None
         self._init_prompt_tokens()
 
+        # 5. Optional compilation
+        if self.config.compile_dit:
+            self.compile_transformer(mode=self.config.dit_compile_mode)
+        if self.config.compile_vae and self.vae is not None:
+            self.compile_vae(mode=self.config.vae_compile_mode)
+
     def _init_prompt_tokens(self) -> None:
         if self.tokenizer is None:
             if self.config.checkpoint_path is None:
@@ -482,10 +492,24 @@ class Cosmos3FeatureExtractor(BaseVAMExtractor):
         with torch.no_grad():
             self._cached_prompt_embeds = self.transformer.embed_tokens(prompt_input_ids)
 
+    def compile_transformer(self, mode: str = "default") -> None:
+        """Compile targeted transformer layers with PyTorch Inductor kernel fusion."""
+        max_block = max(lyr - 1 for lyr in self.config.hidden_layers)
+        for i in range(max_block + 1):
+            if i < len(self.transformer.layers):
+                self.transformer.layers[i] = torch.compile(self.transformer.layers[i], mode=mode)
+
+    def compile_vae(self, mode: str = "reduce-overhead") -> None:
+        """Compile VAE encoder with PyTorch Inductor CUDA Graphs."""
+        if self.vae is not None and hasattr(self.vae, "encoder"):
+            self.vae.encoder = torch.compile(self.vae.encoder, mode=mode)
+
     def encode_latents(self, rgb_frames: Tensor) -> Tensor:
         """Encode RGB video [B, 3, T, H, W] into normalized VAE latents [B, 48, T_lat, H_lat, W_lat]."""
         if self.vae is None:
             raise Cosmos3FeatureError("VAE model is required for encode_latents()")
+        if hasattr(torch.compiler, "cudagraph_mark_step_begin"):
+            torch.compiler.cudagraph_mark_step_begin()
         return encode_cosmos3_video(self.vae, rgb_frames, sample_mode="argmax")
 
     def forward_transformer_blocks(

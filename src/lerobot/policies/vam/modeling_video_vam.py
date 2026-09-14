@@ -226,6 +226,7 @@ class VideoVAMPolicy(PreTrainedPolicy):
         elif self.config.backend == "cosmos3_edge":
             from .cosmos3_features import Cosmos3ExtractorConfig, Cosmos3FeatureExtractor
 
+            should_compile = getattr(self.config, "cosmos_torch_compile", False)
             extractor = Cosmos3FeatureExtractor(
                 Cosmos3ExtractorConfig(
                     backbone_name="cosmos3-edge",
@@ -236,6 +237,8 @@ class VideoVAMPolicy(PreTrainedPolicy):
                     fps=10.0,
                     prompt="take cube out of box",
                     lora_checkpoint=self.config.cosmos3_lora_weights,
+                    compile_dit=should_compile,
+                    compile_vae=should_compile,
                 )
             )
             return extractor, torch.zeros(1, 1, device=self.config.device)
