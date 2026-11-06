@@ -332,6 +332,123 @@ class MultiFrameSuccessDetector(nn.Module):
     ) -> Tensor:
         return torch.sigmoid(self.forward(seq_frames, seq_states, precomputed_vis=precomputed_vis))
 
+    def update_from_episode_buffer(
+        self,
+        episodes: list[dict[str, object]],
+        *,
+        anchor_cache: dict[str, Tensor] | None = None,
+        steps: int = 80,
+        lr: float = 2e-4,
+        batch_size: int = 32,
+    ) -> dict[str, float]:
+        """Fine-tune the Temporal Transformer & dual-phase heads online using rollout + human-annotated episodes."""
+        device = next(self.parameters()).device
+        seq_len = self.seq_len
+        vis_list: list[Tensor] = []
+        st_list: list[Tensor] = []
+        y_list: list[float] = []
+        pre_list: list[float] = []
+
+        for ep in episodes:
+            ep_steps = ep.get("steps")
+            if not isinstance(ep_steps, list) or len(ep_steps) < 4 or "vis_raw" not in ep_steps[0]:
+                continue
+            n_st = len(ep_steps)
+            rew = float(ep.get("reward", 0.0))  # type: ignore[arg-type]
+            is_human = bool(ep.get("human_labeled", False))
+            repeat = 3 if is_human else 1
+
+            if rew >= 0.5:
+                # Positive terminal release windows
+                pos_ends = [n_st - 1, max(0, n_st - 2)]
+                for _ in range(repeat):
+                    for end_i in pos_ends:
+                        for stride in (1, 2):
+                            if stride == 2 and end_i < seq_len:
+                                continue
+                            idxs = [max(0, end_i - (seq_len - 1 - k) * stride) for k in range(seq_len)]
+                            vis_list.append(torch.stack([ep_steps[j]["vis_raw"] for j in idxs], dim=0))
+                            st_list.append(torch.stack([ep_steps[j]["state"] for j in idxs], dim=0))
+                            y_list.append(1.0)
+                            pre_list.append(1.0)
+                # Early approach windows in the same episode are negatives (not released yet)
+                for end_i in range(2, max(2, n_st - 6), 2):
+                    idxs = [max(0, end_i - (seq_len - 1 - k)) for k in range(seq_len)]
+                    vis_list.append(torch.stack([ep_steps[j]["vis_raw"] for j in idxs], dim=0))
+                    st_list.append(torch.stack([ep_steps[j]["state"] for j in idxs], dim=0))
+                    y_list.append(0.0)
+                    pre_list.append(0.0)
+            else:
+                # Failed episode: all windows are negative; upweight any false-positive spikes
+                for end_i in range(3, n_st):
+                    det_p = float(ep_steps[end_i].get("det_prob", 0.0))
+                    reps = (repeat * 3) if det_p >= 0.4 else (1 if end_i % 2 == 0 else 0)
+                    for _ in range(reps):
+                        for stride in (1, 2):
+                            if stride == 2 and end_i < seq_len:
+                                continue
+                            idxs = [max(0, end_i - (seq_len - 1 - k) * stride) for k in range(seq_len)]
+                            vis_list.append(torch.stack([ep_steps[j]["vis_raw"] for j in idxs], dim=0))
+                            st_list.append(torch.stack([ep_steps[j]["state"] for j in idxs], dim=0))
+                            y_list.append(0.0)
+                            pre_list.append(0.0)
+
+        if not vis_list:
+            return {"loss": 0.0, "num_windows": 0.0}
+
+        on_vis = torch.stack(vis_list, dim=0).to(device, dtype=torch.float32)
+        on_st = torch.stack(st_list, dim=0).to(device, dtype=torch.float32)
+        on_y = torch.tensor(y_list, device=device, dtype=torch.float32)
+        on_pre = torch.tensor(pre_list, device=device, dtype=torch.float32)
+        n_on = on_vis.shape[0]
+
+        trainable_params = [p for p in self.parameters() if p.requires_grad]
+        optimizer = torch.optim.AdamW(trainable_params, lr=lr, weight_decay=1e-4)
+        self.train()
+        last_loss = 0.0
+
+        has_anchor = (
+            anchor_cache is not None
+            and "vis_seq" in anchor_cache
+            and anchor_cache["vis_seq"].shape[0] > 0
+        )
+        for _ in range(steps):
+            b_on = min(batch_size // 2 if has_anchor else batch_size, n_on)
+            idx_on = torch.randint(0, n_on, (b_on,), device=device)
+            v_b = on_vis[idx_on]
+            s_b = on_st[idx_on]
+            y_b = on_y[idx_on]
+            p_b = on_pre[idx_on]
+
+            if has_anchor and anchor_cache is not None:
+                n_anc = anchor_cache["vis_seq"].shape[0]
+                b_anc = max(1, batch_size - b_on)
+                idx_anc = torch.randint(0, n_anc, (b_anc,))
+                v_anc = anchor_cache["vis_seq"][idx_anc].to(device, dtype=torch.float32)
+                s_anc = anchor_cache["state_seq"][idx_anc].to(device, dtype=torch.float32)
+                y_anc = anchor_cache["y"][idx_anc].to(device, dtype=torch.float32)
+                p_anc = anchor_cache["pre"][idx_anc].to(device, dtype=torch.float32)
+                v_b = torch.cat([v_b, v_anc], dim=0)
+                s_b = torch.cat([s_b, s_anc], dim=0)
+                y_b = torch.cat([y_b, y_anc], dim=0)
+                p_b = torch.cat([p_b, p_anc], dim=0)
+
+            dummy_f = torch.empty(v_b.shape[0], seq_len, 3, 1, 1, device=device)
+            joint_logit, pre_logit = self.forward_with_aux(
+                dummy_f, s_b, precomputed_vis=v_b, proprio_dropout=0.15, token_dropout=0.1
+            )
+            loss_joint = F.binary_cross_entropy_with_logits(joint_logit, y_b)
+            loss_pre = F.binary_cross_entropy_with_logits(pre_logit, p_b)
+            loss = loss_joint + 0.4 * loss_pre
+            optimizer.zero_grad(set_to_none=True)
+            loss.backward()
+            nn.utils.clip_grad_norm_(trainable_params, 1.0)
+            optimizer.step()
+            last_loss = float(loss.item())
+
+        self.eval()
+        return {"loss": last_loss, "num_windows": float(n_on)}
+
 
 class SharedFeatureSequenceDetector(nn.Module):
     """Zero-backbone-overhead Multi-Frame Sequence Detector operating directly on frozen

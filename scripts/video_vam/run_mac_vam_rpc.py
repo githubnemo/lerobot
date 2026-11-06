@@ -531,8 +531,9 @@ class VideoVAMRPCClient:
         update_critic: bool = False,
         update_steps: int = 600,
         save_checkpoint: str | None = None,
+        manual_reward: float | None = None,
     ) -> dict[str, Any]:
-        payload = {
+        payload: dict[str, Any] = {
             "identity": self.health["identity"],
             "instance_id": self.health["instance_id"],
             "spawn_group": int(spawn_group),
@@ -540,6 +541,8 @@ class VideoVAMRPCClient:
             "update_steps": int(update_steps),
             "save_checkpoint": save_checkpoint,
         }
+        if manual_reward is not None:
+            payload["manual_reward"] = float(manual_reward)
         command = shlex.join(
             [
                 "curl",
@@ -579,6 +582,63 @@ class VideoVAMRPCClient:
         if not isinstance(result, dict) or "error" in result:
             raise RuntimeError(f"RPC episode_complete error: {result}")
         return result
+
+    def override_episode(self, *, ep_index: int, reward: float) -> dict[str, Any]:
+        payload = {
+            "ep_index": int(ep_index),
+            "reward": float(reward),
+        }
+        command = shlex.join(
+            [
+                "curl",
+                "--fail-with-body",
+                "--silent",
+                "--show-error",
+                "--connect-timeout",
+                "3",
+                "--max-time",
+                str(self.timeout),
+                "-X",
+                "POST",
+                f"http://127.0.0.1:{self.port}/override_episode",
+                "-H",
+                "Content-Type: application/json",
+                "--data-binary",
+                "@-",
+            ]
+        )
+        cmd = (
+            ["bash", "-c", command]
+            if _is_local_host(self.ssh_host)
+            else [_ssh_executable(), *SSH_OPTIONS, self.ssh_host, command]
+        )
+        completed = subprocess.run(
+            cmd,
+            input=json.dumps(payload, allow_nan=False).encode(),
+            capture_output=True,
+            check=False,
+            timeout=self.timeout + 12,
+        )
+        if completed.returncode:
+            raise RuntimeError(f"Override RPC failed: {completed.stderr.decode(errors='replace')}")
+        return json.loads(completed.stdout)
+
+
+def _poll_key() -> str | None:
+    """Non-blocking single-character poll from stdin if available."""
+    import select
+    import sys
+
+    try:
+        if not sys.stdin.isatty():
+            return None
+        rlist, _, _ = select.select([sys.stdin], [], [], 0.0)
+        if rlist:
+            ch = sys.stdin.read(1)
+            return ch.lower() if ch else None
+    except Exception:
+        return None
+    return None
 
 
 def planned_inference_delay(latency_s: float | None, fps: int) -> int:
@@ -781,8 +841,9 @@ def _run_single_episode(
     args: argparse.Namespace,
     client: VideoVAMRPCClient,
     executor: ThreadPoolExecutor,
-) -> None:
+) -> float | None:
     future: Future[dict[str, Any]] | None = None
+    manual_reward: float | None = None
     rtc = args.inference_type == "rtc"
     queue = ActionQueue(RTCConfig(enabled=rtc, execution_horizon=args.execution_horizon))
     latencies = LatencyTracker(maxlen=20)
@@ -823,7 +884,22 @@ def _run_single_episode(
                 result = future.result()
                 original, actions = _chunks_from_result(result, horizon)
                 latency = time.monotonic() - started
-                print(f"[RPC] Chunk received: {latency:.3f}s (phase: {phase}, queue: {queue.qsize()})")
+                det_p = float(result.get("reward_prob", 0.0))
+                pre_p = float(result.get("pre_grasp_prob", 0.0))
+                edit_norm = float(result.get("edit_norm", 0.0))
+                chunk_idx = int(result.get("chunk_idx", 0))
+                det_str = (
+                    f" | chunk={chunk_idx} grip={state[5]:.1f}° pre_p={pre_p:.2f} det_p={det_p:.3f} Δa={edit_norm:.2f}°"
+                    if chunk_idx > 0
+                    else ""
+                )
+                print(f"[RPC] Chunk received: {latency:.3f}s (phase: {phase}, queue: {queue.qsize()}{det_str})")
+                if running and result.get("reward_detected"):
+                    print(
+                        f"🎯 [LIVE REWARD DETECTED] MultiFrameSuccessDetector p={det_p:.3f} "
+                        f"— completing drop (1.0s) and ending episode!"
+                    )
+                    deadline = min(deadline, time.monotonic() + 1.0)
                 future = None
                 if phase == "warmup":
                     # Warm up RTC guided branch as well before starting episode execution.
@@ -895,6 +971,18 @@ def _run_single_episode(
                     future = executor.submit(client.request, snapshot)
             is_action_tick = (obs_ticks % action_stride) == 0
             obs_ticks += 1
+            key = _poll_key()
+            if running and key in ("s", "f") and manual_reward is None:
+                if key == "s":
+                    manual_reward = 1.0
+                    print(
+                        "\n⌨️ [HUMAN KEYPRESS 's'] Marked SUCCESS (1.0) — completing drop (0.8s) and ending episode!"
+                    )
+                    deadline = min(deadline, time.monotonic() + 0.8)
+                else:
+                    manual_reward = 0.0
+                    print("\n⌨️ [HUMAN KEYPRESS 'f'] Marked FAIL (0.0) — ending episode immediately!")
+                    deadline = min(deadline, time.monotonic())
             if is_action_tick:
                 step = queue.get() if running else None
                 if step is not None:
@@ -920,9 +1008,14 @@ def _run_single_episode(
             _sleep_until(min(next_tick, deadline))
         if not running:
             raise RuntimeError("Warmup/initial inference exceeded startup deadline")
+        return manual_reward
     finally:
         if future is not None:
-            future.cancel()
+            import contextlib
+
+            if not future.cancel():
+                with contextlib.suppress(Exception):
+                    future.result(timeout=5.0)
 
 
 def _run_rollout(args: argparse.Namespace, client: VideoVAMRPCClient) -> None:
@@ -960,49 +1053,91 @@ def _run_rollout(args: argparse.Namespace, client: VideoVAMRPCClient) -> None:
             or getattr(args, "shared_detector_checkpoint", None) is not None
         )
         update_interval = max(1, int(getattr(args, "online_update_interval", 5)))
-        while episodes < target_episodes:
-            episodes += 1
-            print(f"\n{'=' * 55}")
-            print(f"🎬 Starting Episode {episodes} (Duration: {args.duration:.0f}s)")
-            print(f"{'=' * 55}")
+        import contextlib
+        import sys
+        import termios
+        import tty
 
-            _run_single_episode(robot, args, client, executor)
-
-            if online_enabled:
-                should_update = (episodes % update_interval == 0) or (episodes == target_episodes)
-                ep_stats = client.complete_episode(
-                    spawn_group=getattr(args, "spawn_group", 0),
-                    update_critic=should_update,
-                    update_steps=getattr(args, "online_update_steps", 600),
-                    save_checkpoint=getattr(args, "expo_checkpoint", None),
-                )
-                rew_icon = "✅ SUCCESS (1.0)" if ep_stats.get("reward", 0.0) >= 0.5 else "❌ FAIL (0.0)"
+        old_term = None
+        if sys.stdin.isatty():
+            with contextlib.suppress(Exception):
+                old_term = termios.tcgetattr(sys.stdin.fileno())
+                tty.setcbreak(sys.stdin.fileno())
+        try:
+            while episodes < target_episodes:
+                episodes += 1
+                print(f"\n{'=' * 65}")
                 print(
-                    f"[EXPO-ONLINE] Ep {episodes}: {rew_icon} "
-                    f"(p={ep_stats.get('reward_prob', 0.0):.3f}, "
-                    f"group={ep_stats.get('spawn_group', 0)}, "
-                    f"R_mean={ep_stats.get('group_mean_reward', 0.0):.2f}, "
-                    f"A_dr_grpo={ep_stats.get('advantage', 0.0):+.2f})"
+                    f"🎬 Starting Episode {episodes} (Duration: {args.duration:.0f}s) "
+                    f"[Press 's'=Success, 'f'=Fail anytime]"
                 )
-                if ep_stats.get("critic_updated"):
-                    print(
-                        f"  🔥 Updated ExpoResidualCritic on {ep_stats.get('episode_count', episodes)} "
-                        f"episodes (loss={ep_stats.get('update_loss', 0.0):.4f})"
-                    )
+                print(f"{'=' * 65}")
 
-            if episodes < target_episodes:
-                print(f"\n[RESET] Episode {episodes} complete. Smoothly returning to base position...")
-                _smooth_move_to(robot, home_pose, duration_s=getattr(args, "home_duration", 2.0))
-                print(f"[RESET] Base position reached. Reset the scene ({args.reset_time:.0f}s)...")
-                reset_time = getattr(args, "reset_time", 6.0)
-                countdown_start = time.monotonic()
-                while time.monotonic() - countdown_start < reset_time:
-                    remaining = reset_time - (time.monotonic() - countdown_start)
-                    print(f"  ⏳ Reset countdown: {int(remaining) + 1}s...", end="\r", flush=True)
-                    time.sleep(0.5)
-                print("\n  ✅ Reset countdown complete! Starting next episode.")
-                client.frames.clear()
-                client.frame_times.clear()
+                live_manual_reward = _run_single_episode(robot, args, client, executor)
+
+                if online_enabled:
+                    should_update = (episodes % update_interval == 0) or (episodes == target_episodes)
+                    ep_stats = client.complete_episode(
+                        spawn_group=getattr(args, "spawn_group", 0),
+                        update_critic=should_update,
+                        update_steps=getattr(args, "online_update_steps", 600),
+                        save_checkpoint=getattr(args, "expo_checkpoint", None),
+                        manual_reward=live_manual_reward,
+                    )
+                    rew_icon = "✅ SUCCESS (1.0)" if ep_stats.get("reward", 0.0) >= 0.5 else "❌ FAIL (0.0)"
+                    src_tag = "HUMAN-KEY" if live_manual_reward is not None else "DETECTOR"
+                    print(
+                        f"[EXPO-ONLINE] Ep {episodes} ({src_tag}): {rew_icon} "
+                        f"(p={ep_stats.get('reward_prob', 0.0):.3f}, "
+                        f"group={ep_stats.get('spawn_group', 0)}, "
+                        f"R_mean={ep_stats.get('group_mean_reward', 0.0):.2f}, "
+                        f"A_dr_grpo={ep_stats.get('advantage', 0.0):+.2f})"
+                    )
+                    if ep_stats.get("critic_updated"):
+                        det_loss_val = ep_stats.get("detector_loss")
+                        det_msg = (
+                            f" | Detector fine-tuned (loss={det_loss_val:.4f})"
+                            if det_loss_val is not None
+                            else ""
+                        )
+                        print(
+                            f"  🔥 Updated ExpoResidualCritic on {ep_stats.get('episode_count', episodes)} "
+                            f"episodes (loss={ep_stats.get('update_loss', 0.0):.4f}){det_msg}"
+                        )
+
+                if episodes < target_episodes:
+                    print(f"\n[RESET] Episode {episodes} complete. Smoothly returning to base position...")
+                    _smooth_move_to(robot, home_pose, duration_s=getattr(args, "home_duration", 2.0))
+                    print(
+                        f"[RESET] Base position reached. Reset the scene ({args.reset_time:.0f}s) "
+                        f"[Press 's'=Override Success, 'f'=Override Fail]..."
+                    )
+                    reset_time = getattr(args, "reset_time", 6.0)
+                    countdown_start = time.monotonic()
+                    while time.monotonic() - countdown_start < reset_time:
+                        key = _poll_key()
+                        if online_enabled and key in ("s", "f"):
+                            ov_rew = 1.0 if key == "s" else 0.0
+                            ov_res = client.override_episode(ep_index=episodes - 1, reward=ov_rew)
+                            ov_icon = "✅ SUCCESS (1.0)" if ov_rew >= 0.5 else "❌ FAIL (0.0)"
+                            print(
+                                f"\n  ⌨️ [HUMAN OVERRIDE '{key}'] Ep {episodes} -> {ov_icon} "
+                                f"(Critic loss={ov_res.get('loss')}, Detector loss={ov_res.get('detector_loss')})"
+                            )
+                        remaining = reset_time - (time.monotonic() - countdown_start)
+                        print(
+                            f"  ⏳ Reset countdown: {int(remaining) + 1}s (press 's'/'f' to override)...",
+                            end="\r",
+                            flush=True,
+                        )
+                        time.sleep(0.2)
+                    print("\n  ✅ Reset countdown complete! Starting next episode.")
+                    client.frames.clear()
+                    client.frame_times.clear()
+        finally:
+            if old_term is not None:
+                with contextlib.suppress(Exception):
+                    termios.tcsetattr(sys.stdin.fileno(), termios.TCSADRAIN, old_term)
     except KeyboardInterrupt:
         print("\n\n[INTERRUPT] Received Ctrl+C. Stopping episode loop...")
     finally:

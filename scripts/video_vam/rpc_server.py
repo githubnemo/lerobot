@@ -251,41 +251,99 @@ class RPCApplication:
             self.history_key = f"{config.camera_key}.history"
             self.history_index_key = HISTORY_FRAME_INDEX_KEY
             self.config = config
-            self.expo_critic = None
-            self.expo_checkpoint_path = getattr(args, "expo_checkpoint", None)
-            self.shared_detector = None
-            self.current_episode_steps: list[dict[str, torch.Tensor]] = []
-            self.online_rollout_buffer: list[dict[str, Any]] = []
-            if getattr(args, "shared_detector_checkpoint", None) is not None:
+
+        self.expo_critic = None
+        self.expo_checkpoint_path = getattr(args, "expo_checkpoint", None)
+        self.shared_detector = None
+        self.multiframe_detector = None
+        self.current_episode_steps: list[dict[str, Any]] = []
+        self.online_rollout_buffer: list[dict[str, Any]] = []
+        self.latest_frame_b64: str | None = None
+        self.last_update_loss: float | None = None
+        self.last_detector_loss: float | None = None
+        self.detector_checkpoint_path = getattr(args, "shared_detector_checkpoint", None)
+        self.detector_anchor_cache: dict[str, torch.Tensor] | None = None
+        anchor_file = Path(__file__).resolve().parents[2] / "outputs/sparse_seq_rl/real_detector_features_v2.pt"
+        if anchor_file.is_file():
+            raw_anc = torch.load(anchor_file, map_location="cpu", weights_only=False)
+            if isinstance(raw_anc, dict) and "train" in raw_anc:
+                self.detector_anchor_cache = raw_anc["train"]
+        if getattr(args, "shared_detector_checkpoint", None) is not None:
+            det_ckpt = torch.load(
+                args.shared_detector_checkpoint, map_location=self.device, weights_only=False
+            )
+            det_state = (
+                det_ckpt["state_dict"]
+                if isinstance(det_ckpt, dict) and "state_dict" in det_ckpt
+                else det_ckpt
+            )
+            is_multiframe = (
+                (isinstance(det_ckpt, dict) and det_ckpt.get("detector_type") == "multiframe")
+                or any(k.startswith("stem.") or k.startswith("vis_in_norm.") for k in det_state)
+            )
+            if is_multiframe:
+                from lerobot.rewards.sequence_detector import MultiFrameSuccessDetector
+
+                seq_len = int(det_ckpt.get("seq_len", 8)) if isinstance(det_ckpt, dict) else 8
+                self.multiframe_detector = MultiFrameSuccessDetector(
+                    seq_len=seq_len, state_dim=6, pretrained=True
+                ).to(self.device)
+                self.multiframe_detector.load_state_dict(det_state, strict=False)
+                self.multiframe_detector.eval()
+            else:
                 from lerobot.rewards.sequence_detector import SharedFeatureSequenceDetector
 
-                det_ckpt = torch.load(
-                    args.shared_detector_checkpoint, map_location=self.device, weights_only=False
-                )
-                det_state = det_ckpt["state_dict"] if isinstance(det_ckpt, dict) and "state_dict" in det_ckpt else det_ckpt
                 seq_len = int(det_ckpt.get("seq_len", 12)) if isinstance(det_ckpt, dict) else 12
                 self.shared_detector = SharedFeatureSequenceDetector(seq_len=seq_len).to(self.device)
                 self.shared_detector.load_state_dict(det_state, strict=False)
                 self.shared_detector.eval()
-            if self.expo_checkpoint_path is not None or self.shared_detector is not None:
-                from lerobot.policies.vam.expo_residual import ExpoResidualCritic
 
-                if self.expo_checkpoint_path is not None and Path(self.expo_checkpoint_path).is_file():
-                    raw_ckpt = torch.load(
-                        self.expo_checkpoint_path, map_location=self.device, weights_only=False
-                    )
-                    if isinstance(raw_ckpt, dict) and "state_dict" in raw_ckpt:
-                        state_dict = raw_ckpt["state_dict"]
-                        expo_cfg = raw_ckpt.get("config", {})
-                        self.expo_critic = ExpoResidualCritic(**expo_cfg).to(self.device)
-                    else:
-                        state_dict = raw_ckpt
-                        use_init_anchor = any(k.startswith("init_proj.") for k in state_dict)
-                        self.expo_critic = ExpoResidualCritic(use_init_anchor=use_init_anchor).to(self.device)
-                    self.expo_critic.load_state_dict(state_dict, strict=False)
+        if (
+            self.expo_checkpoint_path is not None
+            or self.shared_detector is not None
+            or self.multiframe_detector is not None
+        ):
+            from lerobot.policies.vam.expo_residual import ExpoResidualCritic
+
+            default_ctx_dim = 512 if self.name == "smolvla" else 2048
+            if self.expo_checkpoint_path is not None and Path(self.expo_checkpoint_path).is_file():
+                raw_ckpt = torch.load(
+                    self.expo_checkpoint_path, map_location=self.device, weights_only=False
+                )
+                if isinstance(raw_ckpt, dict) and "state_dict" in raw_ckpt:
+                    state_dict = raw_ckpt["state_dict"]
+                    expo_cfg = raw_ckpt.get("config", {})
+                    self.expo_critic = ExpoResidualCritic(**expo_cfg).to(self.device)
                 else:
-                    self.expo_critic = ExpoResidualCritic(use_init_anchor=True).to(self.device)
-                self.expo_critic.eval()
+                    state_dict = raw_ckpt
+                    use_init_anchor = any(k.startswith("init_proj.") for k in state_dict)
+                    self.expo_critic = ExpoResidualCritic(
+                        ctx_dim=default_ctx_dim,
+                        chunk_len=self.horizon,
+                        use_init_anchor=use_init_anchor,
+                    ).to(self.device)
+                self.expo_critic.load_state_dict(state_dict, strict=False)
+            elif self.name == "smolvla":
+                if self.multiframe_detector is None:
+                    from lerobot.rewards.sequence_detector import MultiFrameSuccessDetector
+
+                    self.multiframe_detector = MultiFrameSuccessDetector(
+                        seq_len=8, state_dim=6, pretrained=True
+                    ).to(self.device)
+                    self.multiframe_detector.eval()
+                self.expo_critic = ExpoResidualCritic(
+                    ctx_dim=512,
+                    state_dim=6,
+                    chunk_len=self.horizon,
+                    use_init_anchor=True,
+                    base_alpha=1.0,
+                    curr_scale=1.0,
+                    max_delta_deg=8.0,
+                    zero_init_edit=True,
+                ).to(self.device)
+            else:
+                self.expo_critic = ExpoResidualCritic(use_init_anchor=True).to(self.device)
+            self.expo_critic.eval()
         from lerobot.policies.rtc.configuration_rtc import RTCConfig
 
         if not 1 <= self.execution_horizon <= self.horizon:
@@ -369,8 +427,87 @@ class RPCApplication:
             # Each RPC supplies a complete observation, independent of other clients.
             self.policy.reset()
             original = self.policy.predict_action_chunk(processed, noise=noise, **kwargs)
-            actions = self.backend.postprocessor(original.clone())[0].cpu()
+            base_actions = self.backend.postprocessor(original.clone())[0].cpu()
+            actions = base_actions.clone()
             original = original[0].cpu()
+            live_reward_detected = False
+            live_reward_prob = 0.0
+            live_pre_grasp_prob = 0.0
+            live_edit_norm = 0.0
+            if isinstance(value, str):
+                self.latest_frame_b64 = value
+            if getattr(self, "expo_critic", None) is not None and getattr(self, "multiframe_detector", None) is not None:
+                import torch.nn.functional as F
+
+                img_t = observation["observation.images.front"].unsqueeze(0).to(self.device)
+                img_128 = F.interpolate(img_t, size=(128, 128), mode="bilinear", align_corners=False)
+                fmap = self.multiframe_detector.stem(self.multiframe_detector.norm(img_128))
+                gap = fmap.mean(dim=(-2, -1))
+                quad = F.adaptive_avg_pool2d(fmap, (2, 2)).flatten(1)
+                jaw_roi = fmap[:, :, 2:, 1:3].mean(dim=(-2, -1))
+                vis_raw = torch.cat([gap, quad, jaw_roi], dim=-1)
+                p12 = F.adaptive_avg_pool2d(fmap, (3, 4)).reshape(1, 1, 512, 12).permute(0, 1, 3, 2)
+                ctx_pooled = p12.expand(1, 2, 12, 512).reshape(1, 24, 512)
+
+                state_t = state.unsqueeze(0).to(self.device, dtype=torch.float32)
+                if self.rtc_enabled and "prev_chunk_left_over" not in kwargs:
+                    self.current_episode_steps.clear()
+                ep_step_idx = len(self.current_episode_steps)
+                t_norm = torch.tensor([[min(1.0, ep_step_idx / 80.0)]], device=self.device, dtype=torch.float32)
+                if ep_step_idx == 0:
+                    self.expo_critic.reset_episode()
+                edited = self.expo_critic.forward_edit(
+                    ctx_pooled, state_t, t_norm, base_actions.unsqueeze(0).to(self.device)
+                )[0].cpu()
+                live_edit_norm = float((edited - base_actions).abs().mean().item())
+                # Smooth low-amplitude exploration perturbation on arm joints for Score-Centered RL innovation
+                expl_gen = torch.Generator().manual_seed(
+                    int((supplied_seed or 0) * 1009 + self.frame_index * 37 + len(self.online_rollout_buffer) * 997)
+                )
+                arm_noise = torch.randn((1, 5), generator=expl_gen) * 1.0
+                ramp = torch.sin(torch.linspace(0.0, math.pi, self.horizon)).unsqueeze(-1)
+                expl_delta = torch.zeros_like(edited)
+                expl_delta[:, :5] = ramp * arm_noise
+                actions = edited + expl_delta
+                self.current_episode_steps.append(
+                    {
+                        "ctx": ctx_pooled[0].detach().cpu(),
+                        "vis_raw": vis_raw[0].detach().cpu(),
+                        "state": state.detach().cpu(),
+                        "t_norm": t_norm[0].detach().cpu(),
+                        "base_action": base_actions.detach().cpu(),
+                        "exec_action": actions.detach().cpu(),
+                        "det_prob": 0.0,
+                        "pre_grasp_prob": 0.0,
+                        "edit_norm": live_edit_norm,
+                    }
+                )
+                seq_len = self.multiframe_detector.seq_len
+                n_st = len(self.current_episode_steps)
+                if n_st >= 5:
+                    end_i = n_st - 1
+                    cand_vis, cand_st = [], []
+                    for stride in (1, 2):
+                        if stride == 2 and n_st < seq_len + 2:
+                            continue
+                        idxs = [max(0, end_i - (seq_len - 1 - k) * stride) for k in range(seq_len)]
+                        cand_vis.append(torch.stack([self.current_episode_steps[j]["vis_raw"] for j in idxs], dim=0))
+                        cand_st.append(torch.stack([self.current_episode_steps[j]["state"] for j in idxs], dim=0))
+                    vb = torch.stack(cand_vis, dim=0).to(self.device)
+                    sb = torch.stack(cand_st, dim=0).to(self.device)
+                    dummy_f = torch.empty(vb.shape[0], seq_len, 3, 1, 1, device=self.device)
+                    joint_logits, pre_logits = self.multiframe_detector.forward_with_aux(
+                        dummy_f, sb, precomputed_vis=vb
+                    )
+                    probs = torch.sigmoid(joint_logits)
+                    pre_probs = torch.sigmoid(pre_logits)
+                    best_k = int(probs.argmax().item())
+                    live_reward_prob = float(probs[best_k].item())
+                    live_pre_grasp_prob = float(pre_probs[best_k].item())
+                    self.current_episode_steps[-1]["det_prob"] = live_reward_prob
+                    self.current_episode_steps[-1]["pre_grasp_prob"] = live_pre_grasp_prob
+                    if live_reward_prob >= 0.80:
+                        live_reward_detected = True
         else:
             frames = _frame(value)
             if frames.ndim != 4 or frames.shape[0] != HISTORY:
@@ -437,6 +574,11 @@ class RPCApplication:
             "request_id": request_id,
             "policy": self.name,
             "latency_s": time.perf_counter() - started,
+            "reward_detected": live_reward_detected if self.name == "smolvla" else False,
+            "reward_prob": live_reward_prob if self.name == "smolvla" else 0.0,
+            "pre_grasp_prob": live_pre_grasp_prob if self.name == "smolvla" else 0.0,
+            "edit_norm": live_edit_norm if self.name == "smolvla" else 0.0,
+            "chunk_idx": len(self.current_episode_steps),
         }
 
     def complete_episode(self, payload: dict[str, Any]) -> dict[str, Any]:
@@ -457,6 +599,31 @@ class RPCApplication:
         if manual_reward is not None:
             reward_prob = float(manual_reward)
             reward = 1.0 if reward_prob >= 0.5 else 0.0
+        elif getattr(self, "multiframe_detector", None) is not None and steps and "vis_raw" in steps[0]:
+            seq_len = self.multiframe_detector.seq_len
+            n_st = len(steps)
+            win_vis_list = []
+            win_st_list = []
+            win_ends = []
+            start_end_i = 4 if n_st > 4 else max(0, n_st - 1)
+            for end_i in range(start_end_i, n_st):
+                for stride in (1, 2):
+                    if stride == 2 and end_i < seq_len:
+                        continue
+                    idxs = [max(0, end_i - (seq_len - 1 - k) * stride) for k in range(seq_len)]
+                    win_vis_list.append(torch.stack([steps[j]["vis_raw"] for j in idxs], dim=0))
+                    win_st_list.append(torch.stack([steps[j]["state"] for j in idxs], dim=0))
+                    win_ends.append(end_i)
+            vis_batch = torch.stack(win_vis_list, dim=0).to(self.device)
+            st_batch = torch.stack(win_st_list, dim=0).to(self.device)
+            dummy_f = torch.empty(vis_batch.shape[0], seq_len, 3, 1, 1, device=self.device)
+            probs = self.multiframe_detector.predict_proba(dummy_f, st_batch, precomputed_vis=vis_batch)
+            best_w = int(probs.argmax().item())
+            reward_prob = float(probs[best_w].item())
+            reward = 1.0 if reward_prob >= 0.80 else 0.0
+            if reward >= 0.5:
+                peak_end = win_ends[best_w]
+                steps = steps[: min(n_st, peak_end + 2)]
         elif getattr(self, "shared_detector", None) is not None and steps:
             seq_len = self.shared_detector.seq_len
             if len(steps) >= seq_len:
@@ -479,6 +646,7 @@ class RPCApplication:
                     "reward": reward,
                     "reward_prob": reward_prob,
                     "spawn_group": spawn_group,
+                    "human_labeled": manual_reward is not None,
                 }
             )
 
@@ -493,17 +661,54 @@ class RPCApplication:
 
         critic_updated = False
         update_loss = None
+        detector_updated = False
+        detector_loss = None
         if update_critic and getattr(self, "expo_critic", None) is not None and self.online_rollout_buffer:
             stats = self.expo_critic.update_from_episode_buffer(
                 self.online_rollout_buffer, steps=update_steps
             )
             critic_updated = True
             update_loss = float(stats["loss"])
+            self.last_update_loss = update_loss
             save_path = payload.get("save_checkpoint") or getattr(self, "expo_checkpoint_path", None)
             if save_path:
                 out_p = Path(save_path)
                 out_p.parent.mkdir(parents=True, exist_ok=True)
-                torch.save(self.expo_critic.state_dict(), out_p)
+                torch.save(
+                    {
+                        "state_dict": self.expo_critic.state_dict(),
+                        "config": {
+                            "ctx_dim": self.expo_critic.ctx_dim,
+                            "state_dim": self.expo_critic.state_dim,
+                            "chunk_len": self.expo_critic.chunk_len,
+                            "use_init_anchor": self.expo_critic.use_init_anchor,
+                            "base_alpha": self.expo_critic.base_alpha,
+                            "curr_scale": self.expo_critic.curr_scale,
+                            "max_delta_deg": self.expo_critic.max_delta_deg,
+                        },
+                    },
+                    out_p,
+                )
+            if getattr(self, "multiframe_detector", None) is not None:
+                det_stats = self.multiframe_detector.update_from_episode_buffer(
+                    self.online_rollout_buffer,
+                    anchor_cache=self.detector_anchor_cache,
+                    steps=80,
+                )
+                if det_stats["num_windows"] > 0:
+                    detector_updated = True
+                    detector_loss = float(det_stats["loss"])
+                    self.last_detector_loss = detector_loss
+                    if self.detector_checkpoint_path:
+                        det_p = Path(self.detector_checkpoint_path)
+                        torch.save(
+                            {
+                                "detector_type": "multiframe",
+                                "seq_len": self.multiframe_detector.seq_len,
+                                "state_dict": self.multiframe_detector.state_dict(),
+                            },
+                            det_p,
+                        )
 
         return {
             "episode_count": len(self.online_rollout_buffer),
@@ -515,12 +720,207 @@ class RPCApplication:
             "advantage": latest_adv,
             "critic_updated": critic_updated,
             "update_loss": update_loss,
+            "detector_updated": detector_updated,
+            "detector_loss": detector_loss,
+        }
+
+    def live_state(self) -> dict[str, Any]:
+        from lerobot.policies.vam.expo_residual import compute_dr_grpo_advantages
+
+        steps = list(getattr(self, "current_episode_steps", []))
+        last_step = steps[-1] if steps else None
+        state_vec = last_step["state"].tolist() if last_step is not None and "state" in last_step else [0.0] * 6
+        det_trace = [round(float(s.get("det_prob", 0.0)), 4) for s in steps]
+        pre_trace = [round(float(s.get("pre_grasp_prob", 0.0)), 4) for s in steps]
+        edit_trace = [round(float(s.get("edit_norm", 0.0)), 3) for s in steps]
+        buf = list(getattr(self, "online_rollout_buffer", []))
+        all_rewards = [float(ep["reward"]) for ep in buf]
+        all_groups = [int(ep["spawn_group"]) for ep in buf]
+        adv_all = compute_dr_grpo_advantages(all_rewards, all_groups).tolist() if all_rewards else []
+        episodes_summary = [
+            {
+                "ep": idx + 1,
+                "reward": float(ep["reward"]),
+                "reward_prob": round(float(ep.get("reward_prob", 0.0)), 3),
+                "chunks": len(ep.get("steps", [])),
+                "advantage": round(float(adv_all[idx]), 3) if idx < len(adv_all) else 0.0,
+            }
+            for idx, ep in enumerate(buf)
+        ]
+        return {
+            "policy": self.name,
+            "checkpoint": Path(self.checkpoint_path).parent.name + "/" + Path(self.checkpoint_path).name,
+            "current_chunk": len(steps),
+            "state": [round(float(x), 1) for x in state_vec],
+            "det_prob": det_trace[-1] if det_trace else 0.0,
+            "pre_grasp_prob": pre_trace[-1] if pre_trace else 0.0,
+            "edit_norm": edit_trace[-1] if edit_trace else 0.0,
+            "det_trace": det_trace,
+            "pre_trace": pre_trace,
+            "edit_trace": edit_trace,
+            "episodes": episodes_summary,
+            "mean_reward": round(sum(all_rewards) / len(all_rewards), 3) if all_rewards else 0.0,
+            "last_update_loss": self.last_update_loss,
+            "frame_b64": getattr(self, "latest_frame_b64", None),
+        }
+
+    def override_episode(self, payload: dict[str, Any]) -> dict[str, Any]:
+        buf = getattr(self, "online_rollout_buffer", [])
+        if not buf:
+            return {"ok": False, "error": "no completed episodes in buffer"}
+        ep_idx = int(payload.get("ep_index", len(buf) - 1))
+        if not (0 <= ep_idx < len(buf)):
+            ep_idx = len(buf) - 1
+        new_rew = payload.get("reward")
+        if new_rew is None:
+            new_rew = 0.0 if float(buf[ep_idx]["reward"]) >= 0.5 else 1.0
+        buf[ep_idx]["reward"] = float(new_rew)
+        buf[ep_idx]["human_labeled"] = True
+        if getattr(self, "expo_critic", None) is not None:
+            stats = self.expo_critic.update_from_episode_buffer(buf, steps=300)
+            self.last_update_loss = float(stats["loss"])
+            if getattr(self, "expo_checkpoint_path", None):
+                out_p = Path(self.expo_checkpoint_path)
+                out_p.parent.mkdir(parents=True, exist_ok=True)
+                torch.save(
+                    {
+                        "state_dict": self.expo_critic.state_dict(),
+                        "config": {
+                            "ctx_dim": self.expo_critic.ctx_dim,
+                            "state_dim": self.expo_critic.state_dim,
+                            "chunk_len": self.expo_critic.chunk_len,
+                            "use_init_anchor": self.expo_critic.use_init_anchor,
+                            "base_alpha": self.expo_critic.base_alpha,
+                            "curr_scale": self.expo_critic.curr_scale,
+                            "max_delta_deg": self.expo_critic.max_delta_deg,
+                        },
+                    },
+                    out_p,
+                )
+        if getattr(self, "multiframe_detector", None) is not None:
+            det_stats = self.multiframe_detector.update_from_episode_buffer(
+                buf, anchor_cache=self.detector_anchor_cache, steps=80
+            )
+            if det_stats["num_windows"] > 0:
+                self.last_detector_loss = float(det_stats["loss"])
+                if self.detector_checkpoint_path:
+                    torch.save(
+                        {
+                            "detector_type": "multiframe",
+                            "seq_len": self.multiframe_detector.seq_len,
+                            "state_dict": self.multiframe_detector.state_dict(),
+                        },
+                        Path(self.detector_checkpoint_path),
+                    )
+        return {
+            "ok": True,
+            "ep": ep_idx + 1,
+            "new_reward": buf[ep_idx]["reward"],
+            "loss": self.last_update_loss,
+            "detector_loss": self.last_detector_loss,
         }
 
     def close(self) -> None:
         closer = getattr(self.backend, "close", None)
         if closer is not None:
             closer()
+
+
+DASHBOARD_HTML = """<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>SO-101 Live EXPO + MultiFrame Detector Dashboard</title>
+<style>
+  body { background: #0f172a; color: #f8fafc; font-family: system-ui, -apple-system, sans-serif; margin: 0; padding: 16px; }
+  .grid { display: grid; grid-template-columns: 420px 1fr; gap: 16px; max-width: 1360px; margin: 0 auto; }
+  .card { background: #1e293b; border: 1px solid #334155; border-radius: 10px; padding: 14px; }
+  h2 { margin: 0 0 10px 0; font-size: 16px; color: #38bdf8; }
+  .cam { width: 100%; border-radius: 8px; border: 1px solid #475569; background: #000; min-height: 280px; object-fit: contain; }
+  .bar-wrap { background: #0f172a; border-radius: 6px; height: 22px; overflow: hidden; margin: 6px 0 12px 0; border: 1px solid #334155; }
+  .bar { height: 100%; transition: width 0.2s ease; }
+  .metrics { display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; margin-bottom: 12px; }
+  .stat { background: #0f172a; padding: 8px 10px; border-radius: 6px; border: 1px solid #334155; }
+  .stat .lbl { font-size: 11px; color: #94a3b8; }
+  .stat .val { font-size: 18px; font-weight: 700; margin-top: 2px; }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th, td { padding: 7px 8px; text-align: left; border-bottom: 1px solid #334155; }
+  th { color: #94a3b8; }
+  button { background: #2563eb; color: #fff; border: none; border-radius: 5px; padding: 5px 10px; cursor: pointer; font-size: 12px; }
+  button:hover { background: #1d4ed8; }
+</style>
+</head>
+<body>
+<div class="grid">
+  <div class="card">
+    <h2>Wrist Camera (/dev/video0)</h2>
+    <img id="cam" class="cam" alt="Waiting for frame..." />
+    <div style="margin-top:12px;">
+      <div style="display:flex;justify-content:space-between;font-size:13px;"><span>Neural Success Prob (det_p ≥ 0.80)</span><b id="det_val">0.000</b></div>
+      <div class="bar-wrap"><div id="det_bar" class="bar" style="width:0%;background:#22c55e;"></div></div>
+      <div style="display:flex;justify-content:space-between;font-size:13px;"><span>Pre-Grasp Carry Gate (pre_p)</span><b id="pre_val">0.000</b></div>
+      <div class="bar-wrap"><div id="pre_bar" class="bar" style="width:0%;background:#38bdf8;"></div></div>
+      <div style="display:flex;justify-content:space-between;font-size:13px;"><span>EXPO Action Edit |Δa_φ| (deg)</span><b id="edit_val">0.00°</b></div>
+      <div class="bar-wrap"><div id="edit_bar" class="bar" style="width:0%;background:#f59e0b;"></div></div>
+    </div>
+  </div>
+  <div class="card">
+    <h2>Online EXPO + Multi-Frame Transformer Telemetry</h2>
+    <div class="metrics">
+      <div class="stat"><div class="lbl">Current Ep Chunk</div><div class="val" id="m_chunk">0</div></div>
+      <div class="stat"><div class="lbl">Gripper / Pan</div><div class="val" id="m_grip">0.0° / 0.0°</div></div>
+      <div class="stat"><div class="lbl">Session Success Rate</div><div class="val" id="m_sr">0%</div></div>
+      <div class="stat"><div class="lbl">Last Critic Loss</div><div class="val" id="m_loss">—</div></div>
+    </div>
+    <div style="font-size:12px;color:#94a3b8;margin-bottom:6px;">Current Episode Detector Trace (det_p per chunk): <span id="trace_txt" style="color:#e2e8f0;">[]</span></div>
+    <h2 style="margin-top:14px;">Completed Episodes (Click Flip to Override Misdetection & Re-Train Critic)</h2>
+    <table>
+      <thead><tr><th>Ep</th><th>Status</th><th>Peak det_p</th><th>Chunks</th><th>Dr. GRPO Adv</th><th>Override</th></tr></thead>
+      <tbody id="ep_body"></tbody>
+    </table>
+  </div>
+</div>
+<script>
+async function flipEp(idx) {
+  await fetch('/override_episode', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({ep_index: idx})});
+  refresh();
+}
+async function refresh() {
+  try {
+    const r = await fetch('/live_state');
+    const d = await r.json();
+    if (d.frame_b64) document.getElementById('cam').src = 'data:image/jpeg;base64,' + d.frame_b64;
+    document.getElementById('det_val').textContent = d.det_prob.toFixed(3);
+    document.getElementById('det_bar').style.width = Math.min(100, d.det_prob * 100) + '%';
+    document.getElementById('det_bar').style.background = d.det_prob >= 0.80 ? '#22c55e' : '#64748b';
+    document.getElementById('pre_val').textContent = d.pre_grasp_prob.toFixed(3);
+    document.getElementById('pre_bar').style.width = Math.min(100, d.pre_grasp_prob * 100) + '%';
+    document.getElementById('edit_val').textContent = d.edit_norm.toFixed(2) + '°';
+    document.getElementById('edit_bar').style.width = Math.min(100, d.edit_norm * 15) + '%';
+    document.getElementById('m_chunk').textContent = d.current_chunk;
+    document.getElementById('m_grip').textContent = (d.state[5]||0).toFixed(1) + '° / ' + (d.state[0]||0).toFixed(1) + '°';
+    document.getElementById('m_sr').textContent = (d.mean_reward * 100).toFixed(0) + '% (' + d.episodes.length + ' eps)';
+    document.getElementById('m_loss').textContent = d.last_update_loss !== null ? d.last_update_loss.toFixed(4) : '—';
+    document.getElementById('trace_txt').textContent = d.det_trace.slice(-16).map(x => x.toFixed(2)).join(' → ');
+    const tbody = document.getElementById('ep_body');
+    tbody.innerHTML = d.episodes.slice().reverse().map(e => `
+      <tr>
+        <td><b>#${e.ep}</b></td>
+        <td style="color:${e.reward>=0.5?'#22c55e':'#ef4444'}">${e.reward>=0.5?'✅ SUCCESS (1.0)':'❌ FAIL (0.0)'}</td>
+        <td>${e.reward_prob.toFixed(3)}</td>
+        <td>${e.chunks}</td>
+        <td>${e.advantage >= 0 ? '+' : ''}${e.advantage.toFixed(2)}</td>
+        <td><button onclick="flipEp(${e.ep - 1})">Flip 0 ↔ 1 & Update</button></td>
+      </tr>
+    `).join('');
+  } catch (e) {}
+}
+setInterval(refresh, 400);
+refresh();
+</script>
+</body>
+</html>
+"""
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -531,17 +931,28 @@ class Handler(BaseHTTPRequestHandler):
         self.connection.settimeout(10.0)
 
     def do_GET(self) -> None:
+        if self.path in ("/", "/dashboard"):
+            encoded = DASHBOARD_HTML.encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(encoded)))
+            self.end_headers()
+            self.wfile.write(encoded)
+            return
+        if self.path == "/live_state":
+            self._send(200, self.app.live_state())
+            return
         if self.path != "/healthz":
             self._send(404, {"error": "not found"})
             return
         self._send(200, self.app.health())
 
     def do_POST(self) -> None:
-        if self.path not in ("/predict", "/episode_complete"):
-            self._send(404, {"error": "use POST /predict or POST /episode_complete"})
+        if self.path not in ("/predict", "/episode_complete", "/override_episode"):
+            self._send(404, {"error": "use POST /predict, /episode_complete, or /override_episode"})
             return
         try:
-            self.connection.settimeout(30.0 if self.path == "/episode_complete" else 10.0)
+            self.connection.settimeout(30.0 if self.path in ("/episode_complete", "/override_episode") else 10.0)
             length = int(self.headers.get("Content-Length", "0"))
             if not 0 < length <= MAX_REQUEST_BYTES:
                 raise ValueError("invalid request size")
@@ -549,12 +960,20 @@ class Handler(BaseHTTPRequestHandler):
             if not isinstance(payload, dict):
                 raise ValueError("request must be a JSON object")
             # Health remains responsive, but never queue concurrent GPU predictions.
-            if not self.app.predict_lock.acquire(blocking=False):
+            is_blocking = self.path in ("/episode_complete", "/override_episode")
+            acquired = (
+                self.app.predict_lock.acquire(blocking=True, timeout=15.0)
+                if is_blocking
+                else self.app.predict_lock.acquire(blocking=False)
+            )
+            if not acquired:
                 self._send(409, {"error": "inference already in progress"})
                 return
             try:
                 if self.path == "/episode_complete":
                     result = self.app.complete_episode(payload)
+                elif self.path == "/override_episode":
+                    result = self.app.override_episode(payload)
                 else:
                     result = self.app.predict(payload)
             finally:

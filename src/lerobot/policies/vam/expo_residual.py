@@ -118,6 +118,7 @@ class ExpoResidualCritic(nn.Module):
         base_alpha: float = 0.06,
         curr_scale: float = 0.06,
         max_delta_deg: float = 100.0,
+        zero_init_edit: bool = False,
     ) -> None:
         super().__init__()
         self.ctx_dim = ctx_dim
@@ -127,6 +128,7 @@ class ExpoResidualCritic(nn.Module):
         self.base_alpha = base_alpha if use_init_anchor else 1.0
         self.curr_scale = curr_scale if use_init_anchor else 1.0
         self.max_delta_deg = max_delta_deg if use_init_anchor else 60.0
+        self.zero_init_edit = zero_init_edit
 
         self.register_buffer("init_mean", torch.zeros(1, 24, ctx_dim))
         self.register_buffer("init_std", torch.ones(1, 24, ctx_dim))
@@ -172,6 +174,11 @@ class ExpoResidualCritic(nn.Module):
             nn.Linear(256, chunk_len * state_dim),
             nn.Softplus(),
         )
+        if zero_init_edit:
+            last_linear = self.edit_net[-1]
+            if isinstance(last_linear, nn.Linear):
+                nn.init.zeros_(last_linear.weight)
+                nn.init.zeros_(last_linear.bias)
 
     def reset_episode(self) -> None:
         """Clear the cached episode-initial visual token grid at `policy.reset()`."""
