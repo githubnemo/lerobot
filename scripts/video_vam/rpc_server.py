@@ -418,13 +418,13 @@ class RPCApplication:
             original = actions.clone()
         actions = validate_chunk(actions, horizon=self.horizon)
         original = validate_chunk(original, horizon=self.horizon, name="original_chunk")
-        if (
-            self.lower is not None
-            and ((actions < torch.tensor(self.lower)) | (actions > torch.tensor(self.upper))).any().item()
-        ):
-            raise ValueError("predicted physical action exceeds joint limits")
-        if ((actions[:, 5] < 0) | (actions[:, 5] > 100)).any().item():
-            raise ValueError("predicted gripper action outside [0, 100]")
+        if self.lower is not None and self.upper is not None:
+            lo = torch.tensor(self.lower, dtype=actions.dtype)
+            hi = torch.tensor(self.upper, dtype=actions.dtype)
+            actions = torch.clamp(actions, min=lo, max=hi)
+        actions[:, 5] = torch.clamp(actions[:, 5], min=0.0, max=100.0)
+        if self.name == "video_vam":
+            original = actions.clone()
         self.frame_index += 1
         if self.device.type == "cuda":
             torch.cuda.synchronize(self.device)

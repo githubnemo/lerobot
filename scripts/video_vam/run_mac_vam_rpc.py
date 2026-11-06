@@ -822,8 +822,7 @@ def _run_single_episode(
                 elif phase == "warmup_rtc":
                     phase = "initial"
                 else:
-                    if ((actions < lower) | (actions > upper)).any().item():
-                        raise RuntimeError("Action chunk exceeds absolute joint limits")
+                    actions = torch.clamp(actions, min=lower, max=upper)
                     exact_delay = ticks_sent - snapshot_ticks if running and rtc else 0
                     delay = min(max(0, exact_delay), horizon - 1)
                     if running and rtc:
