@@ -1154,6 +1154,20 @@ def main(argv: list[str] | None = None) -> int:
         help="Inference mode: 'rtc' (Real-Time Chunking, default) or 'sync'",
     )
     parser.add_argument(
+        "--rtc",
+        dest="inference_type",
+        action="store_const",
+        const="rtc",
+        help="Enable Real-Time Chunking (alias for --inference.type=rtc)",
+    )
+    parser.add_argument(
+        "--no-rtc",
+        dest="inference_type",
+        action="store_const",
+        const="sync",
+        help="Disable Real-Time Chunking (alias for --inference.type=sync)",
+    )
+    parser.add_argument(
         "--inference.rtc.execution_horizon",
         "--execution-horizon",
         dest="execution_horizon",
