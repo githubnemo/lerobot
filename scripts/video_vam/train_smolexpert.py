@@ -3679,16 +3679,23 @@ def main(argv: list[str] | None = None) -> int:
         "train_stride": args.train_stride if is_online else None,
     }
     if "cosmos3" in backend_val:
+        trained_bb_lora = args.output_dir / "best_backbone_lora.safetensors"
+        if not trained_bb_lora.is_file():
+            trained_bb_lora = args.output_dir / "last_backbone_lora.safetensors"
+        resolved_lora_weights = (
+            str(trained_bb_lora)
+            if (backbone_trainable_params and trained_bb_lora.is_file())
+            else (str(args.backbone_lora_weights) if args.backbone_lora_weights else None)
+        )
         deployment_cfg.update(
             {
                 "cosmos3_checkpoint": str(
                     args.backbone_checkpoint or "/home/anton/.cache/video-vam/cosmos3-edge"
                 ),
-                "cosmos3_lora_weights": str(args.backbone_lora_weights)
-                if args.backbone_lora_weights
-                else None,
+                "cosmos3_lora_weights": resolved_lora_weights,
                 "cosmos3_lora_rank": args.backbone_lora_rank,
                 "cosmos3_lora_alpha": args.backbone_lora_alpha,
+                "cosmos3_lora_use_dora": bool(getattr(args, "backbone_lora_dora", False)),
             }
         )
     elif backend_val == "cosmos":

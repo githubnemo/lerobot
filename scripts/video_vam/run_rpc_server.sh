@@ -8,6 +8,12 @@ cd "$REPO"
 export TORCHINDUCTOR_COMPILE_THREADS=1
 export PYTHONPATH="${REPO}:${REPO}/src${PYTHONPATH:+:${PYTHONPATH}}"
 VAM_VENV="${VAM_VENV:-${REPO}/.venv}"
+if [[ ! -x "$VAM_VENV/bin/python" ]] && [[ -x "/home/nemo/envs/lerobot/bin/python" ]]; then
+    VAM_VENV="/home/nemo/envs/lerobot"
+fi
+if [[ -d "/home/nemo/.cache/pysandbox-lerobot/huggingface" ]] && [[ -z "${HF_HOME:-}" ]]; then
+    export HF_HOME="/home/nemo/.cache/pysandbox-lerobot/huggingface"
+fi
 if [[ -f scripts/video_vam/cosmos_cuda_env.sh ]]; then
     source scripts/video_vam/cosmos_cuda_env.sh 2>/dev/null || true
 fi

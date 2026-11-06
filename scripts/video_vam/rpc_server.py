@@ -271,11 +271,17 @@ class RPCApplication:
                 from lerobot.policies.vam.expo_residual import ExpoResidualCritic
 
                 if self.expo_checkpoint_path is not None and Path(self.expo_checkpoint_path).is_file():
-                    state_dict = torch.load(
-                        self.expo_checkpoint_path, map_location=self.device, weights_only=True
+                    raw_ckpt = torch.load(
+                        self.expo_checkpoint_path, map_location=self.device, weights_only=False
                     )
-                    use_init_anchor = any(k.startswith("init_proj.") for k in state_dict)
-                    self.expo_critic = ExpoResidualCritic(use_init_anchor=use_init_anchor).to(self.device)
+                    if isinstance(raw_ckpt, dict) and "state_dict" in raw_ckpt:
+                        state_dict = raw_ckpt["state_dict"]
+                        expo_cfg = raw_ckpt.get("config", {})
+                        self.expo_critic = ExpoResidualCritic(**expo_cfg).to(self.device)
+                    else:
+                        state_dict = raw_ckpt
+                        use_init_anchor = any(k.startswith("init_proj.") for k in state_dict)
+                        self.expo_critic = ExpoResidualCritic(use_init_anchor=use_init_anchor).to(self.device)
                     self.expo_critic.load_state_dict(state_dict, strict=False)
                 else:
                     self.expo_critic = ExpoResidualCritic(use_init_anchor=True).to(self.device)

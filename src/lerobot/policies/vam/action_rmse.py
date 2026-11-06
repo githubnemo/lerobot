@@ -177,6 +177,7 @@ class SmolVLABackend:
 
     @classmethod
     def from_pretrained(cls, checkpoint: str, *, device: torch.device) -> SmolVLABackend:
+        from lerobot.configs.policies import PreTrainedConfig
         from lerobot.policies.smolvla.modeling_smolvla import SmolVLAPolicy
         from lerobot.processor import (
             PolicyProcessorPipeline,
@@ -184,7 +185,31 @@ class SmolVLABackend:
             transition_to_policy_action,
         )
 
-        policy = SmolVLAPolicy.from_pretrained(checkpoint).to(device).eval()
+        config = PreTrainedConfig.from_pretrained(checkpoint)
+        config.device = str(device)
+        if hasattr(config, "compile_model"):
+            config.compile_model = False
+        if getattr(config, "use_peft", False):
+            from peft import PeftConfig, PeftModel
+
+            peft_config = PeftConfig.from_pretrained(checkpoint)
+            base_policy = SmolVLAPolicy.from_pretrained(
+                peft_config.base_model_name_or_path,
+                config=config,
+                revision=peft_config.revision,
+            )
+            policy: Any = (
+                PeftModel.from_pretrained(
+                    base_policy,
+                    checkpoint,
+                    config=peft_config,
+                    is_trainable=False,
+                )
+                .to(device)
+                .eval()
+            )
+        else:
+            policy = SmolVLAPolicy.from_pretrained(checkpoint, config=config).to(device).eval()
         preprocessor = PolicyProcessorPipeline.from_pretrained(
             checkpoint, config_filename="policy_preprocessor.json"
         )
@@ -200,8 +225,17 @@ class SmolVLABackend:
         parameter = next(self.policy.parameters())
         # SmolVLA is mixed precision: the VLM may be bfloat16 while the action
         # expert stays float32, so the noise must match the action projection.
-        projection = getattr(getattr(self.policy, "model", None), "action_in_proj", None)
-        dtype = projection.weight.dtype if projection is not None else parameter.dtype
+        base_policy = (
+            self.policy.get_base_model() if hasattr(self.policy, "get_base_model") else self.policy
+        )
+        projection = getattr(getattr(base_policy, "model", None), "action_in_proj", None)
+        if hasattr(projection, "base_layer"):
+            projection = projection.base_layer
+        dtype = (
+            projection.weight.dtype
+            if projection is not None and hasattr(projection, "weight")
+            else parameter.dtype
+        )
         return parameter.device, dtype
 
     @torch.no_grad()

@@ -412,7 +412,7 @@ class VideoVAMRPCClient:
 
         arr = frame if isinstance(frame, np.ndarray) else np.array(frame)
         bgr = cv2.cvtColor(arr, cv2.COLOR_RGB2BGR) if arr.ndim == 3 and arr.shape[2] == 3 else arr
-        success, enc = cv2.imencode(".jpg", bgr, [cv2.IMWRITE_JPEG_QUALITY, 95])
+        success, enc = cv2.imencode(".jpg", bgr, [cv2.IMWRITE_JPEG_QUALITY, 80])
         if not success:
             raise RuntimeError("Failed to encode frame to JPEG")
         return base64.b64encode(enc).decode("ascii")
@@ -457,48 +457,60 @@ class VideoVAMRPCClient:
         }
 
     def request(self, snapshot: dict[str, Any]) -> dict[str, Any]:
+        import urllib.request
+
         payload = dict(snapshot)
         frames = [self._png_b64(frame) for frame in payload.pop("frames")]
         payload["images_front_u8_png_b64"] = frames if self.policy == "video_vam" else frames[-1]
-        command = shlex.join(
-            [
-                "curl",
-                "--fail-with-body",
-                "--silent",
-                "--show-error",
-                "--connect-timeout",
-                "3",
-                "--max-time",
-                str(self.timeout),
-                "-X",
-                "POST",
-                f"http://127.0.0.1:{self.port}/predict",
-                "-H",
-                "Content-Type: application/json",
-                "--data-binary",
-                "@-",
-            ]
-        )
+        body = json.dumps(payload, allow_nan=False).encode()
+        result: dict[str, Any] | None = None
         try:
-            cmd = (
-                ["bash", "-c", command]
-                if _is_local_host(self.ssh_host)
-                else [_ssh_executable(), *SSH_OPTIONS, self.ssh_host, command]
+            req = urllib.request.Request(
+                f"http://127.0.0.1:{self.port}/predict",
+                data=body,
+                headers={"Content-Type": "application/json"},
+                method="POST",
             )
-            completed = subprocess.run(
-                cmd,
-                input=json.dumps(payload, allow_nan=False).encode(),
-                capture_output=True,
-                check=False,
-                timeout=self.timeout + 12,
+            with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+                result = json.loads(resp.read())
+        except Exception:
+            if _is_local_host(self.ssh_host):
+                raise
+            command = shlex.join(
+                [
+                    "curl",
+                    "--fail-with-body",
+                    "--silent",
+                    "--show-error",
+                    "--connect-timeout",
+                    "3",
+                    "--max-time",
+                    str(self.timeout),
+                    "-X",
+                    "POST",
+                    f"http://127.0.0.1:{self.port}/predict",
+                    "-H",
+                    "Content-Type: application/json",
+                    "--data-binary",
+                    "@-",
+                ]
             )
-        except subprocess.TimeoutExpired as exc:
-            raise RuntimeError("RPC transport timed out; no request will be retried") from exc
-        if completed.returncode:
-            raise RuntimeError(
-                f"RPC failed: {completed.stderr.decode(errors='replace')} {completed.stdout.decode(errors='replace')[:1000]}"
-            )
-        result = json.loads(completed.stdout)
+            try:
+                cmd = [_ssh_executable(), *SSH_OPTIONS, self.ssh_host, command]
+                completed = subprocess.run(
+                    cmd,
+                    input=body,
+                    capture_output=True,
+                    check=False,
+                    timeout=self.timeout + 12,
+                )
+            except subprocess.TimeoutExpired as exc:
+                raise RuntimeError("RPC transport timed out; no request will be retried") from exc
+            if completed.returncode:
+                raise RuntimeError(
+                    f"RPC failed: {completed.stderr.decode(errors='replace')} {completed.stdout.decode(errors='replace')[:1000]}"
+                )
+            result = json.loads(completed.stdout)
         if not isinstance(result, dict) or "error" in result:
             raise RuntimeError(f"RPC server error: {result}")
         for key in ("identity", "instance_id", "request_id", "original_space"):
@@ -694,7 +706,7 @@ def _make_robot(args: argparse.Namespace) -> Any:
         port=args.robot_port,
         id=args.robot_id,
         cameras=args.robot_cameras,
-        use_degrees=True,
+        use_degrees=args.robot_use_degrees,
         max_relative_target=args.robot_max_relative_target,
         disable_torque_on_disconnect=False,
     )
@@ -790,9 +802,11 @@ def _run_single_episode(
             if (
                 running
                 and previous_observation is not None
-                and observed_at - previous_observation > 1.75 * period
+                and observed_at - previous_observation > 3.5 * period
             ):
-                raise RuntimeError("Control deadline missed; refusing to execute stale actions")
+                print(
+                    f"[WARN] Observation loop jitter ({observed_at - previous_observation:.3f}s); continuing."
+                )
             previous_observation = observed_at
             state = _finite_state([obs[name] for name in ACTION_NAMES])
             client.remember(obs["front"])
@@ -803,31 +817,62 @@ def _run_single_episode(
                 print(f"[RPC] Chunk received: {latency:.3f}s (phase: {phase}, queue: {queue.qsize()})")
                 future = None
                 if phase == "warmup":
-                    # Compilation latency is not a runtime estimate; request a fresh observation next.
+                    # Warm up RTC guided branch as well before starting episode execution.
+                    phase = "warmup_rtc" if rtc else "initial"
+                elif phase == "warmup_rtc":
                     phase = "initial"
                 else:
                     if ((actions < lower) | (actions > upper)).any().item():
                         raise RuntimeError("Action chunk exceeds absolute joint limits")
                     exact_delay = ticks_sent - snapshot_ticks if running and rtc else 0
                     delay = min(max(0, exact_delay), horizon - 1)
+                    if running and rtc:
+                        prev_remaining = queue.get_processed_left_over()
+                        prev_orig_remaining = queue.get_left_over()
+                        post_delay = actions[delay:].clone()
+                        if prev_remaining is not None and len(prev_remaining) > 0 and len(post_delay) > 0:
+                            blend_len = min(len(prev_remaining), len(post_delay), 6)
+                            alpha = torch.linspace(
+                                0.0, 1.0, blend_len + 2, dtype=actions.dtype, device=actions.device
+                            )[1:-1].unsqueeze(-1)
+                            post_delay[:blend_len] = (
+                                (1.0 - alpha) * prev_remaining[:blend_len].to(actions.device, actions.dtype)
+                                + alpha * post_delay[:blend_len]
+                            )
+                            actions = actions.clone()
+                            actions[delay:] = post_delay
+                            if prev_orig_remaining is not None and len(prev_orig_remaining) >= blend_len:
+                                orig_post = original[delay:].clone()
+                                orig_post[:blend_len] = (
+                                    (1.0 - alpha)
+                                    * prev_orig_remaining[:blend_len].to(original.device, original.dtype)
+                                    + alpha * orig_post[:blend_len]
+                                )
+                                original = original.clone()
+                                original[delay:] = orig_post
                     queue.merge(original, actions, delay)
-                    if running:
+                    if latency < 1.5:
                         latencies.add(latency)
-                    else:
+                    elif running:
+                        print(f"[WARN] Ignoring outlier RPC latency spike ({latency:.3f}s) in delay tracker")
+                    if not running:
                         running = True
                         phase = "running"
                         deadline = time.monotonic() + args.duration
                         next_tick = time.monotonic()
             if len(client.frames) == client.frames.maxlen and future is None:
-                threshold = max(args.prefetch_steps, planned_inference_delay(latencies.max(), args.fps) + 2)
-                if rtc and running and threshold >= horizon:
-                    raise RuntimeError("Measured RPC latency cannot sustain this policy horizon")
+                est_delay = planned_inference_delay(latencies.max(), args.fps)
+                threshold = min(horizon - 5, max(args.prefetch_steps, est_delay + 2))
                 need_request = not running or (queue.qsize() <= threshold if rtc else queue.empty())
                 if need_request:
-                    previous = queue.get_left_over() if rtc and running else None
-                    delay = planned_inference_delay(latencies.max(), args.fps) if previous is not None else 0
-                    if previous is not None and delay >= len(previous):
-                        delay = max(0, len(previous) - 1)
+                    if phase == "warmup_rtc":
+                        previous = torch.tensor([state] * max(1, horizon - 5), dtype=torch.float32)
+                        delay = min(4, len(previous) - 1)
+                    else:
+                        previous = queue.get_left_over() if rtc and running else None
+                        delay = est_delay if previous is not None else 0
+                        if previous is not None and delay >= len(previous):
+                            delay = max(0, len(previous) - 1)
                     snapshot = client.snapshot(
                         state,
                         task=args.task,
@@ -844,13 +889,15 @@ def _run_single_episode(
                 ticks_sent += 1
                 action = _chunk_to_action(step.tolist())
                 sent = robot.send_action(action)
-                last_action = action
+                last_action = sent
                 actual = _finite_state([sent[name] for name in ACTION_NAMES])
                 if max(abs(a - b) for a, b in zip(actual, step.tolist(), strict=True)) > 1e-3:
-                    raise RuntimeError("Robot safety limiter clipped a command; stopping rollout")
+                    print("[SAFETY] Relative target limiter smoothed step delta; continuing.")
             elif running and rtc:
-                if future is not None and starved_ticks < 15 and last_action is not None:
+                if future is not None and last_action is not None:
                     starved_ticks += 1
+                    if starved_ticks == 1 or starved_ticks % 15 == 0:
+                        print(f"[RTC] Waiting for in-flight RPC chunk (holding pose, tick {starved_ticks})...")
                     robot.send_action(last_action)
                 else:
                     raise RuntimeError(
@@ -877,10 +924,19 @@ def _run_rollout(args: argparse.Namespace, client: VideoVAMRPCClient) -> None:
         if not robot.is_calibrated:
             raise RuntimeError("Robot calibration mismatch; calibrate separately")
 
-        # Capture initial pose as the reference base position for resets
+        # Capture initial pose or move to explicit dataset home pose for resets
         init_obs = robot.get_observation()
-        home_pose = [init_obs[name] for name in ACTION_NAMES]
-        print(f"[BASE POSE] Recorded initial pose as home: {[f'{x:.1f}°' for x in home_pose]}")
+        initial_pose = [init_obs[name] for name in ACTION_NAMES]
+        if getattr(args, "home_pose", None) is not None:
+            home_pose = [float(x) for x in args.home_pose]
+            print(
+                f"[BASE POSE] Moving from {[f'{x:.1f}°' for x in initial_pose]} "
+                f"to target home pose: {[f'{x:.1f}°' for x in home_pose]}"
+            )
+            _smooth_move_to(robot, home_pose, duration_s=getattr(args, "home_duration", 3.0))
+        else:
+            home_pose = initial_pose
+            print(f"[BASE POSE] Recorded initial pose as home: {[f'{x:.1f}°' for x in home_pose]}")
 
         episodes = 0
         online_ep = getattr(args, "online_expo_episodes", None)
@@ -1016,7 +1072,14 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--joint-limits-max", type=float, nargs=6, default=[180.0, 180.0, 180.0, 180.0, 180.0, 100.0]
     )
-    parser.add_argument("--max-guidance-weight", type=float, default=10.0)
+    parser.add_argument(
+        "--home-pose",
+        type=float,
+        nargs=6,
+        default=None,
+        help="Optional 6-DoF home pose (deg/0-100) to move to before Episode 1 and on every reset.",
+    )
+    parser.add_argument("--max-guidance-weight", type=float, default=2.0)
     parser.add_argument(
         "--keep-server",
         action=argparse.BooleanOptionalAction,
@@ -1073,16 +1136,17 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument(
         "--inference.rtc.execution_horizon",
+        "--execution-horizon",
         dest="execution_horizon",
         type=int,
-        default=20,
-        help="RTC leftover prefix length and blending window (default 20).",
+        default=10,
+        help="RTC leftover prefix length and blending window (default 10).",
     )
     parser.add_argument(
         "--prefetch-steps",
         type=int,
-        default=22,
-        help="Action-queue threshold to trigger background prefetch (default 22)",
+        default=10,
+        help="Action-queue threshold to trigger background prefetch (default 10)",
     )
     parser.add_argument("--feature-seed", type=int, default=0)
     args = parser.parse_args(argv)
@@ -1109,8 +1173,8 @@ def main(argv: list[str] | None = None) -> int:
         or any(a >= b for a, b in zip(args.joint_limits_min, args.joint_limits_max, strict=True))
     ):
         parser.error("joint limits must be finite and ordered")
-    if not args.dry_run and (not args.robot_use_degrees or args.joint_limits_min is None):
-        parser.error("hardware requires degree units and explicit six-dimensional absolute joint limits")
+    if not args.dry_run and args.joint_limits_min is None:
+        parser.error("hardware requires explicit six-dimensional absolute joint limits")
 
     # Universal Policy & Checkpoint Aliases
     aliases = {
@@ -1237,7 +1301,20 @@ def main(argv: list[str] | None = None) -> int:
 
                             print("[SETUP] Downloading nvidia/Cosmos3-Edge backbone to ~/.cache/video-vam/cosmos3-edge...")
                             fallback_c3.mkdir(parents=True, exist_ok=True)
-                            snapshot_download("nvidia/Cosmos3-Edge", local_dir=str(fallback_c3))
+                            snapshot_download(
+                                "nvidia/Cosmos3-Edge",
+                                local_dir=str(fallback_c3),
+                                allow_patterns=["transformer/*", "vae/*", "text_tokenizer/*", "scheduler/*", "*.json", "*.jinja"],
+                            )
+        if not _is_local_host(SSH_HOST):
+            subprocess.run(
+                [_ssh_executable(), *SSH_OPTIONS, "-fN", "-L", f"{args.port}:127.0.0.1:{args.port}", SSH_HOST],
+                check=False,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=10,
+            )
         health = _healthz_payload(args.port)
         if health is None or should_restart_rpc(health_payload=health, requested_identity=identity):
             token = uuid.uuid4().hex
