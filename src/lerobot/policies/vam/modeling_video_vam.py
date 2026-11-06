@@ -282,10 +282,12 @@ class VideoVAMPolicy(PreTrainedPolicy):
 
             run_dir = Path(self.config.pretrained_path) if self.config.pretrained_path is not None else None
             lora_ckpt = self.config.cosmos3_lora_weights
-            if lora_ckpt is not None and not Path(lora_ckpt).exists() and run_dir is not None:
-                candidate = run_dir / Path(lora_ckpt).name
-                if candidate.exists():
-                    lora_ckpt = candidate
+            if lora_ckpt is not None and not Path(lora_ckpt).exists():
+                repo_root = Path(__file__).resolve().parents[4]
+                if (repo_root / lora_ckpt).exists():
+                    lora_ckpt = repo_root / lora_ckpt
+                elif run_dir is not None and (run_dir / Path(lora_ckpt).name).exists():
+                    lora_ckpt = run_dir / Path(lora_ckpt).name
             elif lora_ckpt is None and run_dir is not None and (run_dir / "best_backbone_lora.safetensors").is_file():
                 lora_ckpt = run_dir / "best_backbone_lora.safetensors"
 
@@ -299,6 +301,9 @@ class VideoVAMPolicy(PreTrainedPolicy):
                     fps=10.0,
                     prompt=getattr(self.config, "cosmos3_prompt", "take cube out of box"),
                     lora_checkpoint=lora_ckpt,
+                    lora_rank=getattr(self.config, "cosmos3_lora_rank", None) or 16,
+                    lora_alpha=getattr(self.config, "cosmos3_lora_alpha", None) or 32.0,
+                    lora_use_dora=bool(getattr(self.config, "cosmos3_lora_use_dora", False)),
                     compile_dit=False,
                     compile_vae=False,
                 )

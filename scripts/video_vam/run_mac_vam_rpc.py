@@ -381,11 +381,13 @@ class VideoVAMRPCClient:
         ssh_host: str | None = None,
         timeout: float = 120.0,
         health: dict[str, Any] | None = None,
+        fps: int = 10,
     ) -> None:
         if policy not in {"smolvla", "video_vam"}:
             raise ValueError("policy must be smolvla or video_vam")
         self.policy, self.port, self.ssh_host = policy, port, (SSH_HOST if ssh_host is None else ssh_host)
         self.timeout, self.health = timeout, health or {}
+        self.fps = fps
         self.frames: deque[Any] = deque(maxlen=5 if policy == "video_vam" else 1)
         self.frame_times: deque[float] = deque(maxlen=self.frames.maxlen)
         self.frame_index = -1
@@ -438,10 +440,13 @@ class VideoVAMRPCClient:
         if len(self.frames) != self.frames.maxlen:
             raise RuntimeError("observation history is not ready")
         now = time.monotonic()
-        if now - self.frame_times[-1] > 0.175 or any(
-            not 0.05 <= gap / 1000 <= 0.175 for gap in self.history_spacing_ms()
+        period = 1.0 / max(1, self.fps)
+        max_gap = max(0.175, 3.5 * period)
+        min_gap = min(0.015, 0.3 * period)
+        if now - self.frame_times[-1] > max_gap or any(
+            not min_gap <= gap / 1000 <= max_gap for gap in self.history_spacing_ms()
         ):
-            raise RuntimeError("observation history is stale or not sampled at 10 Hz")
+            raise RuntimeError(f"observation history is stale or not sampled at {self.fps} Hz")
         return {
             "frames": list(self.frames),
             "state": _finite_state(state),
@@ -452,7 +457,7 @@ class VideoVAMRPCClient:
             "instance_id": self.health["instance_id"],
             "request_id": uuid.uuid4().hex,
             "original_space": self.health["original_space"],
-            "prev_chunk_left_over": leftover_payload(leftover),
+            "prev_chunk_left_over": leftover_payload(leftover, horizon=self.health.get("execution_horizon")),
             "inference_delay": inference_delay,
         }
 
@@ -585,7 +590,8 @@ def leftover_payload(tensor: torch.Tensor | None, horizon: int | None = None) ->
         return None
     if tensor.ndim != 2 or tensor.shape[1] != 6 or not torch.isfinite(tensor).all().item():
         raise ValueError("leftover must be finite [T,6]")
-    # Do not invent physical zero targets or truncate the available guidance prefix.
+    if horizon is not None and horizon > 0:
+        tensor = tensor[:horizon]
     return tensor.detach().cpu().float().tolist()
 
 
@@ -663,7 +669,7 @@ def _run_dry(args: argparse.Namespace, client: VideoVAMRPCClient) -> None:
         # A blocking prediction may age the entire history; replace it at control cadence.
         for _ in range(client.frames.maxlen or 1):
             client.remember(image)
-            time.sleep(0.1)
+            time.sleep(1.0 / max(1, args.fps))
         snapshot = client.snapshot([0.0] * 6, task=args.task, feature_seed=args.feature_seed)
         snapshot.pop("prev_chunk_left_over")
         snapshot.pop("inference_delay")
@@ -869,6 +875,8 @@ def _run_single_episode(
                         delay = min(4, len(previous) - 1)
                     else:
                         previous = queue.get_left_over() if rtc and running else None
+                        if previous is not None and args.execution_horizon > 0:
+                            previous = previous[: args.execution_horizon]
                         delay = est_delay if previous is not None else 0
                         if previous is not None and delay >= len(previous):
                             delay = max(0, len(previous) - 1)
@@ -1152,8 +1160,8 @@ def main(argv: list[str] | None = None) -> int:
     SSH_HOST = args.remote_host
     if _is_local_host(SSH_HOST):
         REPO = str(Path(__file__).resolve().parents[2])
-    if args.fps != 10:
-        parser.error("These checkpoints require 10 Hz observation/action cadence")
+    if args.fps not in (10, 30):
+        parser.error("--fps must be 10 or 30 Hz")
     if not 1 <= args.port <= 65535 or args.execution_horizon < 1 or args.prefetch_steps < 1:
         parser.error("invalid port, execution horizon, or prefetch threshold")
     if any(
@@ -1339,6 +1347,7 @@ def main(argv: list[str] | None = None) -> int:
             ssh_host=SSH_HOST,
             timeout=args.rpc_timeout,
             health=health,
+            fps=args.fps,
         )
         if args.dry_run:
             _run_dry(args, client)
