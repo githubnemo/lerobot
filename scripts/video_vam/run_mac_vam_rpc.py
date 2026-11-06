@@ -669,7 +669,7 @@ def _run_dry(args: argparse.Namespace, client: VideoVAMRPCClient) -> None:
         # A blocking prediction may age the entire history; replace it at control cadence.
         for _ in range(client.frames.maxlen or 1):
             client.remember(image)
-            time.sleep(1.0 / max(1, args.fps))
+            time.sleep(1.0 / max(1, client.fps))
         snapshot = client.snapshot([0.0] * 6, task=args.task, feature_seed=args.feature_seed)
         snapshot.pop("prev_chunk_left_over")
         snapshot.pop("inference_delay")
@@ -787,7 +787,9 @@ def _run_single_episode(
     queue = ActionQueue(RTCConfig(enabled=rtc, execution_horizon=args.execution_horizon))
     latencies = LatencyTracker(maxlen=20)
     horizon = client.health["horizon"]
-    period = 1.0 / args.fps
+    camera_fps = getattr(args, "camera_fps", None) or args.fps
+    action_stride = max(1, camera_fps // args.fps)
+    period = 1.0 / camera_fps
     phase = "warmup"
     started = 0.0
     deadline = time.monotonic() + args.ready_timeout
@@ -798,6 +800,7 @@ def _run_single_episode(
     starved_ticks = 0
     ticks_sent = 0
     snapshot_ticks = 0
+    obs_ticks = 0
 
     next_tick = time.monotonic()
     previous_observation = None
@@ -890,26 +893,29 @@ def _run_single_episode(
                     started = time.monotonic()
                     snapshot_ticks = ticks_sent
                     future = executor.submit(client.request, snapshot)
-            step = queue.get() if running else None
-            if step is not None:
-                starved_ticks = 0
-                ticks_sent += 1
-                action = _chunk_to_action(step.tolist())
-                sent = robot.send_action(action)
-                last_action = sent
-                actual = _finite_state([sent[name] for name in ACTION_NAMES])
-                if max(abs(a - b) for a, b in zip(actual, step.tolist(), strict=True)) > 1e-3:
-                    print("[SAFETY] Relative target limiter smoothed step delta; continuing.")
-            elif running and rtc:
-                if future is not None and last_action is not None:
-                    starved_ticks += 1
-                    if starved_ticks == 1 or starved_ticks % 15 == 0:
-                        print(f"[RTC] Waiting for in-flight RPC chunk (holding pose, tick {starved_ticks})...")
-                    robot.send_action(last_action)
-                else:
-                    raise RuntimeError(
-                        "RTC action queue exhausted; stopping instead of retrying stale observations"
-                    )
+            is_action_tick = (obs_ticks % action_stride) == 0
+            obs_ticks += 1
+            if is_action_tick:
+                step = queue.get() if running else None
+                if step is not None:
+                    starved_ticks = 0
+                    ticks_sent += 1
+                    action = _chunk_to_action(step.tolist())
+                    sent = robot.send_action(action)
+                    last_action = sent
+                    actual = _finite_state([sent[name] for name in ACTION_NAMES])
+                    if max(abs(a - b) for a, b in zip(actual, step.tolist(), strict=True)) > 1e-3:
+                        print("[SAFETY] Relative target limiter smoothed step delta; continuing.")
+                elif running and rtc:
+                    if future is not None and last_action is not None:
+                        starved_ticks += 1
+                        if starved_ticks == 1 or starved_ticks % 15 == 0:
+                            print(f"[RTC] Waiting for in-flight RPC chunk (holding pose, tick {starved_ticks})...")
+                        robot.send_action(last_action)
+                    else:
+                        raise RuntimeError(
+                            "RTC action queue exhausted; stopping instead of retrying stale observations"
+                        )
             next_tick = _next_tick(next_tick, time.monotonic(), period)
             _sleep_until(min(next_tick, deadline))
         if not running:
@@ -1110,7 +1116,13 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--robot.use_degrees", dest="robot_use_degrees", type=_bool_arg, default=True)
     parser.add_argument("--robot.cameras", dest="robot_cameras_raw", default=DEFAULT_CAMERAS)
     parser.add_argument("--robot.max_relative_target", dest="robot_max_relative_target_raw", default=None)
-    parser.add_argument("--fps", type=int, default=10)
+    parser.add_argument("--fps", type=int, default=10, help="Action execution rate in Hz (10 or 30)")
+    parser.add_argument(
+        "--camera-fps",
+        type=int,
+        default=None,
+        help="Camera observation history sampling rate in Hz (defaults to --fps; e.g. 30 with --fps 10)",
+    )
     parser.add_argument(
         "--duration", type=float, default=45.0, help="Rollout duration per episode (default 45s)"
     )
@@ -1162,6 +1174,10 @@ def main(argv: list[str] | None = None) -> int:
         REPO = str(Path(__file__).resolve().parents[2])
     if args.fps not in (10, 30):
         parser.error("--fps must be 10 or 30 Hz")
+    if args.camera_fps is not None and (
+        args.camera_fps not in (10, 30) or args.camera_fps < args.fps or args.camera_fps % args.fps != 0
+    ):
+        parser.error("--camera-fps must be 10 or 30 Hz and an integer multiple of --fps")
     if not 1 <= args.port <= 65535 or args.execution_horizon < 1 or args.prefetch_steps < 1:
         parser.error("invalid port, execution horizon, or prefetch threshold")
     if any(
@@ -1347,7 +1363,7 @@ def main(argv: list[str] | None = None) -> int:
             ssh_host=SSH_HOST,
             timeout=args.rpc_timeout,
             health=health,
-            fps=args.fps,
+            fps=args.camera_fps or args.fps,
         )
         if args.dry_run:
             _run_dry(args, client)
