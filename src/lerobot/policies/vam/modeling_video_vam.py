@@ -148,12 +148,8 @@ class VideoVAMPolicy(PreTrainedPolicy):
             input_channels=input_channels,
         ).eval()
         should_compile = getattr(config, "cosmos_torch_compile", False)
-        if (
-            should_compile
-            and str(config.device).startswith("cuda")
-            and hasattr(torch, "compile")
-            and config.backend != "cosmos3_edge"
-        ):
+        if should_compile and str(config.device).startswith("cuda") and hasattr(torch, "compile"):
+            torch.set_float32_matmul_precision("high")
             self.decoder._vector_field = torch.compile(self.decoder._vector_field, mode="default")
         self.extractor, self.prompt_embedding = self._build_extractor()
         if config.jepa_world_model_checkpoint is not None and config.jepa_planning_mode != "none":
@@ -298,14 +294,14 @@ class VideoVAMPolicy(PreTrainedPolicy):
                     hidden_layers=(20,),
                     device=str(self.config.device),
                     dtype="bfloat16",
-                    fps=10.0,
+                    fps=float(getattr(self.config, "cosmos3_fps", 10.0)),
                     prompt=getattr(self.config, "cosmos3_prompt", "take cube out of box"),
                     lora_checkpoint=lora_ckpt,
                     lora_rank=getattr(self.config, "cosmos3_lora_rank", None) or 16,
                     lora_alpha=getattr(self.config, "cosmos3_lora_alpha", None) or 32.0,
                     lora_use_dora=bool(getattr(self.config, "cosmos3_lora_use_dora", False)),
-                    compile_dit=False,
-                    compile_vae=False,
+                    compile_dit=bool(getattr(self.config, "cosmos_torch_compile", False)),
+                    compile_vae=bool(getattr(self.config, "cosmos_torch_compile", False)),
                 )
             )
             return extractor, torch.zeros(1, 1, device=self.config.device)
@@ -498,6 +494,10 @@ class VideoVAMPolicy(PreTrainedPolicy):
             if rtc_config is None:
                 raise ValueError("prev_chunk_left_over requires config.rtc_config")
             execution_horizon = rtc_config.execution_horizon
+            if prev_chunk_left_over is not None and inference_delay is not None:
+                prev_len = prev_chunk_left_over.shape[-2]
+                if prev_len > 0:
+                    execution_horizon = min(prev_len, max(execution_horizon, int(inference_delay) + 5))
         state_dev = state.to(device=self.config.device, dtype=torch.float32)
         base_seed = self.config.action_seed if action_seed is None else action_seed
         if self.jepa_world_model is not None and self.config.jepa_planning_mode != "none" and noise is None:

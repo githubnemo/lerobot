@@ -299,11 +299,16 @@ def fused_rmsnorm_rope(
     sin: Tensor,
 ) -> Tensor:
     """Apply head-wise RMSNorm followed by 3D-mRoPE rotation (uses custom Triton kernel on CUDA bf16)."""
+    norm_weight = getattr(norm_module, "weight", None)
+    needs_grad = torch.is_grad_enabled() and (
+        x.requires_grad or (norm_weight is not None and norm_weight.requires_grad)
+    )
     if (
-        _TRITON_AVAILABLE
+        not needs_grad
+        and _TRITON_AVAILABLE
         and x.is_cuda
         and x.dtype == torch.bfloat16
-        and getattr(norm_module, "weight", None) is not None
+        and norm_weight is not None
     ):
         B, S, H, D = x.shape
         x_contig = x if x.is_contiguous() else x.contiguous()
@@ -741,6 +746,49 @@ class Cosmos3ExtractionOutput(VAMExtractionOutput):
     """Standard output container for Cosmos 3 Edge extracted features."""
 
 
+def _apply_cosmos3_lora_pathway_grad(
+    transformer: nn.Module,
+    *,
+    trainable_lora: bool,
+    lora_pathway: str,
+) -> None:
+    """Enforce fp32 precision and pathway-scoped requires_grad on Cosmos 3 LoRA/DoRA parameters."""
+    if not trainable_lora:
+        for p in transformer.parameters():
+            p.requires_grad_(False)
+        return
+
+    from lerobot.policies.vam.cosmos3_lora import (
+        DUAL_PATHWAY_TARGET_MODULES,
+        GEN_TARGET_MODULES,
+        UND_TARGET_MODULES,
+        _is_matching_target_module,
+    )
+
+    if lora_pathway == "gen_only":
+        allowed_targets = set(GEN_TARGET_MODULES)
+    elif lora_pathway == "und_only":
+        allowed_targets = set(UND_TARGET_MODULES)
+    elif lora_pathway == "dual":
+        allowed_targets = set(DUAL_PATHWAY_TARGET_MODULES)
+    else:
+        raise ValueError(f"Unsupported Cosmos 3 lora_pathway: {lora_pathway!r}")
+
+    for name, p in transformer.named_parameters():
+        if not name.endswith(("lora_A", "lora_B", "dora_magnitude")):
+            p.requires_grad_(False)
+            continue
+        if p.dtype != torch.float32:
+            p.data = p.data.float()
+        clean = name.replace("._checkpoint_wrapped_module.", ".").replace("._orig_mod.", ".")
+        parts = clean.split(".")
+        if len(parts) > 3 and parts[0] == "layers" and parts[1].isdigit():
+            mod_subpath = ".".join(parts[2:-1])
+        else:
+            mod_subpath = ".".join(parts[:-1])
+        p.requires_grad_(_is_matching_target_module(mod_subpath, allowed_targets))
+
+
 class Cosmos3FeatureExtractor(BaseVAMExtractor):
     """Unified Cosmos 3 Edge feature extractor conforming to BaseVAMExtractor contract."""
 
@@ -837,13 +885,11 @@ class Cosmos3FeatureExtractor(BaseVAMExtractor):
                 use_dora=config.lora_use_dora,
             )
 
-        if not config.trainable_lora:
-            for p in self.transformer.parameters():
-                p.requires_grad_(False)
-        else:
-            from lerobot.policies.vam.cosmos_lora import freeze_base_parameters
-
-            freeze_base_parameters(self.transformer)
+        _apply_cosmos3_lora_pathway_grad(
+            self.transformer,
+            trainable_lora=config.trainable_lora,
+            lora_pathway=config.lora_pathway,
+        )
 
         # 3. Initialize text prompt embedding cache (before moving/pruning embed_tokens)
         self.prompt_text = config.prompt
@@ -860,12 +906,20 @@ class Cosmos3FeatureExtractor(BaseVAMExtractor):
             embed_tokens_cpu = getattr(self.transformer, "embed_tokens", None)
             if embed_tokens_cpu is not None:
                 self.transformer.embed_tokens = None
+            fp32_lora_snapshot = {
+                name: p.detach().float()
+                for name, p in self.transformer.named_parameters()
+                if name.endswith(("lora_A", "lora_B", "dora_magnitude"))
+            }
             self.transformer = self.transformer.to(device=self.device, dtype=self._torch_dtype)
-            if config.trainable_lora:
-                for name, p in self.transformer.named_parameters():
-                    if name.endswith(("lora_A", "lora_B", "dora_magnitude")):
-                        p.data = p.data.float()
-                        p.requires_grad_(True)
+            for name, p in self.transformer.named_parameters():
+                if name in fp32_lora_snapshot:
+                    p.data = fp32_lora_snapshot[name].to(device=self.device, dtype=torch.float32)
+            _apply_cosmos3_lora_pathway_grad(
+                self.transformer,
+                trainable_lora=config.trainable_lora,
+                lora_pathway=config.lora_pathway,
+            )
             if not (config.trainable_lora and config.lora_pathway in ("dual", "und_only")):
                 self._precompute_and_prune_und_pathway()
             if embed_tokens_cpu is not None:
@@ -991,7 +1045,23 @@ class Cosmos3FeatureExtractor(BaseVAMExtractor):
         if not self._supports_fast_batched_gen() or self._cached_prompt_embeds is None:
             return
         self._cached_und_kv = self._compute_und_kv_for_embeds(self._cached_prompt_embeds)
-        for blk in self.transformer.layers:
+        pruned_lora: dict[str, Tensor] = dict(getattr(self.transformer, "_pruned_lora_state_dict", {}))
+        for idx, blk in enumerate(self.transformer.layers):
+            for sub_prefix in ("mlp", "self_attn.to_q", "self_attn.to_k", "self_attn.to_v", "self_attn.to_out"):
+                try:
+                    sub_mod = blk.get_submodule(sub_prefix)
+                except AttributeError:
+                    continue
+                if sub_mod is None:
+                    continue
+                for p_name, param in sub_mod.named_parameters():
+                    if p_name.endswith(("lora_A", "lora_B", "dora_magnitude")):
+                        clean_key = (
+                            f"layers.{idx}.{sub_prefix}.{p_name}"
+                            .replace("._checkpoint_wrapped_module.", ".")
+                            .replace("._orig_mod.", ".")
+                        )
+                        pruned_lora[clean_key] = param.detach().float().cpu().contiguous()
             if hasattr(blk, "mlp"):
                 blk.mlp = None
             if hasattr(blk, "input_layernorm"):
@@ -1003,6 +1073,8 @@ class Cosmos3FeatureExtractor(BaseVAMExtractor):
                 for attr in ("to_q", "to_k", "to_v", "to_out", "norm_q", "norm_k", "k_norm_und_for_gen"):
                     if hasattr(attn, attr):
                         setattr(attn, attr, None)
+        if pruned_lora:
+            self.transformer._pruned_lora_state_dict = pruned_lora
 
     def _get_gen_rotary(self, num_text_tokens: int, grid_shape: tuple[int, int, int]) -> tuple[Tensor, Tensor]:
         key = (num_text_tokens, *grid_shape)

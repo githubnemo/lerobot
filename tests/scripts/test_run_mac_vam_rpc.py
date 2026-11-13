@@ -55,6 +55,7 @@ def args(**changes):
         "feature_seed": 0,
         "joint_limits_min": [-180.0] * 5 + [0.0],
         "joint_limits_max": [180.0] * 5 + [100.0],
+        "euler_steps": None,
     }
     return argparse.Namespace(**(values | changes))
 
@@ -131,13 +132,16 @@ def rollout(monkeypatch, launcher, clock, *, policy="smolvla", delays=(0.3, 0.2)
 def test_single_flight_warmup_fresh_history_and_native_queue(monkeypatch, launcher, clock, policy):
     robot, executor, client, options = rollout(monkeypatch, launcher, clock, policy=policy)
     launcher._run_rollout(options, client)
-    assert len(executor.snapshots) >= 3
-    warmup, initial, rtc = executor.snapshots[:3]
+    assert len(executor.snapshots) >= 4
+    warmup, warmup_rtc, initial, rtc = executor.snapshots[:4]
     assert warmup["prev_chunk_left_over"] is initial["prev_chunk_left_over"] is None
-    assert initial["frame_index"] > warmup["frame_index"]
+    assert warmup_rtc["prev_chunk_left_over"] == [[0.0] * 6] * (50 - 5)
+    assert initial["frame_index"] > warmup_rtc["frame_index"] > warmup["frame_index"]
     assert rtc["prev_chunk_left_over"][0] == [1.0] * 6  # original, NOT executed 5/50 targets
     assert len(warmup["frames"]) == (5 if policy == "video_vam" else 1)
-    assert all(b[0] - a[0] >= 0.099 for a, b in zip(robot.sent, robot.sent[1:], strict=False))
+    episode_sent = [s for s in robot.sent if s[1]["gripper.pos"] == 50.0]
+    assert len(episode_sent) >= 40
+    assert all(b[0] - a[0] >= 0.099 for a, b in zip(episode_sent, episode_sent[1:], strict=False))
     assert robot.disconnected and executor.shutdown_called
 
 
@@ -153,31 +157,52 @@ def test_sync_mode_never_supplies_rtc_prefix(monkeypatch, launcher, clock):
 
 def test_underrun_aborts_without_duplicate_fetch(monkeypatch, launcher, clock):
     robot, executor, client, options = rollout(
-        monkeypatch, launcher, clock, delays=(0.3, 0.2, 5.0), duration=8.0
+        monkeypatch, launcher, clock, delays=(0.3, 0.2, 0.2, 6.0), duration=6.5
     )
-    with pytest.raises(RuntimeError, match="queue exhausted"):
-        launcher._run_rollout(options, client)
-    assert len(executor.snapshots) == 3
+    launcher._run_rollout(options, client)
+    assert len(executor.snapshots) == 4
+    episode_sent = [s for s in robot.sent if s[1]["gripper.pos"] == 50.0]
+    assert len(episode_sent) > 50
+    assert episode_sent[-1][1] == episode_sent[49][1]
     assert robot.disconnected and executor.shutdown_called
 
+    robot2, executor2, client2, options2 = rollout(monkeypatch, launcher, clock)
+    monkeypatch.setattr(launcher.ActionQueue, "get", lambda self: None)
+    with pytest.raises(RuntimeError, match="RTC action queue exhausted"):
+        launcher._run_rollout(options2, client2)
+    assert robot2.disconnected and executor2.shutdown_called
 
-def test_clipped_command_stops(monkeypatch, launcher, clock):
+
+def test_clipped_command_reanchors_and_continues(monkeypatch, launcher, clock, capsys):
     robot, executor, client, options = rollout(monkeypatch, launcher, clock)
-    monkeypatch.setattr(robot, "send_action", lambda action: action | {"gripper.pos": 10.0})
-    with pytest.raises(RuntimeError, match="clipped"):
-        launcher._run_rollout(options, client)
+    orig_send = robot.send_action
+
+    def clamped_first_send(action):
+        if not robot.sent:
+            return orig_send(action) | {"gripper.pos": 10.0}
+        return orig_send(action)
+
+    monkeypatch.setattr(robot, "send_action", clamped_first_send)
+    launcher._run_rollout(options, client)
+    assert "[SAFETY] Relative target limiter smoothed step delta; continuing." in capsys.readouterr().out
+    assert robot.sent[1][1]["gripper.pos"] == pytest.approx(10.0)
+    assert robot.sent[2][1]["gripper.pos"] == pytest.approx(15.0)
     assert robot.disconnected
 
 
 def test_interrupt_disconnects_before_waiting_for_worker(monkeypatch, launcher, clock):
     robot, executor, client, options = rollout(monkeypatch, launcher, clock)
+    shutdown_calls = []
     monkeypatch.setattr(robot, "get_observation", lambda: (_ for _ in ()).throw(KeyboardInterrupt()))
     monkeypatch.setattr(
-        executor, "shutdown", lambda **_: pytest.fail("disconnected late") if not robot.disconnected else None
+        executor,
+        "shutdown",
+        lambda **_: pytest.fail("disconnected late")
+        if not robot.disconnected
+        else shutdown_calls.append(True),
     )
-    with pytest.raises(KeyboardInterrupt):
-        launcher._run_rollout(options, client)
-    assert robot.disconnected
+    launcher._run_rollout(options, client)
+    assert robot.disconnected and shutdown_calls == [True]
 
 
 def test_partial_connect_cleanup(launcher):
@@ -188,7 +213,7 @@ def test_partial_connect_cleanup(launcher):
         bus=SimpleNamespace(is_connected=True, disconnect=lambda **kwargs: closed.append(kwargs)),
     )
     launcher._disconnect_robot(robot)
-    assert closed == ["camera", {"disable_torque": True}]
+    assert closed == ["camera", {"disable_torque": False}]
 
 
 def test_camera_configuration_and_current_action_api(launcher):
@@ -228,7 +253,7 @@ def test_transport_has_timeouts_quotes_and_rejects_wrong_instance(monkeypatch, l
     snapshot = client.snapshot([0.0] * 6, task="cube; 'quoted'", feature_seed=0)
 
     def run(command, **kwargs):
-        assert command[1:9] == launcher.SSH_OPTIONS
+        assert command[1 : 1 + len(launcher.SSH_OPTIONS)] == launcher.SSH_OPTIONS
         assert kwargs["timeout"] == 19
         assert "--max-time 7" in command[-1]
         payload = json.loads(kwargs["input"])
@@ -372,12 +397,12 @@ def test_startup_failure_cleans_only_its_instance(monkeypatch, launcher, keep):
 
 def test_reuses_exact_server_without_stopping_it(monkeypatch, launcher):
     identity = {"checkpoint": "/resolved"}
-    state = health() | {
+    state = health("video_vam") | {
         "ok": True,
         "identity": identity,
         "action_dim": 6,
         "fps": 10,
-        "history_size": 1,
+        "history_size": 5,
         "rtc": True,
         "action_units": ["degrees"] * 5 + ["range_0_100"],
     }
@@ -388,19 +413,19 @@ def test_reuses_exact_server_without_stopping_it(monkeypatch, launcher):
     assert launcher.main(["--dry-run"]) == 0
 
 
-def test_runtime_deadline_miss_aborts(monkeypatch, launcher, clock):
+def test_runtime_deadline_miss_warns_and_continues(monkeypatch, launcher, clock, capsys):
     robot, executor, client, options = rollout(monkeypatch, launcher, clock)
     original = robot.get_observation
 
     def slow_observation():
-        if robot.sent:
-            clock.now += 0.3
+        if len(robot.sent) == 1:
+            clock.now += 0.4
         return original()
 
     monkeypatch.setattr(robot, "get_observation", slow_observation)
-    with pytest.raises(RuntimeError, match="deadline missed"):
-        launcher._run_rollout(options, client)
-    assert len(robot.sent) == 1 and robot.disconnected
+    launcher._run_rollout(options, client)
+    assert "[WARN] Observation loop jitter" in capsys.readouterr().out
+    assert len(robot.sent) > 1 and robot.disconnected
 
 
 @pytest.mark.parametrize("key", ["action_chunk", "original_chunk"])
@@ -422,7 +447,8 @@ def test_real_tmux_management_and_early_exit_logs(monkeypatch, launcher, tmp_pat
     executable = shutil.which("tmux")
     if executable is None:
         pytest.skip("tmux is not installed")
-    socket_path = str(tmp_path / "tmux.sock")
+    sock_path = Path(f"/tmp/vam-test-{uuid.uuid4().hex[:8]}.sock")
+    socket_path = str(sock_path)
     original_run = subprocess.run
 
     def isolated_tmux(command, **kwargs):
@@ -483,6 +509,7 @@ def test_real_tmux_management_and_early_exit_logs(monkeypatch, launcher, tmp_pat
         assert manage("status")["alive"] is False
     finally:
         original_run([executable, "-S", socket_path, "kill-server"], capture_output=True, timeout=5)
+        sock_path.unlink(missing_ok=True)
         log.unlink(missing_ok=True)
         lock.unlink(missing_ok=True)
 
@@ -554,3 +581,190 @@ def test_dry_run_validates_both_responses(monkeypatch, launcher, clock, failed_r
     with pytest.raises(RuntimeError, match="original_chunk must be finite"):
         launcher._run_dry(args(), client)
     assert len(calls) == failed_request
+
+
+@pytest.mark.parametrize("execution_horizon", [10, 15])
+def test_30hz_rtc_waits_for_execution_before_rerequest_and_preserves_full_prefix(
+    monkeypatch, launcher, clock, execution_horizon
+):
+    robot, executor, client, options = rollout(
+        monkeypatch,
+        launcher,
+        clock,
+        policy="video_vam",
+        delays=(0.45,) * 12,
+        fps=30,
+        duration=3.0,
+        execution_horizon=execution_horizon,
+        prefetch_steps=22,
+    )
+    client.fps = 30
+    client.health = health("video_vam", horizon=30)
+
+    submitted_at_sent: list[int] = []
+    orig_submit = executor.submit
+
+    def tracked_submit(function, snapshot):
+        submitted_at_sent.append(len(robot.sent))
+        return orig_submit(function, snapshot)
+
+    monkeypatch.setattr(executor, "submit", tracked_submit)
+
+    def predict_30(snapshot):
+        original = torch.ones(30, 6)
+        physical = original * 5
+        physical[:, 5] = 50
+        return {"original_chunk": original.tolist(), "action_chunk": physical.tolist()}
+
+    monkeypatch.setattr(client, "request", predict_30)
+    launcher._run_rollout(options, client)
+
+    rtc_snapshots = executor.snapshots[3:]
+    rtc_sent_counts = submitted_at_sent[3:]
+    assert len(rtc_snapshots) >= 2
+    assert len(rtc_snapshots[0]["prev_chunk_left_over"]) >= 14
+    for prev_submit, next_submit in zip(rtc_sent_counts, rtc_sent_counts[1:], strict=False):
+        assert next_submit - (prev_submit + 14) >= 1
+
+
+def test_http_keep_alive_and_stale_connection_retry(launcher):
+    import threading
+    from http.server import ThreadingHTTPServer
+
+    server_spec = importlib.util.spec_from_file_location(
+        "rpc_server_keepalive_test", ROOT / "scripts/video_vam/rpc_server.py"
+    )
+    server_mod = importlib.util.module_from_spec(server_spec)
+    server_spec.loader.exec_module(server_mod)
+
+    class FakeApp:
+        def __init__(self):
+            self.predict_lock = threading.Lock()
+            self.calls = 0
+
+        def health(self):
+            return {"ok": True}
+
+        def live_state(self):
+            return {}
+
+        def predict(self, payload):
+            self.calls += 1
+            return {
+                "identity": payload["identity"],
+                "instance_id": payload["instance_id"],
+                "request_id": payload["request_id"],
+                "original_space": payload["original_space"],
+                "original_chunk": [[1.0] * 6] * 30,
+                "action_chunk": [[2.0] * 6] * 30,
+            }
+
+    class TestHandler(server_mod.Handler):
+        app = FakeApp()
+
+        def log_message(self, format, *args):
+            pass
+
+    httpd = ThreadingHTTPServer(("127.0.0.1", 0), TestHandler)
+    port = httpd.server_address[1]
+    thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+    thread.start()
+    try:
+        client = launcher.VideoVAMRPCClient(
+            policy="smolvla", port=port, ssh_host="127.0.0.1", health=health("smolvla", horizon=30)
+        )
+        client.remember(np.zeros((480, 640, 3), dtype=np.uint8))
+        snap1 = client.snapshot([0.0] * 6, task="cube", feature_seed=0)
+        res1 = client.request(snap1)
+        assert res1["request_id"] == snap1["request_id"]
+        conn1 = client._http_conn
+        assert conn1 is not None
+
+        snap2 = client.snapshot([0.0] * 6, task="cube", feature_seed=0)
+        res2 = client.request(snap2)
+        assert res2["request_id"] == snap2["request_id"]
+        assert client._http_conn is conn1  # Reused persistent keep-alive connection
+
+        # Simulate stale/broken keep-alive socket: must retry once on fresh connection and succeed.
+        conn1.close()
+        conn1.sock = None
+
+        def fail_once(*args, **kwargs):
+            raise BrokenPipeError("stale keep-alive socket")
+
+        conn1.request = fail_once
+        snap3 = client.snapshot([0.0] * 6, task="cube", feature_seed=0)
+        res3 = client.request(snap3)
+        assert res3["request_id"] == snap3["request_id"]
+        assert client._http_conn is not None and client._http_conn is not conn1
+    finally:
+        if client._http_conn is not None:
+            client._http_conn.close()
+        httpd.shutdown()
+        httpd.server_close()
+
+
+def test_server_args_euler_steps(launcher):
+    base = args(
+        policy="video_vam",
+        resolved_checkpoint="/ckpt",
+        port=8766,
+        device="cuda",
+        max_guidance_weight=2.0,
+        compile=True,
+    )
+    without_override = launcher._server_args(base)
+    assert "--euler-steps" not in without_override
+
+    with_override = launcher._server_args(
+        args(
+            policy="video_vam",
+            resolved_checkpoint="/ckpt",
+            port=8766,
+            device="cuda",
+            max_guidance_weight=2.0,
+            compile=True,
+            euler_steps=10,
+        )
+    )
+    idx = with_override.index("--euler-steps")
+    assert with_override[idx : idx + 2] == ["--euler-steps", "10"]
+
+    with pytest.raises(SystemExit):
+        launcher.main(["--dry-run", "--euler-steps", "0"])
+
+
+def test_30hz_rtc_tight_latency_pads_short_prefix_and_keeps_delay(monkeypatch, launcher, clock):
+    robot, executor, client, options = rollout(
+        monkeypatch,
+        launcher,
+        clock,
+        policy="video_vam",
+        delays=(0.2, 0.2, 0.55, 0.55, 0.55, 0.55),
+        fps=30,
+        duration=2.5,
+        execution_horizon=20,
+        prefetch_steps=20,
+    )
+    client.fps = 30
+    client.health = health("video_vam", horizon=30)
+
+    def predict_30(snapshot):
+        ramp = torch.arange(30, dtype=torch.float32).unsqueeze(-1).repeat(1, 6)
+        physical = ramp.clone()
+        physical[:, 5] = 50.0
+        return {"original_chunk": ramp.tolist(), "action_chunk": physical.tolist()}
+
+    monkeypatch.setattr(client, "request", predict_30)
+    launcher._run_rollout(options, client)
+
+    rtc_snapshots = executor.snapshots[3:]
+    assert len(rtc_snapshots) >= 2
+    # Second RTC snapshot runs after a short leftover queue (qsize <= est_delay + 4):
+    # prefetch fires early and pads prev_chunk_left_over with its final pose so inference_delay stays intact.
+    padded_snap = rtc_snapshots[1]
+    assert padded_snap["inference_delay"] >= 16
+    assert len(padded_snap["prev_chunk_left_over"]) == min(30 - 4, padded_snap["inference_delay"] + 4)
+    assert padded_snap["prev_chunk_left_over"][-1] == [29.0] * 6
+    assert padded_snap["prev_chunk_left_over"][-2] == [29.0] * 6
+    assert robot.disconnected and executor.shutdown_called

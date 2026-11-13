@@ -970,6 +970,11 @@ class SmolExpertActionDecoder(nn.Module):
         def denoise(input_x_t: Tensor, current_time: Tensor) -> Tensor:
             return self._vector_field(prefix, input_x_t, current_time)
 
+        coarse_max_guidance_weight = (
+            min(float(rtc_processor.rtc_config.max_guidance_weight), 0.90)
+            if rtc_enabled and resolved_steps < 10
+            else None
+        )
         sampled = euler_integrate(
             denoise,
             noise,
@@ -979,5 +984,6 @@ class SmolExpertActionDecoder(nn.Module):
             inference_delay=inference_delay,
             prev_chunk_left_over=prev_chunk_left_over,
             execution_horizon=execution_horizon,
+            max_guidance_weight=coarse_max_guidance_weight,
         )
         return self.normalizer.denormalize_action(sampled[..., : self.action_dim]).to(dtype=torch.float32)

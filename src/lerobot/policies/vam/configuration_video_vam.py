@@ -106,6 +106,7 @@ class VideoVAMConfig(PreTrainedConfig):
     cosmos3_lora_alpha: float | None = None
     cosmos3_lora_use_dora: bool = False
     cosmos3_prompt: str = "take cube out of box"
+    cosmos3_fps: float = 10.0
     flux2_lora_weights: Path | None = None
     flux2_lora_rank: int | None = None
     flux2_lora_alpha: float | None = None

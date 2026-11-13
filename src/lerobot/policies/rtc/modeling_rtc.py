@@ -127,6 +127,8 @@ class RTCProcessor:
         time,
         original_denoise_step_partial,
         execution_horizon=None,
+        *,
+        max_guidance_weight: float | None = None,
     ) -> Tensor:
         """RTC guidance wrapper around an existing denoiser.
 
@@ -146,6 +148,8 @@ class RTCProcessor:
                 computes the base denoised velocity given only ``x_t``.
             execution_horizon (int | None): Horizon used to build prefix weights. If
                 ``None``, defaults to ``self.rtc_config.execution_horizon``.
+            max_guidance_weight (float | None): Optional override for
+                ``self.rtc_config.max_guidance_weight`` for this denoising step.
 
         Returns:
             Tensor: Guided velocity with the same shape as ``v_t``.
@@ -172,7 +176,7 @@ class RTCProcessor:
         if prev_chunk_left_over is None:
             # First step, no guidance - return v_t
             v_t = original_denoise_step_partial(x_t)
-            return v_t
+            return v_t.detach() if v_t.requires_grad else v_t
 
         x_t = x_t.clone().detach()
 
@@ -214,23 +218,25 @@ class RTCProcessor:
         )
 
         with torch.enable_grad():
+            with torch.no_grad():
+                v_t = original_denoise_step_partial(x_t)
             x_t.requires_grad_(True)
-            v_t = original_denoise_step_partial(x_t)
 
             x1_t = x_t - time * v_t  # noqa: N806
             err = (prev_chunk_left_over - x1_t) * weights
             grad_outputs = err.clone().detach()
             correction = torch.autograd.grad(x1_t, x_t, grad_outputs, retain_graph=False)[0]
 
-        max_guidance_weight = torch.as_tensor(self.rtc_config.max_guidance_weight)
-        tau_tensor = torch.as_tensor(tau)
+        cfg_max = self.rtc_config.max_guidance_weight if max_guidance_weight is None else max_guidance_weight
+        max_guidance_weight_tensor = torch.as_tensor(cfg_max, dtype=x_t.dtype, device=x_t.device)
+        tau_tensor = torch.as_tensor(tau, dtype=x_t.dtype, device=x_t.device)
         squared_one_minus_tau = (1 - tau_tensor) ** 2
         inv_r2 = (squared_one_minus_tau + tau_tensor**2) / (squared_one_minus_tau)
-        c = torch.nan_to_num((1 - tau_tensor) / tau_tensor, posinf=max_guidance_weight)
-        guidance_weight = torch.nan_to_num(c * inv_r2, posinf=max_guidance_weight)
-        guidance_weight = torch.minimum(guidance_weight, max_guidance_weight)
+        c = torch.nan_to_num((1 - tau_tensor) / tau_tensor, posinf=max_guidance_weight_tensor)
+        guidance_weight = torch.nan_to_num(c * inv_r2, posinf=max_guidance_weight_tensor)
+        guidance_weight = torch.minimum(guidance_weight, max_guidance_weight_tensor)
 
-        result = v_t - guidance_weight * correction
+        result = (v_t - guidance_weight * correction).detach()
 
         # Remove the batch dimension if it was added
         if squeezed:

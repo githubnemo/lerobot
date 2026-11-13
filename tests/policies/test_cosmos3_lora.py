@@ -339,3 +339,143 @@ def test_cosmos3_extractor_trainable_lora_and_dora_gradient_flow() -> None:
     assert any(n.endswith("lora_A") for n in grad_names)
     assert any(n.endswith("lora_B") for n in grad_names)
     assert any(n.endswith("dora_magnitude") for n in grad_names)
+    # Specifically verify add_q_proj and add_k_proj (which pass through fused_rmsnorm_rope) receive gradients
+    assert any("self_attn.add_q_proj.lora_A" in n for n in grad_names)
+    assert any("self_attn.add_k_proj.lora_A" in n for n in grad_names)
+
+
+def test_fused_rmsnorm_rope_bypasses_triton_when_requires_grad(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Ensure fused_rmsnorm_rope never routes autograd-tracked tensors into the forward-only Triton kernel."""
+    from lerobot.policies.vam import cosmos3_features
+
+    kernel_called = False
+
+    class _DummyKernel:
+        def __getitem__(self, grid: object) -> object:
+            def _launch(*args: object, **kwargs: object) -> None:
+                nonlocal kernel_called
+                kernel_called = True
+
+            return _launch
+
+    monkeypatch.setattr(cosmos3_features, "_TRITON_AVAILABLE", True)
+    monkeypatch.setattr(cosmos3_features, "_fused_rmsnorm_rope_kernel", _DummyKernel(), raising=False)
+
+    norm = torch.nn.RMSNorm(16)
+    x = torch.randn(2, 4, 2, 16, requires_grad=True)
+    cos = torch.ones(4, 16)
+    sin = torch.zeros(4, 16)
+
+    out = cosmos3_features.fused_rmsnorm_rope(x, norm, cos, sin)
+    assert not kernel_called
+    assert out.requires_grad
+    out.square().mean().backward()
+    assert x.grad is not None and x.grad.abs().sum().item() > 0
+
+
+def test_gen_only_warmstart_from_dual_lora_preserves_und_weights_and_roundtrips(tmp_path: Path) -> None:
+    """Loading a dual adapter with trainable_lora=True, lora_pathway='gen_only' must:
+    1) freeze UND params prior to pruning and keep only GEN params trainable,
+    2) compute _cached_und_kv using the loaded UND LoRA weights,
+    3) preserve UND LoRA keys when saving via save_cosmos3_lora after UND pruning, and
+    4) produce bit-identical features when reloaded into a fresh frozen Cosmos3FeatureExtractor.
+    """
+    from unittest.mock import MagicMock
+
+    from safetensors.torch import load_file
+
+    from lerobot.policies.vam.cosmos3_features import Cosmos3ExtractorConfig, Cosmos3FeatureExtractor
+    from lerobot.policies.vam.cosmos3_lora import UND_TARGET_MODULES
+
+    torch.manual_seed(23)
+    ckpt_root = tmp_path / "cosmos3_ckpt"
+    base_trans = build_tiny_real_cosmos3_transformer(num_layers=2, hidden_size=64, dtype="bfloat16")
+    base_trans.save_pretrained(str(ckpt_root / "transformer"))
+
+    # Create a non-zero dual-pathway LoRA checkpoint (both UND and GEN weights active)
+    dual_trans = build_tiny_real_cosmos3_transformer(num_layers=2, hidden_size=64, dtype="bfloat16")
+    dual_trans.load_state_dict(base_trans.state_dict())
+    inject_cosmos3_lora(dual_trans, rank=4, alpha=8.0, target_modules=DUAL_PATHWAY_TARGET_MODULES)
+    with torch.no_grad():
+        for name, p in dual_trans.named_parameters():
+            if name.endswith(("lora_A", "lora_B")):
+                p.normal_(mean=0.0, std=0.1)
+    dual_lora_path = tmp_path / "dual_init.safetensors"
+    save_cosmos3_lora(dual_trans, dual_lora_path, rank=4, alpha=8.0)
+    orig_dual_sd = load_file(str(dual_lora_path))
+    orig_und_keys = {k for k in orig_dual_sd if any(m in k for m in UND_TARGET_MODULES)}
+    orig_gen_keys = set(orig_dual_sd) - orig_und_keys
+    assert len(orig_und_keys) == 2 * 7 * 2
+    assert len(orig_gen_keys) == 2 * 7 * 2
+
+    tokenizer = MagicMock(return_value=type("Tokens", (), {"input_ids": [1, 2, 3, 4]})())
+
+    # 1. Load from disk with trainable_lora=True, lora_pathway="gen_only" (triggers UND precompute & prune)
+    train_cfg = Cosmos3ExtractorConfig(
+        backbone_name="cosmos3-edge",
+        checkpoint_path=ckpt_root,
+        hidden_layers=(2,),
+        device="cpu",
+        dtype="bfloat16",
+        latent_patch_size=2,
+        hidden_dim=64,
+        num_layers=2,
+        fps=30.0,
+        lora_checkpoint=dual_lora_path,
+        lora_rank=4,
+        lora_alpha=8.0,
+        trainable_lora=True,
+        lora_pathway="gen_only",
+        gradient_checkpointing=True,
+    )
+    dummy_vae = torch.nn.Identity()
+    train_ext = Cosmos3FeatureExtractor(train_cfg, vae=dummy_vae, tokenizer=tokenizer)
+
+    # Only GEN LoRA params remain active & trainable
+    trainable = {n: p for n, p in train_ext.transformer.named_parameters() if p.requires_grad}
+    assert set(trainable.keys()) == orig_gen_keys
+
+    # 2. Take a gradient step on GEN LoRA params (verifying add_q_proj and add_k_proj also update)
+    opt = torch.optim.SGD(list(trainable.values()), lr=0.5)
+    latents = torch.randn(2, 48, 2, 4, 4, dtype=torch.bfloat16)
+    out_train_before = train_ext.forward_transformer_blocks(latents)[2]
+    out_train_before.float().square().mean().backward()
+    for k in orig_gen_keys:
+        grad = trainable[k].grad
+        assert grad is not None and grad.abs().sum().item() > 0, f"Missing gradient for {k}"
+    opt.step()
+
+    # 3. Save trained checkpoint and verify BOTH UND and GEN keys are written
+    saved_lora_path = tmp_path / "best_backbone_lora.safetensors"
+    save_cosmos3_lora(train_ext.transformer, saved_lora_path, rank=4, alpha=8.0)
+    saved_sd = load_file(str(saved_lora_path))
+    assert set(saved_sd.keys()) == set(orig_dual_sd.keys())
+    for k in orig_und_keys:
+        torch.testing.assert_close(saved_sd[k], orig_dual_sd[k], atol=0.0, rtol=0.0)
+    for k in orig_gen_keys:
+        assert not torch.allclose(saved_sd[k], orig_dual_sd[k])
+
+    # Also verify in-place reload on the pruned training transformer succeeds (used before final eval)
+    load_cosmos3_lora(train_ext.transformer, saved_lora_path, rank=4, alpha=8.0)
+
+    # 4. Reload into a fresh inference Cosmos3FeatureExtractor (trainable_lora=False, merges into base)
+    eval_cfg = Cosmos3ExtractorConfig(
+        backbone_name="cosmos3-edge",
+        checkpoint_path=ckpt_root,
+        hidden_layers=(2,),
+        device="cpu",
+        dtype="bfloat16",
+        latent_patch_size=2,
+        hidden_dim=64,
+        num_layers=2,
+        fps=30.0,
+        lora_checkpoint=saved_lora_path,
+        lora_rank=4,
+        lora_alpha=8.0,
+        trainable_lora=False,
+    )
+    eval_ext = Cosmos3FeatureExtractor(eval_cfg, vae=dummy_vae, tokenizer=tokenizer)
+    with torch.no_grad():
+        expected_feats = train_ext.forward_transformer_blocks(latents)[2]
+        reloaded_feats = eval_ext.forward_transformer_blocks(latents)[2]
+    torch.testing.assert_close(reloaded_feats, expected_feats, atol=2e-2, rtol=2e-2)

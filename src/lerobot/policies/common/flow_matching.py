@@ -267,6 +267,7 @@ def euler_integrate(
     inference_delay: int | None = None,
     prev_chunk_left_over: Tensor | None = None,
     execution_horizon: int | None = None,
+    max_guidance_weight: float | None = None,
     hard_prefix: Tensor | None = None,
     hard_prefix_mask: Tensor | None = None,
     precompute_times: bool = False,
@@ -310,6 +311,7 @@ def euler_integrate(
         inference_delay: RTC guidance parameter, forwarded verbatim.
         prev_chunk_left_over: RTC guidance parameter, forwarded verbatim.
         execution_horizon: RTC guidance parameter, forwarded verbatim.
+        max_guidance_weight: Optional per-call override for RTC ``max_guidance_weight``.
         hard_prefix: Optional clean action prefix to clamp throughout denoising.
         hard_prefix_mask: Boolean mask selecting the values clamped from ``hard_prefix``.
         precompute_times: Create the float32 timestep schedule on the target device once,
@@ -401,6 +403,7 @@ def euler_integrate(
                     denoise_step_partial_call if noise_at_one else flipped_denoise_step_partial_call
                 ),
                 execution_horizon=execution_horizon,
+                **({"max_guidance_weight": max_guidance_weight} if max_guidance_weight is not None else {}),
             )
             if not noise_at_one:
                 v_t = -v_t

@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import contextlib
 import hashlib
 import io
 import json
@@ -72,6 +73,16 @@ def validate_chunk(value: Any, *, horizon: int, name: str = "action_chunk") -> t
     if tuple(tensor.shape) != (horizon, 6) or not torch.isfinite(tensor).all().item():
         raise ValueError(f"{name} must be finite [{horizon}, 6]")
     return tensor
+
+
+def _smooth_chunk_nyquist(chunk: torch.Tensor, passes: int = 2) -> torch.Tensor:
+    if chunk.ndim != 2 or chunk.shape[0] < 3 or passes <= 0:
+        return chunk
+    out = chunk.clone()
+    for _ in range(passes):
+        prev = out.clone()
+        out[1:-1] = 0.25 * prev[:-2] + 0.50 * prev[1:-1] + 0.25 * prev[2:]
+    return out
 
 
 HF_FALLBACK_REPOS = {
@@ -170,6 +181,7 @@ def checkpoint_identity(args: argparse.Namespace) -> dict[str, Any]:
             "jepa_planning_mode": getattr(args, "jepa_planning_mode", "none"),
             "jepa_num_candidates": getattr(args, "jepa_num_candidates", 8),
             "expo_checkpoint": str(args.expo_checkpoint) if getattr(args, "expo_checkpoint", None) else None,
+            **({"euler_steps": int(args.euler_steps)} if getattr(args, "euler_steps", None) is not None else {}),
             **(
                 {"shared_detector_checkpoint": str(args.shared_detector_checkpoint)}
                 if getattr(args, "shared_detector_checkpoint", None)
@@ -245,6 +257,12 @@ class RPCApplication:
                 config.joint_limits_max = [180.0, 180.0, 180.0, 180.0, 180.0, 100.0]
             config.joint_limit_tolerance = max(getattr(config, "joint_limit_tolerance", 0.0), 15.0)
             self.backend = VideoVAMPolicy.from_pretrained(args.checkpoint, config=config)
+            if (
+                getattr(args, "euler_steps", None) is None
+                and getattr(self.backend, "decoder", None) is not None
+                and int(getattr(self.backend.decoder, "num_steps", 10)) < 10
+            ):
+                self.backend.decoder.num_steps = 10
             self.policy = self.backend
             self.horizon = 30
             self.lower, self.upper = config.joint_limits_min, config.joint_limits_max
@@ -552,6 +570,7 @@ class RPCApplication:
                     )
             else:
                 actions = self.backend.predict_action_chunk(batch, **kwargs)[0].cpu()
+            actions = _smooth_chunk_nyquist(actions, passes=2)
             original = actions.clone()
         actions = validate_chunk(actions, horizon=self.horizon)
         original = validate_chunk(original, horizon=self.horizon, name="original_chunk")
@@ -578,7 +597,7 @@ class RPCApplication:
             "reward_prob": live_reward_prob if self.name == "smolvla" else 0.0,
             "pre_grasp_prob": live_pre_grasp_prob if self.name == "smolvla" else 0.0,
             "edit_norm": live_edit_norm if self.name == "smolvla" else 0.0,
-            "chunk_idx": len(self.current_episode_steps),
+            "chunk_idx": len(getattr(self, "current_episode_steps", ())),
         }
 
     def complete_episode(self, payload: dict[str, Any]) -> dict[str, Any]:
@@ -925,10 +944,15 @@ refresh();
 
 class Handler(BaseHTTPRequestHandler):
     app: RPCApplication
+    protocol_version = "HTTP/1.1"
 
     def setup(self) -> None:
         super().setup()
-        self.connection.settimeout(10.0)
+        self.connection.settimeout(60.0)
+
+    def handle(self) -> None:
+        with contextlib.suppress(TimeoutError, ConnectionResetError, BrokenPipeError):
+            super().handle()
 
     def do_GET(self) -> None:
         if self.path in ("/", "/dashboard"):
@@ -981,6 +1005,9 @@ class Handler(BaseHTTPRequestHandler):
             self._send(200, result)
         except Exception as exc:
             self._send(400, {"error": f"{type(exc).__name__}: {exc}"})
+        finally:
+            with contextlib.suppress(OSError):
+                self.connection.settimeout(60.0)
 
     def _send(self, status: int, payload: dict[str, Any]) -> None:
         encoded = json.dumps(payload, separators=(",", ":")).encode()
@@ -991,7 +1018,7 @@ class Handler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(encoded)
         except (TimeoutError, BrokenPipeError, ConnectionResetError):
-            pass
+            self.close_connection = True
 
     def log_message(self, format: str, *args: Any) -> None:
         print(format % args, flush=True)

@@ -40,6 +40,8 @@ from __future__ import annotations
 import argparse
 import ast
 import base64
+import contextlib
+import http.client
 import json
 import math
 import os
@@ -192,6 +194,8 @@ def _server_args(args: argparse.Namespace) -> list[str]:
         values += ["--expo-checkpoint", str(args.expo_checkpoint)]
     if getattr(args, "shared_detector_checkpoint", None) is not None:
         values += ["--shared-detector-checkpoint", str(args.shared_detector_checkpoint)]
+    if getattr(args, "euler_steps", None) is not None:
+        values += ["--euler-steps", str(args.euler_steps)]
     return values
 
 
@@ -391,6 +395,7 @@ class VideoVAMRPCClient:
         self.frames: deque[Any] = deque(maxlen=5 if policy == "video_vam" else 1)
         self.frame_times: deque[float] = deque(maxlen=self.frames.maxlen)
         self.frame_index = -1
+        self._http_conn: Any = None
 
     @staticmethod
     def _image(frame: Any) -> Any:
@@ -414,7 +419,7 @@ class VideoVAMRPCClient:
 
         arr = frame if isinstance(frame, np.ndarray) else np.array(frame)
         bgr = cv2.cvtColor(arr, cv2.COLOR_RGB2BGR) if arr.ndim == 3 and arr.shape[2] == 3 else arr
-        success, enc = cv2.imencode(".jpg", bgr, [cv2.IMWRITE_JPEG_QUALITY, 80])
+        success, enc = cv2.imencode(".jpg", bgr, [cv2.IMWRITE_JPEG_QUALITY, 65])
         if not success:
             raise RuntimeError("Failed to encode frame to JPEG")
         return base64.b64encode(enc).decode("ascii")
@@ -447,6 +452,10 @@ class VideoVAMRPCClient:
             not min_gap <= gap / 1000 <= max_gap for gap in self.history_spacing_ms()
         ):
             raise RuntimeError(f"observation history is stale or not sampled at {self.fps} Hz")
+        max_h = self.health.get("horizon")
+        trimmed_leftover = (
+            leftover[:max_h] if (leftover is not None and isinstance(max_h, int) and max_h > 0) else leftover
+        )
         return {
             "frames": list(self.frames),
             "state": _finite_state(state),
@@ -457,28 +466,51 @@ class VideoVAMRPCClient:
             "instance_id": self.health["instance_id"],
             "request_id": uuid.uuid4().hex,
             "original_space": self.health["original_space"],
-            "prev_chunk_left_over": leftover_payload(leftover, horizon=self.health.get("execution_horizon")),
+            "prev_chunk_left_over": leftover_payload(trimmed_leftover),
             "inference_delay": inference_delay,
         }
 
-    def request(self, snapshot: dict[str, Any]) -> dict[str, Any]:
-        import urllib.request
+    def _post_local_http(self, path: str, body: bytes) -> dict[str, Any]:
+        headers = {"Content-Type": "application/json", "Connection": "keep-alive"}
+        for attempt in range(2):
+            had_conn = self._http_conn is not None
+            conn = self._http_conn
+            if conn is None:
+                conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=self.timeout)
+                self._http_conn = conn
+            try:
+                conn.request("POST", path, body=body, headers=headers)
+                resp = conn.getresponse()
+                raw = resp.read()
+            except ConnectionRefusedError:
+                with contextlib.suppress(Exception):
+                    conn.close()
+                self._http_conn = None
+                if had_conn and attempt == 0:
+                    continue
+                raise
+            except (http.client.HTTPException, BrokenPipeError, ConnectionResetError, TimeoutError, OSError):
+                with contextlib.suppress(Exception):
+                    conn.close()
+                self._http_conn = None
+                if had_conn and attempt == 0:
+                    continue
+                raise
+            if resp.status != 200:
+                text = raw.decode(errors="replace")[:1000]
+                raise RuntimeError(f"HTTP {resp.status}: {text}")
+            return json.loads(raw)
+        raise RuntimeError("HTTP request failed after retry")
 
+    def request(self, snapshot: dict[str, Any]) -> dict[str, Any]:
         payload = dict(snapshot)
         frames = [self._png_b64(frame) for frame in payload.pop("frames")]
         payload["images_front_u8_png_b64"] = frames if self.policy == "video_vam" else frames[-1]
         body = json.dumps(payload, allow_nan=False).encode()
         result: dict[str, Any] | None = None
         try:
-            req = urllib.request.Request(
-                f"http://127.0.0.1:{self.port}/predict",
-                data=body,
-                headers={"Content-Type": "application/json"},
-                method="POST",
-            )
-            with urllib.request.urlopen(req, timeout=self.timeout) as resp:
-                result = json.loads(resp.read())
-        except Exception:
+            result = self._post_local_http("/predict", body)
+        except (http.client.HTTPException, BrokenPipeError, ConnectionResetError, TimeoutError, OSError) as transport_exc:
             if _is_local_host(self.ssh_host):
                 raise
             command = shlex.join(
@@ -514,7 +546,7 @@ class VideoVAMRPCClient:
             if completed.returncode:
                 raise RuntimeError(
                     f"RPC failed: {completed.stderr.decode(errors='replace')} {completed.stdout.decode(errors='replace')[:1000]}"
-                )
+                ) from transport_exc
             result = json.loads(completed.stdout)
         if not isinstance(result, dict) or "error" in result:
             raise RuntimeError(f"RPC server error: {result}")
@@ -650,8 +682,6 @@ def leftover_payload(tensor: torch.Tensor | None, horizon: int | None = None) ->
         return None
     if tensor.ndim != 2 or tensor.shape[1] != 6 or not torch.isfinite(tensor).all().item():
         raise ValueError("leftover must be finite [T,6]")
-    if horizon is not None and horizon > 0:
-        tensor = tensor[:horizon]
     return tensor.detach().cpu().float().tolist()
 
 
@@ -860,8 +890,10 @@ def _run_single_episode(
     last_action = None
     starved_ticks = 0
     ticks_sent = 0
+    ticks_since_merge = 0
     snapshot_ticks = 0
     obs_ticks = 0
+    max_trackable_latency = min(1.5, max(0.35, (horizon - 4) / max(1, args.fps)))
 
     next_tick = time.monotonic()
     previous_observation = None
@@ -934,8 +966,47 @@ def _run_single_episode(
                                 )
                                 original = original.clone()
                                 original[delay:] = orig_post
+                        elif last_action is not None and len(post_delay) > 0:
+                            held = torch.tensor(
+                                [last_action[name] for name in ACTION_NAMES],
+                                dtype=actions.dtype,
+                                device=actions.device,
+                            )
+                            blend_len = min(len(post_delay), 6)
+                            alpha = torch.linspace(
+                                0.0, 1.0, blend_len + 2, dtype=actions.dtype, device=actions.device
+                            )[1:-1].unsqueeze(-1)
+                            post_delay[:blend_len] = (1.0 - alpha) * held.unsqueeze(0) + alpha * post_delay[:blend_len]
+                            actions = actions.clone()
+                            actions[delay:] = post_delay
+                            if client.health.get("original_space") == "physical" and len(original) > delay:
+                                orig_post = original[delay:].clone()
+                                orig_blend_len = min(len(orig_post), blend_len)
+                                orig_alpha = alpha[:orig_blend_len].to(
+                                    device=original.device, dtype=original.dtype
+                                )
+                                orig_held = held.to(device=original.device, dtype=original.dtype)
+                                orig_post[:orig_blend_len] = (
+                                    (1.0 - orig_alpha) * orig_held.unsqueeze(0)
+                                    + orig_alpha * orig_post[:orig_blend_len]
+                                )
+                                original = original.clone()
+                                original[delay:] = orig_post
+                    elif running and not rtc and last_action is not None and len(actions) > 0:
+                        held = torch.tensor(
+                            [last_action[name] for name in ACTION_NAMES],
+                            dtype=actions.dtype,
+                            device=actions.device,
+                        )
+                        blend_len = min(len(actions), 6)
+                        alpha = torch.linspace(
+                            0.0, 1.0, blend_len + 2, dtype=actions.dtype, device=actions.device
+                        )[1:-1].unsqueeze(-1)
+                        actions = actions.clone()
+                        actions[:blend_len] = (1.0 - alpha) * held.unsqueeze(0) + alpha * actions[:blend_len]
                     queue.merge(original, actions, delay)
-                    if latency < 1.5:
+                    ticks_since_merge = 0
+                    if latency < max_trackable_latency:
                         latencies.add(latency)
                     elif running:
                         print(f"[WARN] Ignoring outlier RPC latency spike ({latency:.3f}s) in delay tracker")
@@ -945,17 +1016,23 @@ def _run_single_episode(
                         deadline = time.monotonic() + args.duration
                         next_tick = time.monotonic()
             if len(client.frames) == client.frames.maxlen and future is None:
-                est_delay = planned_inference_delay(latencies.max(), args.fps)
+                est_delay = planned_inference_delay(latencies.percentile(0.85), args.fps)
                 threshold = min(horizon - 5, max(args.prefetch_steps, est_delay + 2))
-                need_request = not running or (queue.qsize() <= threshold if rtc else queue.empty())
+                qsize = queue.qsize()
+                min_exec_before_prefetch = 1 if qsize <= est_delay + 4 else min(4, max(1, qsize // 4))
+                ready_after_merge = qsize == 0 or ticks_since_merge >= min_exec_before_prefetch
+                need_request = not running or ((qsize <= threshold and ready_after_merge) if rtc else queue.empty())
                 if need_request:
                     if phase == "warmup_rtc":
                         previous = torch.tensor([state] * max(1, horizon - 5), dtype=torch.float32)
                         delay = min(4, len(previous) - 1)
                     else:
                         previous = queue.get_left_over() if rtc and running else None
-                        if previous is not None and args.execution_horizon > 0:
-                            previous = previous[: args.execution_horizon]
+                        if previous is not None and 0 < len(previous) < est_delay + 4:
+                            target_len = min(horizon - 4, est_delay + 4)
+                            if target_len > len(previous):
+                                pad = previous[-1:].expand(target_len - len(previous), -1)
+                                previous = torch.cat([previous, pad], dim=0)
                         delay = est_delay if previous is not None else 0
                         if previous is not None and delay >= len(previous):
                             delay = max(0, len(previous) - 1)
@@ -988,12 +1065,58 @@ def _run_single_episode(
                 if step is not None:
                     starved_ticks = 0
                     ticks_sent += 1
+                    ticks_since_merge += 1
                     action = _chunk_to_action(step.tolist())
                     sent = robot.send_action(action)
                     last_action = sent
                     actual = _finite_state([sent[name] for name in ACTION_NAMES])
                     if max(abs(a - b) for a, b in zip(actual, step.tolist(), strict=True)) > 1e-3:
                         print("[SAFETY] Relative target limiter smoothed step delta; continuing.")
+                        clamp_delta = torch.tensor(actual, dtype=torch.float32) - step.to(dtype=torch.float32)
+                        with queue.lock:
+                            if queue.queue is not None and queue.last_index < len(queue.queue):
+                                rem = len(queue.queue) - queue.last_index
+                                k = min(rem, 8)
+                                decay = torch.linspace(
+                                    1.0, 0.0, k + 1, dtype=queue.queue.dtype, device=queue.queue.device
+                                )[:-1].unsqueeze(-1)
+                                adj = decay * clamp_delta.to(
+                                    device=queue.queue.device, dtype=queue.queue.dtype
+                                )
+                                reanchored = queue.queue[queue.last_index : queue.last_index + k] + adj
+                                reanchored = torch.clamp(
+                                    reanchored,
+                                    min=lower.to(device=reanchored.device, dtype=reanchored.dtype),
+                                    max=upper.to(device=reanchored.device, dtype=reanchored.dtype),
+                                )
+                                reanchored[:, 5] = torch.clamp(reanchored[:, 5], min=0.0, max=100.0)
+                                queue.queue[queue.last_index : queue.last_index + k] = reanchored
+                                if (
+                                    client.health.get("original_space") == "physical"
+                                    and queue.original_queue is not None
+                                    and len(queue.original_queue) == len(queue.queue)
+                                ):
+                                    orig_reanchored = queue.original_queue[
+                                        queue.last_index : queue.last_index + k
+                                    ] + adj.to(
+                                        device=queue.original_queue.device,
+                                        dtype=queue.original_queue.dtype,
+                                    )
+                                    orig_reanchored = torch.clamp(
+                                        orig_reanchored,
+                                        min=lower.to(
+                                            device=orig_reanchored.device, dtype=orig_reanchored.dtype
+                                        ),
+                                        max=upper.to(
+                                            device=orig_reanchored.device, dtype=orig_reanchored.dtype
+                                        ),
+                                    )
+                                    orig_reanchored[:, 5] = torch.clamp(
+                                        orig_reanchored[:, 5], min=0.0, max=100.0
+                                    )
+                                    queue.original_queue[queue.last_index : queue.last_index + k] = (
+                                        orig_reanchored
+                                    )
                 elif running and rtc:
                     if future is not None and last_action is not None:
                         starved_ticks += 1
@@ -1004,6 +1127,8 @@ def _run_single_episode(
                         raise RuntimeError(
                             "RTC action queue exhausted; stopping instead of retrying stale observations"
                         )
+                elif running and not rtc and future is not None and last_action is not None:
+                    robot.send_action(last_action)
             next_tick = _next_tick(next_tick, time.monotonic(), period)
             _sleep_until(min(next_tick, deadline))
         if not running:
@@ -1317,6 +1442,12 @@ def main(argv: list[str] | None = None) -> int:
         help="Action-queue threshold to trigger background prefetch (default 10)",
     )
     parser.add_argument("--feature-seed", type=int, default=0)
+    parser.add_argument(
+        "--euler-steps",
+        type=int,
+        default=None,
+        help="Optional flow-matching Euler step override for video_vam server.",
+    )
     args = parser.parse_args(argv)
     SSH_HOST = args.remote_host
     if _is_local_host(SSH_HOST):
@@ -1336,6 +1467,8 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("duration/timeouts/guidance must be finite and positive")
     if args.feature_seed < 0:
         parser.error("feature seed must be nonnegative")
+    if args.euler_steps is not None and args.euler_steps < 1:
+        parser.error("--euler-steps must be >= 1")
     if args.strategy_type != "base":
         parser.error("only strategy.type=base is supported")
     if (args.joint_limits_min is None) != (args.joint_limits_max is None):
@@ -1478,15 +1611,6 @@ def main(argv: list[str] | None = None) -> int:
                                 local_dir=str(fallback_c3),
                                 allow_patterns=["transformer/*", "vae/*", "text_tokenizer/*", "scheduler/*", "*.json", "*.jinja"],
                             )
-        if not _is_local_host(SSH_HOST):
-            subprocess.run(
-                [_ssh_executable(), *SSH_OPTIONS, "-fN", "-L", f"{args.port}:127.0.0.1:{args.port}", SSH_HOST],
-                check=False,
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                timeout=10,
-            )
         health = _healthz_payload(args.port)
         if health is None or should_restart_rpc(health_payload=health, requested_identity=identity):
             token = uuid.uuid4().hex
@@ -1495,6 +1619,67 @@ def main(argv: list[str] | None = None) -> int:
             health = _wait_ready(args, identity, token)
         else:
             token = health["instance_id"]
+        if not _is_local_host(SSH_HOST):
+            import urllib.request
+
+            def _local_forward_alive() -> bool:
+                try:
+                    with urllib.request.urlopen(f"http://127.0.0.1:{args.port}/healthz", timeout=1.5) as r:
+                        return r.status == 200
+                except Exception:
+                    return False
+
+            if not _local_forward_alive():
+                subprocess.run(
+                    [
+                        _ssh_executable(),
+                        *SSH_OPTIONS,
+                        "-O",
+                        "forward",
+                        "-L",
+                        f"{args.port}:127.0.0.1:{args.port}",
+                        SSH_HOST,
+                    ],
+                    check=False,
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    timeout=5,
+                )
+            if not _local_forward_alive():
+                subprocess.run(
+                    ["pkill", "-f", f"ssh.*-L {args.port}:127.0.0.1:{args.port}"],
+                    check=False,
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+                subprocess.run(
+                    [
+                        _ssh_executable(),
+                        "-o",
+                        "BatchMode=yes",
+                        "-o",
+                        "ConnectTimeout=10",
+                        "-o",
+                        "ControlMaster=no",
+                        "-o",
+                        "ControlPath=none",
+                        "-o",
+                        "ExitOnForwardFailure=yes",
+                        "-o",
+                        "ServerAliveInterval=15",
+                        "-fN",
+                        "-L",
+                        f"{args.port}:127.0.0.1:{args.port}",
+                        SSH_HOST,
+                    ],
+                    check=False,
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    timeout=10,
+                )
         if (
             health.get("action_dim") != 6
             or health.get("fps") != 10

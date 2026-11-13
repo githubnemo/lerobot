@@ -113,8 +113,12 @@ def inject_cosmos3_lora(
 
 
 def cosmos3_lora_state_dict(transformer: nn.Module) -> dict[str, torch.Tensor]:
-    """Extract adapter-only state dict with clean keys."""
+    """Extract adapter-only state dict with clean keys (preserving any stashed pruned-pathway LoRA weights)."""
     state: dict[str, torch.Tensor] = {}
+    pruned_state = getattr(transformer, "_pruned_lora_state_dict", None)
+    if isinstance(pruned_state, dict):
+        for clean_name, tensor in pruned_state.items():
+            state[clean_name] = tensor.detach().cpu().contiguous()
     for name, param in transformer.named_parameters():
         if not name.endswith(("lora_A", "lora_B", "dora_magnitude")):
             continue
@@ -376,5 +380,11 @@ def load_cosmos3_lora(
     # Copy weights
     for k, p in active_lora_params.items():
         p.data.copy_(state_dict[k].to(device=p.device, dtype=p.dtype))
+
+    pruned_state = getattr(transformer, "_pruned_lora_state_dict", None)
+    if isinstance(pruned_state, dict):
+        for k in list(pruned_state.keys()):
+            if k in state_dict:
+                pruned_state[k] = state_dict[k].detach().float().cpu().contiguous()
 
     freeze_base_parameters(transformer)

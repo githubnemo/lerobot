@@ -795,3 +795,57 @@ def test_denoise_step_deterministic_with_same_inputs():
 
     # Should produce identical results
     assert torch.allclose(result1, result2)
+
+
+def test_denoise_step_detaches_output_and_respects_max_guidance_override():
+    """Verify denoise_step detaches output tensors and honors max_guidance_weight overrides."""
+    config = RTCConfig(execution_horizon=10, max_guidance_weight=10.0, debug=True)
+    processor = RTCProcessor(config)
+    capped_processor = RTCProcessor(RTCConfig(execution_horizon=10, max_guidance_weight=0.5))
+
+    x_t = torch.ones(1, 20, 6)
+    prev_chunk = torch.full((1, 20, 6), -5.0)
+    denoiser = torch.nn.Linear(6, 6)
+
+    no_prev = processor.denoise_step(
+        x_t=x_t,
+        prev_chunk_left_over=None,
+        inference_delay=5,
+        time=torch.tensor(1.0),
+        original_denoise_step_partial=denoiser,
+        max_guidance_weight=0.5,
+    )
+    assert not no_prev.requires_grad
+
+    overridden = processor.denoise_step(
+        x_t=x_t,
+        prev_chunk_left_over=prev_chunk,
+        inference_delay=5,
+        time=torch.tensor(1.0),
+        original_denoise_step_partial=denoiser,
+        max_guidance_weight=0.5,
+    )
+    expected = capped_processor.denoise_step(
+        x_t=x_t,
+        prev_chunk_left_over=prev_chunk,
+        inference_delay=5,
+        time=torch.tensor(1.0),
+        original_denoise_step_partial=denoiser,
+    )
+    assert not overridden.requires_grad
+    assert torch.allclose(overridden, expected, atol=1e-6)
+    steps = processor.get_all_debug_steps()
+    assert len(steps) == 1
+    assert steps[0].guidance_weight.item() == pytest.approx(0.5)
+
+    processor.reset_tracker()
+    default_capped = processor.denoise_step(
+        x_t=x_t,
+        prev_chunk_left_over=prev_chunk,
+        inference_delay=5,
+        time=torch.tensor(1.0),
+        original_denoise_step_partial=denoiser,
+    )
+    assert not default_capped.requires_grad
+    assert not torch.allclose(overridden, default_capped)
+    assert processor.get_all_debug_steps()[0].guidance_weight.item() == pytest.approx(10.0)

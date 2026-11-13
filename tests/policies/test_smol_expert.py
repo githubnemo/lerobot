@@ -242,6 +242,36 @@ def test_sampling_accepts_physical_rtc_prefix_and_guides_overlap() -> None:
     assert guided_overlap_rmse < baseline_overlap_rmse
 
 
+def test_3step_rtc_guidance_is_bounded_without_overshoot() -> None:
+    torch.manual_seed(0)
+    decoder = _decoder().eval()
+    state = torch.zeros(1, 6)
+    context = torch.zeros(1, 4, 4)
+    previous = torch.full((22, 6), -70.0)
+
+    baseline = decoder.sample_actions(state, context, seed=7, num_steps=3, use_cuda_graph=False)
+    guided = decoder.sample_actions(
+        state,
+        context,
+        seed=7,
+        num_steps=3,
+        use_cuda_graph=False,
+        rtc_processor=RTCProcessor(RTCConfig(execution_horizon=22, max_guidance_weight=10.0)),
+        inference_delay=10,
+        prev_chunk_left_over=previous,
+        execution_horizon=22,
+    )
+
+    assert not guided.requires_grad
+    assert torch.isfinite(guided).all()
+    assert (guided[0, :22] >= -70.0).all()
+    assert (guided[0, :22] < baseline[0, :22]).all()
+    assert (guided[0, :22] < 0.0).all()
+    # Linear ramp after inference_delay=10 decreases guidance monotonically toward baseline
+    ramp_means = guided[0, 10:22].mean(dim=-1)
+    assert torch.all(ramp_means[1:] > ramp_means[:-1])
+
+
 def test_cached_prefix_kv_matches_uncached_sampling() -> None:
     torch.manual_seed(23)
     decoder = _decoder().eval()

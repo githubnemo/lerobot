@@ -197,3 +197,66 @@ def test_checkpoint_identity_resolves_alias_and_detects_file_change(tmp_path):
     (directory / "config.json").unlink()
     with pytest.raises(FileNotFoundError):
         server.checkpoint_identity(args)
+
+
+def test_smooth_chunk_nyquist_preserves_constants_and_linear_ramps() -> None:
+    server = _load("video_vam_rpc_server", "scripts/video_vam/rpc_server.py")
+    const = torch.ones(30, 6) * 12.5
+    smoothed_const = server._smooth_chunk_nyquist(const, passes=2)
+    assert torch.allclose(smoothed_const, const, atol=1e-6)
+    assert torch.equal(smoothed_const[0], const[0])
+    assert torch.equal(smoothed_const[-1], const[-1])
+
+    t = torch.arange(30, dtype=torch.float32).unsqueeze(-1)
+    a0 = torch.tensor([[-10.0, 5.0, 0.0, 2.5, -3.0, 50.0]])
+    v = torch.tensor([[1.2, -0.4, 0.7, -0.3, 0.9, 1.5]])
+    ramp = a0 + v * t
+    smoothed_ramp = server._smooth_chunk_nyquist(ramp, passes=2)
+    assert torch.allclose(smoothed_ramp, ramp, atol=1e-6)
+    assert torch.equal(smoothed_ramp[0], ramp[0])
+    assert torch.equal(smoothed_ramp[-1], ramp[-1])
+
+
+def test_smooth_chunk_nyquist_attenuates_alternating_sawtooth() -> None:
+    server = _load("video_vam_rpc_server", "scripts/video_vam/rpc_server.py")
+    base = torch.zeros(30, 6)
+    t = torch.arange(30, dtype=torch.float32).unsqueeze(-1)
+    sawtooth = ((-1.0) ** t) * 4.0
+    noisy = base.clone()
+    noisy[1:-1] = noisy[1:-1] + sawtooth[1:-1]
+    smoothed = server._smooth_chunk_nyquist(noisy, passes=2)
+    assert torch.equal(smoothed[0], base[0])
+    assert torch.equal(smoothed[-1], base[-1])
+    # 2 passes of [0.25, 0.5, 0.25] leave 0.5 at idx 1/-2, 0.25 at idx 2/-3, and 0.0 in [3:-3].
+    assert (smoothed[1:-1] - base[1:-1]).abs().max().item() <= 0.5
+    assert (smoothed[2:-2] - base[2:-2]).abs().max().item() < 0.5
+    assert torch.allclose(smoothed[3:-3], base[3:-3], atol=1e-6)
+
+
+def test_checkpoint_identity_euler_steps_optional(tmp_path) -> None:
+    import argparse
+    import json
+
+    server = _load("video_vam_rpc_server", "scripts/video_vam/rpc_server.py")
+    directory = tmp_path / "ckpt"
+    directory.mkdir()
+    (directory / "config.json").write_text(json.dumps({"type": "video_vam"}))
+    (directory / "model.safetensors").write_bytes(b"weights")
+    args = argparse.Namespace(
+        checkpoint=directory,
+        policy="video_vam",
+        device="cpu",
+        compile=False,
+        rtc=True,
+        execution_horizon=10,
+        max_guidance_weight=10.0,
+        joint_limits_min=None,
+        joint_limits_max=None,
+        euler_steps=None,
+    )
+    identity_default = server.checkpoint_identity(args)
+    assert "euler_steps" not in identity_default["config"]
+
+    args.euler_steps = 6
+    identity_override = server.checkpoint_identity(args)
+    assert identity_override["config"]["euler_steps"] == 6

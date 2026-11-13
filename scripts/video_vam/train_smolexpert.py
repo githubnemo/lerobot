@@ -1724,6 +1724,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Conditioning prompt text for online backbone.",
     )
     parser.add_argument(
+        "--backbone-fps",
+        type=float,
+        default=None,
+        help="Temporal FPS passed to Cosmos 3 mRoPE modulation (default: dataset FPS in online mode, or 10.0 for cached Protocol 1.0).",
+    )
+    parser.add_argument(
         "--backbone-tokenizer",
         type=Path,
         default=None,
@@ -2800,13 +2806,19 @@ def main(argv: list[str] | None = None) -> int:
 
             ckpt_dir = args.backbone_checkpoint or Path("/home/anton/.cache/video-vam/cosmos3-edge")
             train_bb_lora = bool(getattr(args, "train_backbone_lora", False))
+            if getattr(args, "backbone_fps", None) is not None:
+                resolved_cosmos3_fps = float(args.backbone_fps)
+            elif args.val_manifest is not None or args.eval2_manifest is not None:
+                resolved_cosmos3_fps = 10.0
+            else:
+                resolved_cosmos3_fps = float(dataset_contract.fps)
             b_cfg = Cosmos3ExtractorConfig(
                 backbone_name="cosmos3-edge",
                 checkpoint_path=ckpt_dir,
                 hidden_layers=(args.backbone_layer,),
                 device=str(device),
                 dtype="bfloat16",
-                fps=10.0,
+                fps=resolved_cosmos3_fps,
                 base_fps=24.0,
                 prompt=args.backbone_prompt,
                 lora_checkpoint=args.backbone_lora_weights,
@@ -3687,6 +3699,15 @@ def main(argv: list[str] | None = None) -> int:
             if (backbone_trainable_params and trained_bb_lora.is_file())
             else (str(args.backbone_lora_weights) if args.backbone_lora_weights else None)
         )
+        resolved_cfg_fps = (
+            float(backbone_extractor.config.fps)
+            if (backbone_extractor is not None and hasattr(backbone_extractor, "config"))
+            else (
+                float(args.backbone_fps)
+                if getattr(args, "backbone_fps", None) is not None
+                else (float(dataset_contract.fps) if is_online else 10.0)
+            )
+        )
         deployment_cfg.update(
             {
                 "cosmos3_checkpoint": str(
@@ -3696,6 +3717,8 @@ def main(argv: list[str] | None = None) -> int:
                 "cosmos3_lora_rank": args.backbone_lora_rank,
                 "cosmos3_lora_alpha": args.backbone_lora_alpha,
                 "cosmos3_lora_use_dora": bool(getattr(args, "backbone_lora_dora", False)),
+                "cosmos3_prompt": args.backbone_prompt,
+                "cosmos3_fps": resolved_cfg_fps,
             }
         )
     elif backend_val == "cosmos":
