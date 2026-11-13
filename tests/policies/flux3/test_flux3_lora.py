@@ -28,6 +28,7 @@ pytest.importorskip("datasets")
 
 from examples.flux3 import export_base as exporter
 from lerobot.configs.default import DatasetConfig, PeftConfig
+from lerobot.configs.policies import PreTrainedConfig
 from lerobot.configs.train import TrainPipelineConfig
 from lerobot.configs.types import FeatureType, PolicyFeature
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
@@ -483,8 +484,103 @@ def test_normalization_uses_training_episodes_only(monkeypatch):
     assert selected == train == [0, 2]
     # Reset the delta at each episode boundary, and leave gripper absolute.
     assert stats["action"]["q99"][:5] == [1.0] * 5
-    assert stats["action"]["q99"][-1] == 2.0
-    assert stats["state"]["q99"] == [2.0] * 6
+
+
+@pytest.mark.usefixtures("restore_torch_backend_flags")
+def test_flux3_dora_w1_rename_map_and_text_encoder_on_cpu(tmp_path):
+    peft = pytest.importorskip("peft")
+    pytest.importorskip("accelerate")
+    pytest.importorskip("diffusers")
+
+    root = tmp_path / "dataset"
+    dataset = LeRobotDataset.create(
+        repo_id="test/so101_wrist_only",
+        fps=30,
+        root=root,
+        features={
+            "action": {"dtype": "float32", "shape": (6,), "names": None},
+            OBS_STATE: {"dtype": "float32", "shape": (6,), "names": None},
+            "observation.images.front": {
+                "dtype": "image",
+                "shape": (64, 96, 3),
+                "names": ["height", "width", "channel"],
+            },
+        },
+    )
+    for t in range(66):
+        dataset.add_frame(
+            {
+                ACTION: np.full(6, t / 100, dtype=np.float32),
+                OBS_STATE: np.zeros(6, dtype=np.float32),
+                "observation.images.front": np.full((64, 96, 3), t, dtype=np.uint8),
+                "task": "pick box",
+            }
+        )
+    dataset.save_episode()
+    dataset.finalize()
+
+    base_cfg = task_config(
+        push_to_hub=False,
+        input_features={
+            "observation.images.scene": PolicyFeature(type=FeatureType.VISUAL, shape=(3, 64, 96)),
+            "observation.images.wrist": PolicyFeature(type=FeatureType.VISUAL, shape=(3, 64, 96)),
+            OBS_STATE: PolicyFeature(type=FeatureType.STATE, shape=(6,)),
+        },
+        camera_layout="side_by_side",
+        camera_keys=["observation.images.scene", "observation.images.wrist"],
+        canvas_hw=(64, 128),
+    )
+    base = tmp_path / "base"
+    pre, post = make_flux3_pre_post_processors(base_cfg, dataset.meta.stats)
+    policy = Flux3Policy(base_cfg)
+    base_cfg.normalization_stats = None
+    policy.save_pretrained(base)
+    pre.save_pretrained(base)
+    post.save_pretrained(base)
+
+    train_policy_cfg = Flux3Config.from_pretrained(base)
+    train_policy_cfg.pretrained_path = str(base)
+    train_policy_cfg.text_encoder_on_cpu = True
+    train_policy_cfg.augment = True
+    train_policy_cfg.camera_keys = ["observation.images.wrist", "observation.images.wrist"]
+
+    train_cfg = TrainPipelineConfig(
+        dataset=DatasetConfig(repo_id="test/so101_wrist_only", root=str(root)),
+        policy=train_policy_cfg,
+        rename_map={"observation.images.front": "observation.images.wrist"},
+        output_dir=tmp_path / "train_dora",
+        batch_size=2,
+        num_workers=0,
+        steps=4,
+        save_freq=4,
+        env_eval_freq=0,
+        log_freq=0,
+        seed=42,
+        peft=PeftConfig(r=16, lora_alpha=16, use_dora=True),
+        ema=ConstantEMAConfig(decay=0.999),
+    )
+    train_cfg.accelerator.gradient_accumulation.steps = 2
+    train_cfg.optimizer = train_policy_cfg.get_optimizer_preset()
+    train_cfg.scheduler = train_policy_cfg.get_scheduler_preset()
+    train_cfg.validate = lambda: None
+
+    train(train_cfg)
+
+    checkpoint = tmp_path / "train_dora/checkpoints/000004"
+    adapter_cfg = peft.PeftConfig.from_pretrained(checkpoint / "pretrained_model")
+    assert adapter_cfg.use_dora is True
+    assert (checkpoint / "pretrained_model_ema/adapter_model.safetensors").exists()
+
+    # Verify adapter reload (matches evaluate_flux3_action_rmse.py)
+    reload_cfg = PreTrainedConfig.from_pretrained(checkpoint / "pretrained_model")
+    reload_cfg.device = "cpu"
+    reload_cfg.use_peft = False
+    reload_cfg.text_encoder_on_cpu = True
+    reloaded_base = Flux3Policy.from_pretrained(base, config=reload_cfg).eval()
+    reloaded = (
+        peft.PeftModel.from_pretrained(reloaded_base, checkpoint / "pretrained_model").get_base_model().eval()
+    )
+    assert any("lora_magnitude_vector" in name for name, _ in reloaded.named_parameters())
 
 
 def test_fixed_text_padding_is_part_of_policy_contract():

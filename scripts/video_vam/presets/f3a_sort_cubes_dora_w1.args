@@ -1,0 +1,4 @@
+# FLUX 3 Action SO-101 DoRA on sort-cubes (wrist-only W1, inherits f3a_sort_cubes_lora_w1).
+#! trainer: lerobot-train
+#! include: f3a_sort_cubes_lora_w1
+--peft.use_dora=true

@@ -696,6 +696,14 @@ class PreTrainedPolicy(nn.Module, HubMixin, abc.ABC):
         # Remove method_type as it's handled separately
         cli_overrides.pop("method_type", None)
 
+        use_dora = cli_overrides.pop("use_dora", None)
+        if use_dora:
+            if peft_method_type != PeftType.LORA:
+                raise ValueError(
+                    f"use_dora=True is only supported with PEFT method LORA, got {peft_method_type}."
+                )
+            cli_overrides["use_dora"] = True
+
         # Handle init_type specially based on PEFT method
         init_type = cli_overrides.pop("init_type", None)
         if init_type is not None:

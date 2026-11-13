@@ -261,6 +261,9 @@ class PeftConfig:
     # Common values are r (alpha == rank) or 2*r.
     lora_alpha: int | None = None
 
+    # Enable Weight-Decomposed Low-Rank Adaptation (DoRA) when method_type == "LORA".
+    use_dora: bool = False
+
 
 @dataclass
 class JobConfig:
