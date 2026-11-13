@@ -778,6 +778,7 @@ class OnlineVideoDataset(torch.utils.data.Dataset[OnlineVideoItem]):
         self._ram_preloaded = False
         self._tabular_preloaded = False
         self._ram_ep_frames: dict[int, Tensor] = {}
+        self._ram_ep_frame_pos: dict[int, dict[int, int]] = {}
         self._ram_states: list[Tensor] = []
         self._ram_actions: list[Tensor] = []
         self._ram_paddings: list[Tensor] = []
@@ -835,7 +836,6 @@ class OnlineVideoDataset(torch.utils.data.Dataset[OnlineVideoItem]):
 
     def _maybe_preload_to_ram(self) -> None:
         from collections import defaultdict
-        from concurrent.futures import ThreadPoolExecutor
 
         from lerobot.datasets.utils import shift_timestamps
         from lerobot.datasets.video_utils import decode_video_frames
@@ -876,7 +876,21 @@ class OnlineVideoDataset(torch.utils.data.Dataset[OnlineVideoItem]):
             self._ep_video_info[ep] = (video_path, from_ts, query_ts)
         self._tabular_preloaded = True
 
-        total_frames = sum(int(self.lerobot_ds.meta.episodes[ep]["length"]) for ep in self.episodes)
+        sparse_windows = self.stride > len(self._cam_delta_indices)
+        ep_needed_frames: dict[int, list[int]] = {}
+        if sparse_windows:
+            for ep in self.episodes:
+                ep_len = int(reader._meta.episodes[ep]["length"])
+                ep_needed_frames[ep] = sorted(
+                    {
+                        max(0, min(ep_len - 1, f + d))
+                        for f in range(4, ep_len, self.stride)
+                        for d in self._cam_delta_indices
+                    }
+                )
+            total_frames = sum(len(v) for v in ep_needed_frames.values())
+        else:
+            total_frames = sum(int(self.lerobot_ds.meta.episodes[ep]["length"]) for ep in self.episodes)
         cam_h, cam_w, cam_c = getattr(self.contract, "camera_shape", (480, 640, 3))
         frame_bytes = cam_h * cam_w * cam_c
         required_bytes = total_frames * frame_bytes
@@ -893,7 +907,7 @@ class OnlineVideoDataset(torch.utils.data.Dataset[OnlineVideoItem]):
             f"requires {req_gb:.2f} GB, free RAM {avail_gb:.2f} GB, usable RAM+VRAM budget {usable_total_gb:.2f} GB.",
             flush=True,
         )
-        if usable_ram_bytes + usable_vram_bytes < frame_bytes * 500:
+        if usable_ram_bytes + usable_vram_bytes < frame_bytes * min(500, max(1, total_frames)):
             print("[OnlineVideoDataset] Insufficient RAM headroom; streaming videos from disk.", flush=True)
             return
 
@@ -902,16 +916,16 @@ class OnlineVideoDataset(torch.utils.data.Dataset[OnlineVideoItem]):
         rem_vram = usable_vram_bytes
         preload_frames_count = 0
         for ep in self.episodes:
-            ep_len = int(reader._meta.episodes[ep]["length"])
-            ep_b = ep_len * frame_bytes
+            ep_frame_cnt = len(ep_needed_frames[ep]) if sparse_windows else int(reader._meta.episodes[ep]["length"])
+            ep_b = ep_frame_cnt * frame_bytes
             if ep_b <= rem_ram:
                 selected_eps[ep] = "cpu"
                 rem_ram -= ep_b
-                preload_frames_count += ep_len
+                preload_frames_count += ep_frame_cnt
             elif ep_b <= rem_vram:
                 selected_eps[ep] = "cuda"
                 rem_vram -= ep_b
-                preload_frames_count += ep_len
+                preload_frames_count += ep_frame_cnt
 
         if not selected_eps:
             return
@@ -919,8 +933,14 @@ class OnlineVideoDataset(torch.utils.data.Dataset[OnlineVideoItem]):
         file_groups: dict[Path, list[tuple[int, int, list[float]]]] = defaultdict(list)
         for ep in selected_eps:
             video_path, from_ts, query_ts = self._ep_video_info[ep]
-            shifted_ts = shift_timestamps(query_ts, from_ts)
-            file_groups[video_path].append((ep, len(query_ts), shifted_ts))
+            if sparse_windows:
+                needed = ep_needed_frames[ep]
+                self._ram_ep_frame_pos[ep] = {orig_f: pos for pos, orig_f in enumerate(needed)}
+                ep_ts_sel = [query_ts[w] for w in needed]
+            else:
+                ep_ts_sel = query_ts
+            shifted_ts = shift_timestamps(ep_ts_sel, from_ts)
+            file_groups[video_path].append((ep, len(ep_ts_sel), shifted_ts))
 
         chunk_ep_count = 6
         for v_path, ep_entries in file_groups.items():
@@ -967,8 +987,13 @@ class OnlineVideoDataset(torch.utils.data.Dataset[OnlineVideoItem]):
         sample_id = f"episode-{ep:04d}-frame-{frame:06d}"
         if ep in self._ram_ep_frames and self._tabular_preloaded:
             ep_frames = self._ram_ep_frames[ep]
-            ep_len = ep_frames.shape[0]
-            win = [max(0, min(ep_len - 1, frame + d)) for d in self._cam_delta_indices]
+            frame_pos = self._ram_ep_frame_pos.get(ep)
+            if frame_pos is not None:
+                ep_len = len(self._ep_video_info[ep][2])
+                win = [frame_pos[max(0, min(ep_len - 1, frame + d))] for d in self._cam_delta_indices]
+            else:
+                ep_len = ep_frames.shape[0]
+                win = [max(0, min(ep_len - 1, frame + d)) for d in self._cam_delta_indices]
             camera = ep_frames[win]
             return OnlineVideoItem(
                 rgb=camera,
@@ -2697,7 +2722,7 @@ def main(argv: list[str] | None = None) -> int:
             episodes=train_eps,
             stride=args.train_stride,
             contract=dataset_contract,
-            ram_headroom_gb=20 if args.augment else 26,
+            ram_headroom_gb=12 if args.augment else 26,
         )
         print(
             f"Loaded online video training dataset with {len(train_dataset)} windows (stride {args.train_stride}, augment={args.augment})"
@@ -3217,30 +3242,8 @@ def main(argv: list[str] | None = None) -> int:
 
     from concurrent.futures import Future, ThreadPoolExecutor
 
-    decode_pool = ThreadPoolExecutor(max_workers=8) if (is_online and not args.dry_run) else None
-
     def _fetch_batch(batch_indices: list[int]) -> list[Any]:
-        if decode_pool is None:
-            return [train_dataset[i] for i in batch_indices]
-        ep_frames = getattr(train_dataset, "_ram_ep_frames", None)
-        idx_map = getattr(train_dataset, "index_map", None)
-        if ep_frames is not None and idx_map is not None:
-            out: list[Any] = [None] * len(batch_indices)
-            miss_pos: list[int] = []
-            miss_idx: list[int] = []
-            for pos, b_idx in enumerate(batch_indices):
-                if idx_map[b_idx][0] in ep_frames:
-                    out[pos] = train_dataset[b_idx]
-                else:
-                    miss_pos.append(pos)
-                    miss_idx.append(b_idx)
-            if miss_idx:
-                for pos, item in zip(
-                    miss_pos, decode_pool.map(train_dataset.__getitem__, miss_idx), strict=True
-                ):
-                    out[pos] = item
-            return out
-        return list(decode_pool.map(train_dataset.__getitem__, batch_indices))
+        return [train_dataset[i] for i in batch_indices]
 
     def _next_batch_indices() -> list[int]:
         nonlocal data_idx
@@ -3572,8 +3575,6 @@ def main(argv: list[str] | None = None) -> int:
     total_time = time.time() - start_time
     if prefetch_pool is not None:
         prefetch_pool.shutdown(wait=False, cancel_futures=True)
-    if decode_pool is not None:
-        decode_pool.shutdown(wait=False, cancel_futures=True)
 
     # Save live final weights before loading best for final evaluation.
     save_weights_artifact(args.output_dir, "last", decoder.state_dict(), opt_step, run_manifest)
