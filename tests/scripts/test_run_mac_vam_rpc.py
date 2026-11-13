@@ -197,9 +197,9 @@ def test_interrupt_disconnects_before_waiting_for_worker(monkeypatch, launcher, 
     monkeypatch.setattr(
         executor,
         "shutdown",
-        lambda **_: pytest.fail("disconnected late")
-        if not robot.disconnected
-        else shutdown_calls.append(True),
+        lambda **_: (
+            pytest.fail("disconnected late") if not robot.disconnected else shutdown_calls.append(True)
+        ),
     )
     launcher._run_rollout(options, client)
     assert robot.disconnected and shutdown_calls == [True]
@@ -905,3 +905,82 @@ def test_chunk_received_logging_distinguishes_local_and_rpc_gpu(monkeypatch, lau
     local_out = capsys.readouterr().out
     assert "[LOCAL] Chunk received:" in local_out
     assert "[RPC] Chunk received:" not in local_out
+
+
+def test_configure_sandbox_triton_env_handles_firejail_ldconfig_and_noexec_home(monkeypatch, tmp_path):
+    import os
+
+    from lerobot.utils import utils as lerobot_utils
+
+    libcuda_dir = tmp_path / "syslib"
+    libcuda_dir.mkdir()
+    (libcuda_dir / "libcuda.so.1").write_bytes(b"")
+
+    fake_home = tmp_path / "jailed_home"
+    fake_home.mkdir()
+    hf_cache_root = tmp_path / "pysandbox_cache"
+    hf_home = hf_cache_root / "huggingface"
+    hf_home.mkdir(parents=True)
+
+    monkeypatch.setattr(lerobot_utils.sys, "platform", "linux")
+    monkeypatch.setattr(Path, "home", lambda: fake_home)
+    monkeypatch.delenv("TRITON_LIBCUDA_PATH", raising=False)
+    monkeypatch.delenv("TRITON_CACHE_DIR", raising=False)
+    monkeypatch.delenv("TORCHINDUCTOR_CACHE_DIR", raising=False)
+    monkeypatch.setenv("LD_LIBRARY_PATH", str(libcuda_dir))
+    monkeypatch.setenv("HF_HOME", str(hf_home))
+    monkeypatch.setenv("JAILED_ENV", "lerobot")
+
+    real_access = os.access
+    noexec_flag = getattr(os, "ST_NOEXEC", 8)
+    monkeypatch.setattr(lerobot_utils.os, "ST_NOEXEC", noexec_flag, raising=False)
+
+    def fake_access(path, mode):
+        if str(path) == "/sbin/ldconfig":
+            return False
+        return real_access(path, mode)
+
+    def fake_statvfs(path):
+        flag = noexec_flag if Path(path).is_relative_to(fake_home) else 0
+        return SimpleNamespace(f_flag=flag)
+
+    monkeypatch.setattr(lerobot_utils.os, "access", fake_access)
+    monkeypatch.setattr(lerobot_utils.os, "statvfs", fake_statvfs, raising=False)
+
+    lerobot_utils.configure_sandbox_triton_env()
+
+    assert os.environ["TRITON_LIBCUDA_PATH"] == str(libcuda_dir)
+    assert os.environ["TRITON_CACHE_DIR"] == str(hf_cache_root / "triton")
+    assert os.environ["TORCHINDUCTOR_CACHE_DIR"] == str(hf_cache_root / "torchinductor")
+    assert (hf_cache_root / "triton").is_dir()
+    assert (hf_cache_root / "torchinductor").is_dir()
+
+
+def test_configure_sandbox_triton_env_noop_when_unlocked(monkeypatch, tmp_path):
+    import os
+
+    from lerobot.utils import utils as lerobot_utils
+
+    normal_home = tmp_path / "normal_home"
+    normal_home.mkdir()
+
+    monkeypatch.setattr(lerobot_utils.sys, "platform", "linux")
+    monkeypatch.setattr(Path, "home", lambda: normal_home)
+    monkeypatch.delenv("TRITON_LIBCUDA_PATH", raising=False)
+    monkeypatch.delenv("TRITON_CACHE_DIR", raising=False)
+    monkeypatch.delenv("TORCHINDUCTOR_CACHE_DIR", raising=False)
+    monkeypatch.delenv("JAILED_ENV", raising=False)
+
+    real_access = os.access
+    monkeypatch.setattr(
+        lerobot_utils.os,
+        "access",
+        lambda path, mode: True if str(path) == "/sbin/ldconfig" else real_access(path, mode),
+    )
+    monkeypatch.setattr(lerobot_utils.os, "statvfs", lambda path: SimpleNamespace(f_flag=0), raising=False)
+
+    lerobot_utils.configure_sandbox_triton_env()
+
+    assert "TRITON_LIBCUDA_PATH" not in os.environ
+    assert "TRITON_CACHE_DIR" not in os.environ
+    assert "TORCHINDUCTOR_CACHE_DIR" not in os.environ

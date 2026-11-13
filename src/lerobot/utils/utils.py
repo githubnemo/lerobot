@@ -40,6 +40,84 @@ def inside_slurm():
     return "SLURM_JOB_ID" in os.environ
 
 
+def _is_exec_writable_dir(path: Path) -> bool:
+    """Return True if `path` (or its nearest existing ancestor) is writable and not mounted `noexec`."""
+    try:
+        probe = path
+        while not probe.exists() and probe.parent != probe:
+            probe = probe.parent
+        if not os.access(probe, os.W_OK | os.X_OK):
+            return False
+        noexec_flag = int(getattr(os, "ST_NOEXEC", 0))
+        return not (noexec_flag and hasattr(os, "statvfs") and bool(os.statvfs(probe).f_flag & noexec_flag))
+    except OSError:
+        return False
+
+
+def configure_sandbox_triton_env() -> None:
+    """Configure Triton and TorchInductor environment variables for Linux sandboxes (e.g. `firejail`).
+
+    1. When `/sbin/ldconfig` is missing or blocked (`EACCES` under `firejail`), Triton's
+       `libcuda_dirs()` raises `PermissionError` unless `TRITON_LIBCUDA_PATH` points to the
+       directory containing `libcuda.so.1`.
+    2. When `$HOME` is mounted `noexec` (as in `firejail` whitelist mode), `dlopen` on Triton's
+       compiled `cuda_utils*.so` under `~/.triton/cache` fails with `failed to map segment from
+       shared object`. Redirect `TRITON_CACHE_DIR` and `TORCHINDUCTOR_CACHE_DIR` to a persistent
+       executable cache directory (preferring `Path(HF_HOME).parent` when writable/exec, else `/tmp`).
+    """
+    if sys.platform != "linux":
+        return
+
+    if not os.environ.get("TRITON_LIBCUDA_PATH") and not os.access("/sbin/ldconfig", os.X_OK):
+        ld_paths = [p for p in os.environ.get("LD_LIBRARY_PATH", "").split(":") if p]
+        candidates = [
+            *ld_paths,
+            "/usr/lib/x86_64-linux-gnu",
+            "/lib/x86_64-linux-gnu",
+            "/usr/lib/aarch64-linux-gnu",
+            "/lib/aarch64-linux-gnu",
+            "/usr/lib64",
+            "/lib64",
+            "/usr/local/cuda/lib64",
+        ]
+        for cand in candidates:
+            if (Path(cand) / "libcuda.so.1").exists():
+                os.environ["TRITON_LIBCUDA_PATH"] = cand
+                break
+
+    need_triton_cache = not os.environ.get("TRITON_CACHE_DIR")
+    need_inductor_cache = not os.environ.get("TORCHINDUCTOR_CACHE_DIR")
+    if not (need_triton_cache or need_inductor_cache):
+        return
+
+    default_triton_dir = Path.home() / ".triton"
+    if _is_exec_writable_dir(default_triton_dir) and not os.environ.get("JAILED_ENV"):
+        return
+
+    import tempfile
+
+    cache_roots: list[Path] = []
+    hf_home = os.environ.get("HF_HOME")
+    if hf_home:
+        cache_roots.append(Path(hf_home).expanduser().parent)
+    cache_roots.append(Path(tempfile.gettempdir()) / f"lerobot_cache_{os.getuid()}")
+
+    for root in cache_roots:
+        if _is_exec_writable_dir(root):
+            try:
+                if need_triton_cache:
+                    triton_dir = root / "triton"
+                    triton_dir.mkdir(parents=True, exist_ok=True)
+                    os.environ["TRITON_CACHE_DIR"] = str(triton_dir)
+                if need_inductor_cache:
+                    inductor_dir = root / "torchinductor"
+                    inductor_dir.mkdir(parents=True, exist_ok=True)
+                    os.environ["TORCHINDUCTOR_CACHE_DIR"] = str(inductor_dir)
+                break
+            except OSError:
+                continue
+
+
 def init_logging(
     log_file: Path | None = None,
     display_pid: bool = False,

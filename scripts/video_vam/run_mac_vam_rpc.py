@@ -58,11 +58,15 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 
-import torch
+from lerobot.utils.utils import configure_sandbox_triton_env
 
-from lerobot.policies.rtc.action_queue import ActionQueue
-from lerobot.policies.rtc.configuration_rtc import RTCConfig
-from lerobot.policies.rtc.latency_tracker import LatencyTracker
+configure_sandbox_triton_env()
+
+import torch  # noqa: E402
+
+from lerobot.policies.rtc.action_queue import ActionQueue  # noqa: E402
+from lerobot.policies.rtc.configuration_rtc import RTCConfig  # noqa: E402
+from lerobot.policies.rtc.latency_tracker import LatencyTracker  # noqa: E402
 
 SSH_HOST = os.environ.get("VAM_SSH_HOST", "abakus")
 

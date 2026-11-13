@@ -17,10 +17,13 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 
-os.environ.setdefault("TORCHINDUCTOR_COMPILE_THREADS", "1")
+from lerobot.utils.utils import configure_sandbox_triton_env
 
-import torch
-from PIL import Image
+os.environ.setdefault("TORCHINDUCTOR_COMPILE_THREADS", "1")
+configure_sandbox_triton_env()
+
+import torch  # noqa: E402
+from PIL import Image  # noqa: E402
 
 HOST = "127.0.0.1"
 PORT = 8766

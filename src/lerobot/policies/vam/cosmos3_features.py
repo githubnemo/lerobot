@@ -28,6 +28,10 @@ from diffusers.pipelines.cosmos.pipeline_cosmos3_omni import (
 )
 from torch import Tensor, nn
 
+from lerobot.utils.utils import configure_sandbox_triton_env
+
+configure_sandbox_triton_env()
+
 try:
     import triton
     import triton.language as tl
