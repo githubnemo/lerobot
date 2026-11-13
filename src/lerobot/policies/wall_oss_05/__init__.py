@@ -16,8 +16,20 @@
 
 """Wall-OSS-0.5 policy integration."""
 
+from typing import TYPE_CHECKING
+
 from .configuration_wall_oss_05 import WallOSS05Config
-from .modeling_wall_oss_05 import WallOSS05Policy
 from .processor_wall_oss_05 import make_wall_oss_05_pre_post_processors
 
+if TYPE_CHECKING:
+    from .modeling_wall_oss_05 import WallOSS05Policy
+
 __all__ = ["WallOSS05Config", "WallOSS05Policy", "make_wall_oss_05_pre_post_processors"]
+
+
+def __getattr__(name: str):
+    if name == "WallOSS05Policy":
+        from .modeling_wall_oss_05 import WallOSS05Policy
+
+        return WallOSS05Policy
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

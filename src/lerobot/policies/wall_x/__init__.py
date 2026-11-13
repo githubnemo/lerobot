@@ -14,8 +14,20 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from typing import TYPE_CHECKING
+
 from .configuration_wall_x import WallXConfig
-from .modeling_wall_x import WallXPolicy
 from .processor_wall_x import make_wall_x_pre_post_processors
 
+if TYPE_CHECKING:
+    from .modeling_wall_x import WallXPolicy
+
 __all__ = ["WallXConfig", "WallXPolicy", "make_wall_x_pre_post_processors"]
+
+
+def __getattr__(name: str):
+    if name == "WallXPolicy":
+        from .modeling_wall_x import WallXPolicy
+
+        return WallXPolicy
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
