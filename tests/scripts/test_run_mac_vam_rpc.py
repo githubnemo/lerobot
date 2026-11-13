@@ -1029,3 +1029,38 @@ def test_warmup_gil_stall_refreshes_30hz_observation_history(
     initial_snap = executor.snapshots[expected_warmups]
     assert initial_snap["frame_index"] >= expected_warmups * 5 + 4
     assert robot.disconnected and executor.shutdown_called
+
+
+def test_debug_dir_writes_episode_trace_and_frames(monkeypatch, launcher, clock, tmp_path):
+    debug_dir = tmp_path / "dbg"
+    robot, executor, client, options = rollout(
+        monkeypatch,
+        launcher,
+        clock,
+        policy="video_vam",
+        delays=(0.05,) * 8,
+        fps=30,
+        camera_fps=30,
+        duration=0.6,
+        inference_type="rtc",
+        debug_dir=debug_dir,
+    )
+    client.fps = 30
+    client.health = health("video_vam", horizon=30)
+
+    def predict_30(snapshot):
+        chunk = [[5.0, 5.0, 5.0, 5.0, 5.0, 50.0]] * 30
+        return {"original_chunk": chunk, "action_chunk": chunk, "latency_s": 0.04}
+
+    monkeypatch.setattr(client, "request", predict_30)
+    launcher._run_rollout(options, client)
+
+    ep_dir = debug_dir / "episode_001"
+    assert (ep_dir / "meta.json").is_file()
+    chunks = [json.loads(line) for line in (ep_dir / "chunks.jsonl").read_text().splitlines() if line]
+    ticks = [json.loads(line) for line in (ep_dir / "ticks.jsonl").read_text().splitlines() if line]
+    assert len(chunks) >= 1
+    assert len(chunks[0]["chunk"]) == 30
+    assert len(ticks) >= 10
+    assert (ep_dir / "frames" / "chunk_0000.jpg").is_file()
+    assert robot.disconnected and executor.shutdown_called

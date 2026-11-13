@@ -903,11 +903,34 @@ def _disconnect_robot(robot: Any) -> None:
         raise RuntimeError(f"Partial robot disconnect failed: {errors}")
 
 
+def _save_debug_episode_trace(
+    debug_ep_dir: Path,
+    meta: dict[str, Any],
+    chunk_records: list[dict[str, Any]],
+    tick_records: list[dict[str, Any]],
+    saved_frames: list[tuple[int, Any]],
+) -> None:
+    frames_dir = debug_ep_dir / "frames"
+    frames_dir.mkdir(parents=True, exist_ok=True)
+    (debug_ep_dir / "meta.json").write_text(json.dumps(meta, indent=2) + "\n")
+    (debug_ep_dir / "chunks.jsonl").write_text(
+        "".join(json.dumps(rec) + "\n" for rec in chunk_records)
+    )
+    (debug_ep_dir / "ticks.jsonl").write_text(
+        "".join(json.dumps(rec) + "\n" for rec in tick_records)
+    )
+    for c_idx, frame in saved_frames:
+        if hasattr(frame, "save"):
+            frame.save(frames_dir / f"chunk_{c_idx:04d}.jpg", format="JPEG", quality=85)
+
+
 def _run_single_episode(
     robot: Any,
     args: argparse.Namespace,
     client: VideoVAMRPCClient,
     executor: ThreadPoolExecutor,
+    *,
+    episode_index: int = 1,
 ) -> float | None:
     future: Future[dict[str, Any]] | None = None
     manual_reward: float | None = None
@@ -920,6 +943,7 @@ def _run_single_episode(
     period = 1.0 / camera_fps
     phase = "warmup"
     started = 0.0
+    ep_start_t: float | None = None
     deadline = time.monotonic() + args.ready_timeout
     running = False
     lower = torch.tensor(args.joint_limits_min)
@@ -931,6 +955,15 @@ def _run_single_episode(
     snapshot_ticks = 0
     obs_ticks = 0
     max_trackable_latency = min(1.5, max(0.35, (horizon - 4) / max(1, args.fps)))
+
+    raw_debug_dir = getattr(args, "debug_dir", None)
+    debug_ep_dir = (Path(raw_debug_dir) / f"episode_{episode_index:03d}") if raw_debug_dir is not None else None
+    chunk_records: list[dict[str, Any]] = []
+    tick_records: list[dict[str, Any]] = []
+    saved_frames: list[tuple[int, Any]] = []
+    pending_snapshot_frame: Any = None
+    pending_snapshot_state: list[float] | None = None
+    pending_snapshot_frame_idx: int | None = None
 
     next_tick = time.monotonic()
     previous_observation = None
@@ -1003,6 +1036,7 @@ def _run_single_episode(
                     actions = torch.clamp(actions, min=lower, max=upper)
                     exact_delay = ticks_sent - snapshot_ticks if running and rtc else 0
                     delay = min(max(0, exact_delay), horizon - 1)
+                    qsize_before = queue.qsize()
                     if running and rtc:
                         prev_remaining = queue.get_processed_left_over()
                         prev_orig_remaining = queue.get_left_over()
@@ -1066,6 +1100,7 @@ def _run_single_episode(
                         actions = actions.clone()
                         actions[:blend_len] = (1.0 - alpha) * held.unsqueeze(0) + alpha * actions[:blend_len]
                     queue.merge(original, actions, delay)
+                    qsize_after = queue.qsize()
                     ticks_since_merge = 0
                     if latency < max_trackable_latency:
                         latencies.add(latency)
@@ -1074,8 +1109,39 @@ def _run_single_episode(
                     if not running:
                         running = True
                         phase = "running"
-                        deadline = time.monotonic() + args.duration
-                        next_tick = time.monotonic()
+                        ep_start_t = time.monotonic()
+                        deadline = ep_start_t + args.duration
+                        next_tick = ep_start_t
+                    if debug_ep_dir is not None:
+                        snap_state = pending_snapshot_state if pending_snapshot_state is not None else state
+                        d0 = [round(float(a - s), 2) for a, s in zip(actions[0].tolist(), snap_state, strict=True)]
+                        c_idx = len(chunk_records)
+                        print(
+                            f"  [DBG] chunk={c_idx} delay={delay} q={qsize_before}->{qsize_after} "
+                            f"d0={d0} grip={actions[0, 5]:.1f}->{actions[-1, 5]:.1f}"
+                        )
+                        chunk_records.append(
+                            {
+                                "chunk_idx": c_idx,
+                                "t_rel_s": round(time.monotonic() - (ep_start_t or time.monotonic()), 4),
+                                "latency_s": round(latency, 4),
+                                "server_s": float(server_s) if isinstance(server_s, (int, float)) else None,
+                                "delay": delay,
+                                "qsize_before": qsize_before,
+                                "qsize_after": qsize_after,
+                                "snapshot_ticks": snapshot_ticks,
+                                "ticks_sent": ticks_sent,
+                                "frame_index": pending_snapshot_frame_idx,
+                                "state": [round(float(x), 3) for x in snap_state],
+                                "d0": d0,
+                                "chunk": [[round(float(v), 3) for v in row] for row in actions.tolist()],
+                            }
+                        )
+                        if pending_snapshot_frame is not None:
+                            saved_frames.append((c_idx, pending_snapshot_frame))
+                        pending_snapshot_frame = None
+                        pending_snapshot_state = None
+                        pending_snapshot_frame_idx = None
             if len(client.frames) == client.frames.maxlen and future is None:
                 est_delay = planned_inference_delay(latencies.percentile(0.85), args.fps)
                 threshold = min(horizon - 5, max(args.prefetch_steps, est_delay + 2))
@@ -1104,6 +1170,10 @@ def _run_single_episode(
                         leftover=previous,
                         inference_delay=delay,
                     )
+                    if debug_ep_dir is not None and phase not in ("warmup", "warmup_rtc"):
+                        pending_snapshot_frame = snapshot["frames"][-1] if snapshot.get("frames") else None
+                        pending_snapshot_state = list(state)
+                        pending_snapshot_frame_idx = int(snapshot["frame_index"])
                     started = time.monotonic()
                     snapshot_ticks = ticks_sent
                     future = executor.submit(client.request, snapshot)
@@ -1131,7 +1201,21 @@ def _run_single_episode(
                     sent = robot.send_action(action)
                     last_action = sent
                     actual = _finite_state([sent[name] for name in ACTION_NAMES])
-                    if max(abs(a - b) for a, b in zip(actual, step.tolist(), strict=True)) > 1e-3:
+                    limited = max(abs(a - b) for a, b in zip(actual, step.tolist(), strict=True)) > 1e-3
+                    if debug_ep_dir is not None:
+                        tick_records.append(
+                            {
+                                "tick": ticks_sent,
+                                "t_rel_s": round(time.monotonic() - (ep_start_t or time.monotonic()), 4),
+                                "state": [round(float(x), 3) for x in state],
+                                "cmd": [round(float(x), 3) for x in step.tolist()],
+                                "sent": [round(float(x), 3) for x in actual],
+                                "qsize": queue.qsize(),
+                                "starved": False,
+                                "limited": limited,
+                            }
+                        )
+                    if limited:
                         print("[SAFETY] Relative target limiter smoothed step delta; continuing.")
                         clamp_delta = torch.tensor(actual, dtype=torch.float32) - step.to(dtype=torch.float32)
                         with queue.lock:
@@ -1184,6 +1268,20 @@ def _run_single_episode(
                         if starved_ticks == 1 or starved_ticks % 15 == 0:
                             print(f"[RTC] Waiting for in-flight RPC chunk (holding pose, tick {starved_ticks})...")
                         robot.send_action(last_action)
+                        if debug_ep_dir is not None:
+                            held_vec = [float(last_action[name]) for name in ACTION_NAMES]
+                            tick_records.append(
+                                {
+                                    "tick": ticks_sent,
+                                    "t_rel_s": round(time.monotonic() - (ep_start_t or time.monotonic()), 4),
+                                    "state": [round(float(x), 3) for x in state],
+                                    "cmd": [round(x, 3) for x in held_vec],
+                                    "sent": [round(x, 3) for x in held_vec],
+                                    "qsize": queue.qsize(),
+                                    "starved": True,
+                                    "limited": False,
+                                }
+                            )
                     else:
                         raise RuntimeError(
                             "RTC action queue exhausted; stopping instead of retrying stale observations"
@@ -1202,6 +1300,27 @@ def _run_single_episode(
             if not future.cancel():
                 with contextlib.suppress(Exception):
                     future.result(timeout=5.0)
+        if debug_ep_dir is not None and (chunk_records or tick_records):
+            meta = {
+                "episode_index": episode_index,
+                "policy": getattr(args, "policy", None),
+                "checkpoint": getattr(args, "resolved_checkpoint", getattr(args, "checkpoint", None)),
+                "fps": args.fps,
+                "camera_fps": camera_fps,
+                "execution_horizon": args.execution_horizon,
+                "prefetch_steps": args.prefetch_steps,
+                "inference_type": args.inference_type,
+                "no_rpc": bool(getattr(args, "no_rpc", False)),
+                "remote_host": getattr(args, "remote_host", None),
+                "task": getattr(args, "task", None),
+                "home_pose": getattr(args, "home_pose", None),
+                "health": client.health,
+            }
+            _save_debug_episode_trace(debug_ep_dir, meta, chunk_records, tick_records, saved_frames)
+            print(
+                f"[DEBUG] Saved episode trace ({len(chunk_records)} chunks, "
+                f"{len(tick_records)} ticks, {len(saved_frames)} frames) -> {debug_ep_dir}"
+            )
 
 
 def _run_rollout(args: argparse.Namespace, client: VideoVAMRPCClient) -> None:
@@ -1259,7 +1378,9 @@ def _run_rollout(args: argparse.Namespace, client: VideoVAMRPCClient) -> None:
                 )
                 print(f"{'=' * 65}")
 
-                live_manual_reward = _run_single_episode(robot, args, client, executor)
+                live_manual_reward = _run_single_episode(
+                    robot, args, client, executor, episode_index=episodes
+                )
 
                 if online_enabled:
                     should_update = (episodes % update_interval == 0) or (episodes == target_episodes)
@@ -1616,6 +1737,12 @@ def main(argv: list[str] | None = None) -> int:
         type=int,
         default=None,
         help="Optional flow-matching Euler step override for video_vam server.",
+    )
+    parser.add_argument(
+        "--debug-dir",
+        type=Path,
+        default=None,
+        help="Optional directory to save per-episode debug traces (meta.json, chunks.jsonl, ticks.jsonl, snapshot frames).",
     )
     args = parser.parse_args(argv)
     SSH_HOST = args.remote_host
