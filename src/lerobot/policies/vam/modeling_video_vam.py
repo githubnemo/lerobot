@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 from collections import deque
 from pathlib import Path
 from typing import Any
@@ -31,6 +32,35 @@ def _read_json(path: Path) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise ValueError(f"expected JSON object: {path}")
     return value
+
+
+def _resolve_cosmos3_checkpoint_path(configured: str | Path) -> Path:
+    """Resolve Cosmos 3 Edge checkpoint path across machines and HuggingFace caches."""
+    configured_path = Path(configured)
+    if configured_path.exists():
+        return configured_path
+
+    default_cache = Path.home() / ".cache/video-vam/cosmos3-edge"
+    if (default_cache / "transformer").is_dir():
+        return default_cache
+
+    hub_dirs: list[Path] = []
+    if hf_home := os.environ.get("HF_HOME"):
+        hub_dirs.append(Path(hf_home) / "hub")
+    if hf_hub_cache := os.environ.get("HF_HUB_CACHE"):
+        hub_dirs.append(Path(hf_hub_cache))
+    hub_dirs.append(Path.home() / ".cache/huggingface/hub")
+    hub_dirs.append(Path.home() / ".cache/pysandbox-lerobot/huggingface/hub")
+
+    for hub_dir in hub_dirs:
+        snapshots_dir = hub_dir / "models--nvidia--Cosmos3-Edge" / "snapshots"
+        if not snapshots_dir.is_dir():
+            continue
+        for snap in sorted(snapshots_dir.iterdir()):
+            if snap.is_dir() and (snap / "transformer").is_dir():
+                return snap
+
+    return configured_path
 
 
 def _load_normalizer(run_dir: Path, checkpoint_metadata: dict[str, Any]) -> SmolVLANormalizer:
@@ -290,7 +320,7 @@ class VideoVAMPolicy(PreTrainedPolicy):
             extractor = Cosmos3FeatureExtractor(
                 Cosmos3ExtractorConfig(
                     backbone_name="cosmos3-edge",
-                    checkpoint_path=self.config.cosmos3_checkpoint,
+                    checkpoint_path=_resolve_cosmos3_checkpoint_path(self.config.cosmos3_checkpoint),
                     hidden_layers=(20,),
                     device=str(self.config.device),
                     dtype="bfloat16",

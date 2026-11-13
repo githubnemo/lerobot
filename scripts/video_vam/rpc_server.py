@@ -28,6 +28,10 @@ HISTORY = 5
 
 
 def _frame(value: Any) -> torch.Tensor:
+    if isinstance(value, torch.Tensor) and value.dtype == torch.uint8:
+        if value.ndim == 3 or (value.ndim == 4 and value.shape[0] == HISTORY):
+            return value
+        raise ValueError(f"invalid uint8 tensor frame shape: {tuple(value.shape)}")
     if isinstance(value, str):
         try:
             raw = base64.b64decode(value, validate=True)

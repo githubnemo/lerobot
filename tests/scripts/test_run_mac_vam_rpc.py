@@ -768,3 +768,140 @@ def test_30hz_rtc_tight_latency_pads_short_prefix_and_keeps_delay(monkeypatch, l
     assert padded_snap["prev_chunk_left_over"][-1] == [29.0] * 6
     assert padded_snap["prev_chunk_left_over"][-2] == [29.0] * 6
     assert robot.disconnected and executor.shutdown_called
+
+
+@pytest.mark.parametrize("policy,horizon", [("smolvla", 50), ("video_vam", 30)])
+def test_no_rpc_dry_run_runs_in_process_without_ssh_or_http(
+    monkeypatch, launcher, clock, capsys, policy, horizon
+):
+    import threading
+
+    predict_payloads = []
+    closed = []
+
+    class FakeInProcessApp:
+        def __init__(self):
+            self.predict_lock = threading.Lock()
+            self._health = {
+                "ok": True,
+                "identity": {"protocol": 2, "policy": policy},
+                "instance_id": "in-process",
+                "policy": policy,
+                "checkpoint": "/local/ckpt",
+                "rtc": True,
+                "horizon": horizon,
+                "original_space": "normalized" if policy == "smolvla" else "physical",
+                "action_dim": 6,
+                "history_size": 5 if policy == "video_vam" else 1,
+                "fps": 10,
+                "action_units": ["degrees"] * 5 + ["range_0_100"],
+            }
+
+        def health(self):
+            return dict(self._health)
+
+        def predict(self, payload):
+            predict_payloads.append(payload)
+            return {
+                "identity": payload["identity"],
+                "instance_id": payload["instance_id"],
+                "request_id": payload["request_id"],
+                "original_space": payload["original_space"],
+                "original_chunk": [[1.0] * 6] * horizon,
+                "action_chunk": [[2.0] * 6] * horizon,
+                "latency_s": 0.05,
+            }
+
+        def complete_episode(self, payload):
+            return {"episode_count": 1, "reward": 1.0, "payload": payload}
+
+        def close(self):
+            closed.append(True)
+
+    fake_app = FakeInProcessApp()
+    monkeypatch.setattr(launcher, "_load_in_process_app", lambda args: fake_app)
+    monkeypatch.setattr(
+        launcher, "_ssh", lambda *a, **kw: pytest.fail("_ssh must not be called in --no-rpc mode")
+    )
+    monkeypatch.setattr(
+        launcher, "_describe_server", lambda *a, **kw: pytest.fail("_describe_server must not be called")
+    )
+    monkeypatch.setattr(
+        launcher, "_healthz_payload", lambda *a, **kw: pytest.fail("_healthz_payload must not be called")
+    )
+    monkeypatch.setattr(launcher, "_manage", lambda *a, **kw: pytest.fail("_manage must not be called"))
+    monkeypatch.setattr(
+        launcher.http.client,
+        "HTTPConnection",
+        lambda *a, **kw: pytest.fail("HTTPConnection must not be called in --no-rpc mode"),
+    )
+    monkeypatch.setattr(
+        launcher.subprocess,
+        "run",
+        lambda *a, **kw: pytest.fail("subprocess.run must not be called in --no-rpc mode"),
+    )
+
+    ckpt_arg = "smolvla_v1" if policy == "smolvla" else "cosmos3_lora"
+    rc = launcher.main(
+        ["--no-rpc", "--remote-host", "abakus", "--policy", policy, "--checkpoint", ckpt_arg, "--dry-run"]
+    )
+    assert rc == 0
+    assert len(predict_payloads) == 2
+    expected_shape = (5, 480, 640, 3) if policy == "video_vam" else (480, 640, 3)
+    for payload in predict_payloads:
+        assert "images_front_u8_raw" in payload
+        assert "images_front_u8_png_b64" not in payload
+        raw = payload["images_front_u8_raw"]
+        assert isinstance(raw, torch.Tensor) and raw.dtype == torch.uint8
+        assert tuple(raw.shape) == expected_shape
+    assert closed == [True]
+    assert "Initial no-prefix request" in capsys.readouterr().out
+
+    # Also verify in-process complete_episode bypasses subprocess/HTTP
+    client = launcher.VideoVAMRPCClient(
+        policy=policy,
+        ssh_host="local",
+        health=fake_app.health(),
+        in_process_app=fake_app,
+    )
+    ep_res = client.complete_episode(spawn_group=2, update_critic=True, update_steps=10, manual_reward=1.0)
+    assert ep_res["episode_count"] == 1
+    assert ep_res["payload"]["spawn_group"] == 2
+    assert ep_res["payload"]["manual_reward"] == 1.0
+
+
+def test_chunk_received_logging_distinguishes_local_and_rpc_gpu(monkeypatch, launcher, clock, capsys):
+    import threading
+
+    robot, executor, client, options = rollout(monkeypatch, launcher, clock)
+    # 1. RPC with server latency_s reports gpu=...
+    monkeypatch.setattr(
+        client,
+        "request",
+        lambda snapshot: {
+            "original_chunk": [[1.0] * 6] * 50,
+            "action_chunk": [[5.0] * 6] * 50,
+            "latency_s": 0.123,
+        },
+    )
+    launcher._run_rollout(options, client)
+    rpc_out = capsys.readouterr().out
+    assert "[RPC] Chunk received:" in rpc_out
+    assert "gpu: 0.123s" in rpc_out
+
+    # 2. In-process client reports [LOCAL] without gpu=...
+    robot2, executor2, client2, options2 = rollout(monkeypatch, launcher, clock)
+    client2.in_process_app = SimpleNamespace(predict_lock=threading.Lock())
+    monkeypatch.setattr(
+        client2,
+        "request",
+        lambda snapshot: {
+            "original_chunk": [[1.0] * 6] * 50,
+            "action_chunk": [[5.0] * 6] * 50,
+            "latency_s": 0.123,
+        },
+    )
+    launcher._run_rollout(options2, client2)
+    local_out = capsys.readouterr().out
+    assert "[LOCAL] Chunk received:" in local_out
+    assert "[RPC] Chunk received:" not in local_out

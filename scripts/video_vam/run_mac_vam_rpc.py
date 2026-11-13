@@ -42,12 +42,14 @@ import ast
 import base64
 import contextlib
 import http.client
+import importlib.util
 import json
 import math
 import os
 import shlex
 import shutil
 import subprocess
+import sys
 import time
 import uuid
 import warnings
@@ -386,12 +388,14 @@ class VideoVAMRPCClient:
         timeout: float = 120.0,
         health: dict[str, Any] | None = None,
         fps: int = 10,
+        in_process_app: Any | None = None,
     ) -> None:
         if policy not in {"smolvla", "video_vam"}:
             raise ValueError("policy must be smolvla or video_vam")
         self.policy, self.port, self.ssh_host = policy, port, (SSH_HOST if ssh_host is None else ssh_host)
         self.timeout, self.health = timeout, health or {}
         self.fps = fps
+        self.in_process_app = in_process_app
         self.frames: deque[Any] = deque(maxlen=5 if policy == "video_vam" else 1)
         self.frame_times: deque[float] = deque(maxlen=self.frames.maxlen)
         self.frame_index = -1
@@ -504,50 +508,70 @@ class VideoVAMRPCClient:
 
     def request(self, snapshot: dict[str, Any]) -> dict[str, Any]:
         payload = dict(snapshot)
-        frames = [self._png_b64(frame) for frame in payload.pop("frames")]
-        payload["images_front_u8_png_b64"] = frames if self.policy == "video_vam" else frames[-1]
-        body = json.dumps(payload, allow_nan=False).encode()
         result: dict[str, Any] | None = None
-        try:
-            result = self._post_local_http("/predict", body)
-        except (http.client.HTTPException, BrokenPipeError, ConnectionResetError, TimeoutError, OSError) as transport_exc:
-            if _is_local_host(self.ssh_host):
-                raise
-            command = shlex.join(
-                [
-                    "curl",
-                    "--fail-with-body",
-                    "--silent",
-                    "--show-error",
-                    "--connect-timeout",
-                    "3",
-                    "--max-time",
-                    str(self.timeout),
-                    "-X",
-                    "POST",
-                    f"http://127.0.0.1:{self.port}/predict",
-                    "-H",
-                    "Content-Type: application/json",
-                    "--data-binary",
-                    "@-",
-                ]
-            )
-            try:
-                cmd = [_ssh_executable(), *SSH_OPTIONS, self.ssh_host, command]
-                completed = subprocess.run(
-                    cmd,
-                    input=body,
-                    capture_output=True,
-                    check=False,
-                    timeout=self.timeout + 12,
+        if self.in_process_app is not None:
+            pil_frames = payload.pop("frames")
+            tensors = [
+                torch.frombuffer(bytearray(img.tobytes()), dtype=torch.uint8).reshape(
+                    img.height, img.width, 3
                 )
-            except subprocess.TimeoutExpired as exc:
-                raise RuntimeError("RPC transport timed out; no request will be retried") from exc
-            if completed.returncode:
-                raise RuntimeError(
-                    f"RPC failed: {completed.stderr.decode(errors='replace')} {completed.stdout.decode(errors='replace')[:1000]}"
-                ) from transport_exc
-            result = json.loads(completed.stdout)
+                for img in pil_frames
+            ]
+            payload["images_front_u8_raw"] = (
+                torch.stack(tensors, dim=0) if self.policy == "video_vam" else tensors[-1]
+            )
+            with self.in_process_app.predict_lock:
+                result = self.in_process_app.predict(payload)
+        else:
+            frames = [self._png_b64(frame) for frame in payload.pop("frames")]
+            payload["images_front_u8_png_b64"] = frames if self.policy == "video_vam" else frames[-1]
+            body = json.dumps(payload, allow_nan=False).encode()
+            try:
+                result = self._post_local_http("/predict", body)
+            except (
+                http.client.HTTPException,
+                BrokenPipeError,
+                ConnectionResetError,
+                TimeoutError,
+                OSError,
+            ) as transport_exc:
+                if _is_local_host(self.ssh_host):
+                    raise
+                command = shlex.join(
+                    [
+                        "curl",
+                        "--fail-with-body",
+                        "--silent",
+                        "--show-error",
+                        "--connect-timeout",
+                        "3",
+                        "--max-time",
+                        str(self.timeout),
+                        "-X",
+                        "POST",
+                        f"http://127.0.0.1:{self.port}/predict",
+                        "-H",
+                        "Content-Type: application/json",
+                        "--data-binary",
+                        "@-",
+                    ]
+                )
+                try:
+                    cmd = [_ssh_executable(), *SSH_OPTIONS, self.ssh_host, command]
+                    completed = subprocess.run(
+                        cmd,
+                        input=body,
+                        capture_output=True,
+                        check=False,
+                        timeout=self.timeout + 12,
+                    )
+                except subprocess.TimeoutExpired as exc:
+                    raise RuntimeError("RPC transport timed out; no request will be retried") from exc
+                if completed.returncode:
+                    raise RuntimeError(
+                        f"RPC failed: {completed.stderr.decode(errors='replace')} {completed.stdout.decode(errors='replace')[:1000]}"
+                    ) from transport_exc
+                result = json.loads(completed.stdout)
         if not isinstance(result, dict) or "error" in result:
             raise RuntimeError(f"RPC server error: {result}")
         for key in ("identity", "instance_id", "request_id", "original_space"):
@@ -575,6 +599,12 @@ class VideoVAMRPCClient:
         }
         if manual_reward is not None:
             payload["manual_reward"] = float(manual_reward)
+        if self.in_process_app is not None:
+            with self.in_process_app.predict_lock:
+                result = self.in_process_app.complete_episode(payload)
+            if not isinstance(result, dict) or "error" in result:
+                raise RuntimeError(f"RPC episode_complete error: {result}")
+            return result
         command = shlex.join(
             [
                 "curl",
@@ -620,6 +650,9 @@ class VideoVAMRPCClient:
             "ep_index": int(ep_index),
             "reward": float(reward),
         }
+        if self.in_process_app is not None:
+            with self.in_process_app.predict_lock:
+                return self.in_process_app.override_episode(payload)
         command = shlex.join(
             [
                 "curl",
@@ -925,7 +958,23 @@ def _run_single_episode(
                     if chunk_idx > 0
                     else ""
                 )
-                print(f"[RPC] Chunk received: {latency:.3f}s (phase: {phase}, queue: {queue.qsize()}{det_str})")
+                server_s = result.get("latency_s")
+                if client.in_process_app is not None:
+                    print(
+                        f"[LOCAL] Chunk received: {latency:.3f}s (phase: {phase}, queue: {queue.qsize()}{det_str})"
+                    )
+                elif (
+                    isinstance(server_s, (int, float))
+                    and not isinstance(server_s, bool)
+                    and math.isfinite(server_s)
+                ):
+                    print(
+                        f"[RPC] Chunk received: {latency:.3f}s (gpu: {float(server_s):.3f}s, phase: {phase}, queue: {queue.qsize()}{det_str})"
+                    )
+                else:
+                    print(
+                        f"[RPC] Chunk received: {latency:.3f}s (phase: {phase}, queue: {queue.qsize()}{det_str})"
+                    )
                 if running and result.get("reward_detected"):
                     print(
                         f"🎯 [LIVE REWARD DETECTED] MultiFrameSuccessDetector p={det_p:.3f} "
@@ -1277,6 +1326,101 @@ def _run_rollout(args: argparse.Namespace, client: VideoVAMRPCClient) -> None:
             executor.shutdown(wait=True, cancel_futures=True)
 
 
+def _resolve_local_checkpoint(raw_checkpoint: str) -> str:
+    ckpt_path = Path(raw_checkpoint)
+    if not ckpt_path.exists():
+        local_repo = Path(__file__).resolve().parents[2]
+        if not ckpt_path.is_absolute():
+            candidate = local_repo / raw_checkpoint
+            if candidate.exists():
+                return str(candidate)
+        elif raw_checkpoint.startswith("/home/anton/lerobot-video-vam/"):
+            candidate = local_repo / raw_checkpoint.removeprefix("/home/anton/lerobot-video-vam/")
+            if candidate.exists():
+                return str(candidate)
+    return raw_checkpoint
+
+
+def _ensure_cosmos3_backbone(resolved_checkpoint: str, policy: str) -> None:
+    if policy != "video_vam":
+        return
+    ckpt_cfg_path = Path(resolved_checkpoint) / "config.json"
+    if ckpt_cfg_path.is_file():
+        ckpt_cfg = json.loads(ckpt_cfg_path.read_text())
+        if ckpt_cfg.get("backend") == "cosmos3_edge":
+            from lerobot.policies.vam.modeling_video_vam import _resolve_cosmos3_checkpoint_path
+
+            c3_path = _resolve_cosmos3_checkpoint_path(
+                ckpt_cfg.get("cosmos3_checkpoint", "/home/anton/.cache/video-vam/cosmos3-edge")
+            )
+            if not (c3_path / "transformer").is_dir():
+                fallback_c3 = Path.home() / ".cache/video-vam/cosmos3-edge"
+                if not (fallback_c3 / "transformer").is_dir():
+                    from huggingface_hub import snapshot_download
+
+                    print(
+                        "[SETUP] Downloading nvidia/Cosmos3-Edge backbone to ~/.cache/video-vam/cosmos3-edge..."
+                    )
+                    fallback_c3.mkdir(parents=True, exist_ok=True)
+                    snapshot_download(
+                        "nvidia/Cosmos3-Edge",
+                        local_dir=str(fallback_c3),
+                        allow_patterns=[
+                            "transformer/*",
+                            "vae/*",
+                            "text_tokenizer/*",
+                            "scheduler/*",
+                            "*.json",
+                            "*.jinja",
+                        ],
+                    )
+
+
+def _validate_health(health: dict[str, Any], args: argparse.Namespace) -> None:
+    if (
+        health.get("action_dim") != 6
+        or health.get("fps") != 10
+        or health.get("original_space") != ("normalized" if args.policy == "smolvla" else "physical")
+        or health.get("rtc") is not (args.inference_type == "rtc")
+        or health.get("history_size") != (5 if args.policy == "video_vam" else 1)
+        or health.get("action_units") != ["degrees"] * 5 + ["range_0_100"]
+        or not isinstance(health.get("horizon"), int)
+        or health["horizon"] <= args.execution_horizon
+    ):
+        raise RuntimeError("Server advertises incompatible or missing action metadata")
+
+
+def _load_in_process_app(args: argparse.Namespace) -> Any:
+    rpc_path = Path(__file__).with_name("rpc_server.py")
+    spec = importlib.util.spec_from_file_location("video_vam_rpc_server_inproc", rpc_path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"Could not load rpc_server.py from {rpc_path}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules.setdefault("video_vam_rpc_server_inproc", module)
+    spec.loader.exec_module(module)
+
+    args.resolved_checkpoint = _resolve_local_checkpoint(args.resolved_checkpoint)
+    server_ns = argparse.Namespace(
+        policy=args.policy,
+        checkpoint=Path(args.resolved_checkpoint),
+        device=args.device,
+        compile=args.compile,
+        rtc=(args.inference_type == "rtc"),
+        execution_horizon=args.execution_horizon,
+        max_guidance_weight=args.max_guidance_weight,
+        joint_limits_min=args.joint_limits_min,
+        joint_limits_max=args.joint_limits_max,
+        euler_steps=args.euler_steps,
+        instance_id="in-process",
+        jepa_world_model=None,
+        jepa_planning_mode="none",
+        jepa_num_candidates=8,
+        expo_checkpoint=getattr(args, "expo_checkpoint", None),
+        shared_detector_checkpoint=getattr(args, "shared_detector_checkpoint", None),
+    )
+    return module.RPCApplication(server_ns)
+
+
 def main(argv: list[str] | None = None) -> int:
     global SSH_HOST, REPO
     parser = argparse.ArgumentParser(
@@ -1406,6 +1550,19 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--task", default="take cube out of box")
     parser.add_argument("--strategy.type", dest="strategy_type", default="base")
+    parser.add_argument(
+        "--no-rpc",
+        dest="no_rpc",
+        action="store_true",
+        default=False,
+        help="Load and run policy directly in-process on local device without starting or querying an RPC server (overrides --remote-host).",
+    )
+    parser.add_argument(
+        "--rpc",
+        dest="no_rpc",
+        action="store_false",
+        help="Use RPC server for policy inference (default).",
+    )
     parser.add_argument(
         "--inference.type",
         dest="inference_type",
@@ -1586,6 +1743,32 @@ def main(argv: list[str] | None = None) -> int:
             args.robot_max_relative_target = dict(DEFAULT_MAX_RELATIVE_TARGET)
         args.robot_cameras = _parse_cameras(args.robot_cameras_raw)
 
+    if args.no_rpc:
+        args.resolved_checkpoint = _resolve_local_checkpoint(args.resolved_checkpoint)
+        _ensure_cosmos3_backbone(args.resolved_checkpoint, args.policy)
+        app = _load_in_process_app(args)
+        try:
+            health = app.health()
+            _validate_health(health, args)
+            client = VideoVAMRPCClient(
+                policy=args.policy,
+                port=args.port,
+                ssh_host="local",
+                timeout=args.rpc_timeout,
+                health=health,
+                fps=args.camera_fps or args.fps,
+                in_process_app=app,
+            )
+            if args.dry_run:
+                _run_dry(args, client)
+            else:
+                _run_rollout(args, client)
+        finally:
+            closer = getattr(app, "close", None)
+            if closer is not None:
+                closer()
+        return 0
+
     token = None
     owned = False
     succeeded = False
@@ -1593,24 +1776,8 @@ def main(argv: list[str] | None = None) -> int:
         identity = _describe_server(args)
         # Pin a mutable `last` symlink before starting a process.
         args.resolved_checkpoint = identity["checkpoint"]
-        if _is_local_host(SSH_HOST) and args.policy == "video_vam":
-            ckpt_cfg_path = Path(args.resolved_checkpoint) / "config.json"
-            if ckpt_cfg_path.is_file():
-                ckpt_cfg = json.loads(ckpt_cfg_path.read_text())
-                if ckpt_cfg.get("backend") == "cosmos3_edge":
-                    c3_path = Path(ckpt_cfg.get("cosmos3_checkpoint", "/home/anton/.cache/video-vam/cosmos3-edge"))
-                    if not (c3_path / "transformer").is_dir():
-                        fallback_c3 = Path.home() / ".cache/video-vam/cosmos3-edge"
-                        if not (fallback_c3 / "transformer").is_dir():
-                            from huggingface_hub import snapshot_download
-
-                            print("[SETUP] Downloading nvidia/Cosmos3-Edge backbone to ~/.cache/video-vam/cosmos3-edge...")
-                            fallback_c3.mkdir(parents=True, exist_ok=True)
-                            snapshot_download(
-                                "nvidia/Cosmos3-Edge",
-                                local_dir=str(fallback_c3),
-                                allow_patterns=["transformer/*", "vae/*", "text_tokenizer/*", "scheduler/*", "*.json", "*.jinja"],
-                            )
+        if _is_local_host(SSH_HOST):
+            _ensure_cosmos3_backbone(args.resolved_checkpoint, args.policy)
         health = _healthz_payload(args.port)
         if health is None or should_restart_rpc(health_payload=health, requested_identity=identity):
             token = uuid.uuid4().hex
@@ -1680,17 +1847,7 @@ def main(argv: list[str] | None = None) -> int:
                     stderr=subprocess.DEVNULL,
                     timeout=10,
                 )
-        if (
-            health.get("action_dim") != 6
-            or health.get("fps") != 10
-            or health.get("original_space") != ("normalized" if args.policy == "smolvla" else "physical")
-            or health.get("rtc") is not (args.inference_type == "rtc")
-            or health.get("history_size") != (5 if args.policy == "video_vam" else 1)
-            or health.get("action_units") != ["degrees"] * 5 + ["range_0_100"]
-            or not isinstance(health.get("horizon"), int)
-            or health["horizon"] <= args.execution_horizon
-        ):
-            raise RuntimeError("Server advertises incompatible or missing action metadata")
+        _validate_health(health, args)
         client = VideoVAMRPCClient(
             policy=args.policy,
             port=args.port,

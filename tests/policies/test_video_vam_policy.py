@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -14,6 +15,7 @@ from lerobot.policies.vam.modeling_video_vam import (
     HISTORY_FRAME_INDEX_KEY,
     VideoVAMPolicy,
     VideoVAMSafetyError,
+    _resolve_cosmos3_checkpoint_path,
     restore_uint8_history,
 )
 from lerobot.processor import NormalizerProcessorStep, UnnormalizerProcessorStep
@@ -332,3 +334,30 @@ def test_processors_do_not_double_normalize() -> None:
     preprocessor, postprocessor = make_pre_post_processors(_config(), pretrained_path="custom-run")
     steps = [*preprocessor.steps, *postprocessor.steps]
     assert not any(isinstance(step, (NormalizerProcessorStep, UnnormalizerProcessorStep)) for step in steps)
+
+
+def test_resolve_cosmos3_checkpoint_path_fallback(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    fake_home = tmp_path / "home"
+    fake_home.mkdir()
+    monkeypatch.setenv("HOME", str(fake_home))
+    monkeypatch.delenv("HF_HOME", raising=False)
+    monkeypatch.delenv("HF_HUB_CACHE", raising=False)
+
+    missing = Path("/nonexistent/abakus/cosmos3-edge")
+    assert _resolve_cosmos3_checkpoint_path(missing) == missing
+
+    hf_home = tmp_path / "hf_home"
+    hf_snap = hf_home / "hub" / "models--nvidia--Cosmos3-Edge" / "snapshots" / "rev123"
+    (hf_snap / "transformer").mkdir(parents=True)
+    monkeypatch.setenv("HF_HOME", str(hf_home))
+    assert _resolve_cosmos3_checkpoint_path(missing) == hf_snap
+    assert _resolve_cosmos3_checkpoint_path(str(missing)) == hf_snap
+
+    local_cache = fake_home / ".cache" / "video-vam" / "cosmos3-edge"
+    (local_cache / "transformer").mkdir(parents=True)
+    assert _resolve_cosmos3_checkpoint_path(missing) == local_cache
+
+    explicit = tmp_path / "explicit-cosmos3"
+    explicit.mkdir()
+    assert _resolve_cosmos3_checkpoint_path(explicit) == explicit
+    assert _resolve_cosmos3_checkpoint_path(str(explicit)) == explicit

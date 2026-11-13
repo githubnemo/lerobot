@@ -260,3 +260,35 @@ def test_checkpoint_identity_euler_steps_optional(tmp_path) -> None:
     args.euler_steps = 6
     identity_override = server.checkpoint_identity(args)
     assert identity_override["config"]["euler_steps"] == 6
+
+
+def test_frame_accepts_uint8_tensors_zero_copy_and_rejects_bad_shapes() -> None:
+    server = _load("video_vam_rpc_server", "scripts/video_vam/rpc_server.py")
+    single = torch.randint(0, 255, (480, 640, 3), dtype=torch.uint8)
+    history = torch.randint(0, 255, (5, 480, 640, 3), dtype=torch.uint8)
+    assert server._frame(single) is single
+    assert server._frame(history) is history
+
+    for bad_shape in ((480, 640), (2, 480, 640, 3), (1, 5, 480, 640, 3)):
+        with pytest.raises(ValueError, match="invalid uint8 tensor frame shape"):
+            server._frame(torch.zeros(bad_shape, dtype=torch.uint8))
+
+
+@pytest.mark.parametrize("policy", ["smolvla", "video_vam"])
+def test_rpc_application_predict_accepts_raw_uint8_tensor(policy: str) -> None:
+    server = _load("video_vam_rpc_server", "scripts/video_vam/rpc_server.py")
+    app, calls = _fake_app(server, policy)
+    frames = torch.zeros((480, 640, 3) if policy == "smolvla" else (5, 480, 640, 3), dtype=torch.uint8)
+    payload = {
+        "identity": app.identity,
+        "instance_id": "test",
+        "request_id": "r-raw",
+        "state": [0.0] * 6,
+        "images_front_u8_raw": frames,
+        "frame_index": 12,
+        "original_space": app.original_space,
+    }
+    result = app.predict(payload)
+    assert result["request_id"] == "r-raw"
+    assert len(calls) == 1
+    assert result["action_chunk"][0] == ([10.0] * 6 if policy == "smolvla" else [1.0] * 6)
