@@ -16,6 +16,6 @@
 --dataset.eval_split=0.0
 --dataset.video_backend=torchcodec
 --eval_steps=0
---wandb.enable=false
+--trackio.enable=false
 --output_dir=outputs/train/${RUN_TAG}
 --job_name=${RUN_TAG}

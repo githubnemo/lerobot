@@ -12,7 +12,9 @@ import math
 import os
 import platform
 import random
+import re
 import sys
+from glob import glob
 import tempfile
 import time
 from collections.abc import Iterable, Mapping, Sequence
@@ -26,8 +28,17 @@ import torch
 from safetensors.torch import load_file, save_file
 from torch.utils.data import DataLoader
 
-from lerobot.common.wandb_utils import get_wandb_run_id_from_filesystem
 from lerobot.datasets import LeRobotDataset
+
+
+def _get_wandb_run_id_from_filesystem(log_dir: Path) -> str:
+    paths = glob(str(log_dir / "wandb/latest-run/run-*"))
+    if len(paths) != 1:
+        raise RuntimeError("Couldn't get the previous WandB run ID for run resumption.")
+    match = re.search(r"run-([^\.]+).wandb", paths[0].split("/")[-1])
+    if match is None:
+        raise RuntimeError("Couldn't get the previous WandB run ID for run resumption.")
+    return match.group(1)
 from lerobot.policies.vam.context_transform import (
     CONTEXT_TRANSFORMS,
     apply_context_transform,
@@ -154,7 +165,7 @@ class SafeWandbLogger:
                     run_id = run_id_path.read_text().strip() or None
                 if run_id is None:
                     try:
-                        run_id = get_wandb_run_id_from_filesystem(output_dir)
+                        run_id = _get_wandb_run_id_from_filesystem(output_dir)
                     except Exception:
                         run_id = None
             kwargs: dict[str, Any] = {

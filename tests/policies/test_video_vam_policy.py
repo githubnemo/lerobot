@@ -19,7 +19,7 @@ from lerobot.policies.vam.modeling_video_vam import (
     restore_uint8_history,
 )
 from lerobot.processor import NormalizerProcessorStep, UnnormalizerProcessorStep
-from lerobot.rollout.inference import RTCInferenceConfig, SyncInferenceConfig
+from lerobot.inference import RTCInferenceConfig, SyncInferenceConfig
 
 
 class _FakeExtractor:

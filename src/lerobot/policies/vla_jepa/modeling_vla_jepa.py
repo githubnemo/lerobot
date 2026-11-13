@@ -20,17 +20,18 @@ from typing import TYPE_CHECKING, Any
 
 import torch
 import torch.nn.functional as F  # noqa: N812
-from safetensors.torch import load_file
 from torch import Tensor, nn
 
 from lerobot.configs import FeatureType
+from lerobot.policies.checkpoint import SafetensorsCheckpoint
 from lerobot.policies.pretrained import PreTrainedPolicy, T
 from lerobot.policies.utils import log_model_loading_keys, populate_queues
 from lerobot.utils.constants import ACTION, OBS_STATE
 from lerobot.utils.device_utils import get_autocast_context, resolve_safetensors_device
+from lerobot.utils.feature_spec import FeatureSpec
 from lerobot.utils.import_utils import _transformers_available, require_package
 
-from ..chunk import ChunkPolicySpec, FeatureSpec
+from ..chunk import ChunkPolicySpec
 
 if TYPE_CHECKING or _transformers_available:
     from transformers import AutoModel, AutoVideoProcessor
@@ -113,6 +114,7 @@ class VLAJEPAModel(nn.Module):
                 mlp_ratio=config.predictor_mlp_ratio,
                 num_action_tokens_per_step=config.num_action_tokens_per_timestep,
                 dropout=config.predictor_dropout,
+                rope_legacy=config.world_model_rope_legacy,
             )
         else:
             self.video_encoder = None
@@ -358,6 +360,8 @@ class VLAJEPAModel(nn.Module):
         images: list[list[Tensor]],
         instructions: list[str],
         state: Tensor | None = None,
+        *,
+        noise: Tensor | None = None,
     ) -> Tensor:
         """Predict an action chunk. `images` is per-sample, per-view float [0,1] [C, H, W] tensors."""
         if self.config.resize_images_to is not None:
@@ -369,7 +373,7 @@ class VLAJEPAModel(nn.Module):
 
         embodied_action_tokens, _ = self._encode_qwen(images, instructions, need_action_tokens=False)
         return self.action_model.predict_action(
-            embodied_action_tokens.float(), state.float() if state is not None else None
+            embodied_action_tokens.float(), state.float() if state is not None else None, noise=noise
         )
 
 
@@ -537,35 +541,43 @@ class VLAJEPAPolicy(PreTrainedPolicy):
         return self.model.parameters()
 
     @torch.no_grad()
-    def predict_action_chunk(self, batch: dict[str, Tensor], noise: Tensor | None = None) -> Tensor:
-        """LeRobot inference: convert → native predict → return as Tensor."""
+    def predict_action_chunk(self, batch: dict[str, Tensor], *, noise: Tensor | None = None) -> Tensor:
+        """LeRobot inference: convert → native predict → return as Tensor.
+
+        `noise` is the starting sample of the flow, shaped `(batch_size, chunk_size, action_dim)`.
+        When it is None, it is drawn with `torch.randn`.
+        """
         self.eval()
         self._queues = populate_queues(self._queues, batch, exclude_keys=[ACTION])
 
         inputs = self._prepare_model_inputs(batch, training=False)
-        actions = self.model.predict_action(inputs["images"], inputs["instructions"], inputs.get("state"))
+        actions = self.model.predict_action(
+            inputs["images"], inputs["instructions"], inputs.get("state"), noise=noise
+        )
         return actions.to(device=self.config.device, dtype=torch.float32)
 
     @torch.no_grad()
-    def select_action(self, batch: dict[str, Tensor], noise: Tensor | None = None) -> Tensor:
+    def select_action(self, batch: dict[str, Tensor], *, noise: Tensor | None = None) -> Tensor:
         """LeRobot select_action with action queue caching."""
         self.eval()
         self._queues = populate_queues(self._queues, batch, exclude_keys=[ACTION])
         if len(self._queues[ACTION]) == 0:
-            actions = self.predict_action_chunk(batch)
+            actions = self.predict_action_chunk(batch, noise=noise)
             self._queues[ACTION].extend(actions.transpose(0, 1)[: self.config.n_action_steps])
         return self._queues[ACTION].popleft()
 
     @classmethod
-    def _load_as_safetensor(cls, model: T, model_file: str, map_location: str, strict: bool) -> T:
+    def _load_checkpoint(
+        cls, model: T, checkpoint: SafetensorsCheckpoint, map_location: str, strict: bool
+    ) -> T:
         reinit_prefixes = model.config.reinit_modules
         if not reinit_prefixes:
-            return super()._load_as_safetensor(model, model_file, map_location, strict)
+            return super()._load_checkpoint(model, checkpoint, map_location, strict)
 
         # `resolve_safetensors_device` is what keeps every rank from materializing the whole
         # checkpoint on GPU 0: safetensors maps the bare string "cuda" to cuda:0 regardless of
         # torch.cuda.current_device(), and `config.device` is exactly that bare string.
-        state_dict = load_file(model_file, device=resolve_safetensors_device(map_location))
+        state_dict = checkpoint.load_state_dict(device=resolve_safetensors_device(map_location))
         current = model.state_dict()
 
         reinitialized: list[str] = []

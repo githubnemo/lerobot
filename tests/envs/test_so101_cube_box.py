@@ -16,7 +16,7 @@ import numpy as np
 
 from lerobot.envs.factory import make_env, make_env_config
 from lerobot.envs.so101_cube_box import lerobot_to_mujoco_qpos, mujoco_to_lerobot_qpos
-from lerobot.envs.utils import close_envs, preprocess_observation
+from lerobot.envs.utils import close_envs, prepare_canonical_observation, preprocess_observation
 
 
 def test_so101_joint_conversion_roundtrip():
@@ -30,9 +30,13 @@ def test_so101_cube_box_env_creation_and_step():
     cfg = make_env_config("so101_cube_box", episode_length=50)
     envs = make_env(cfg, n_envs=1)
     try:
-        vec_env = envs["so101_cube_box"][0]
+        vec_env = next(iter(envs.values()))[0]
         obs, info = vec_env.reset(seed=0)
-        proc = preprocess_observation(obs)
+        proc = (
+            prepare_canonical_observation(obs)
+            if vec_env.metadata.get("canonical_observations", False)
+            else preprocess_observation(obs)
+        )
         assert "observation.images.front" in proc
         assert "observation.state" in proc
         assert proc["observation.images.front"].shape == (1, 3, 480, 640)
@@ -52,12 +56,13 @@ def test_so101_cube_box_sparse_reward_mode():
     cfg = make_env_config("so101_cube_box", episode_length=50, reward_mode="sparse")
     envs = make_env(cfg, n_envs=1)
     try:
-        vec_env = envs["so101_cube_box"][0]
+        vec_env = next(iter(envs.values()))[0]
         vec_env.reset(seed=0)
         action = np.array([[0.0, -20.0, 30.0, 50.0, -90.0, 20.0]], dtype=np.float32)
         _, rew, term, _, info = vec_env.step(action)
         assert not term[0]
         assert rew[0] == 0.0
-        assert info["dense_reward"][0] > 0.0
+        dense_reward = info["metrics"]["dense_reward"] if "metrics" in info else info["dense_reward"]
+        assert dense_reward[0] > 0.0
     finally:
         close_envs(envs)

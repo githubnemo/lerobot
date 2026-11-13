@@ -73,7 +73,7 @@ printf "[%s] Output directory: %s\n" "$(date --iso-8601=seconds)" "$OUTPUT_DIR"
     --save_checkpoint=true \
     --save_freq=0 \
     --output_dir="$OUTPUT_DIR" \
-    --wandb.enable=false
+    --trackio.enable=false
 
 date --iso-8601=seconds > "$RUN_DIR/COMPLETE"
 printf "[%s] SMOLVLA SCALE-100 TRAINING COMPLETED SUCCESSFULLY!\n" "$(date --iso-8601=seconds)"

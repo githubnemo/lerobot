@@ -23,16 +23,18 @@ import torch
 from torch import Tensor, nn
 
 from lerobot.configs import FeatureType
+from lerobot.policies.checkpoint import SafetensorsCheckpoint
 from lerobot.policies.pretrained import PreTrainedPolicy
 from lerobot.policies.utils import populate_queues
 from lerobot.utils import ACTION, OBS_STATE
+from lerobot.utils.feature_spec import FeatureSpec
 from lerobot.utils.import_utils import (
     _diffusers_available,
     _transformers_available,
     require_package,
 )
 
-from ..chunk import ChunkPolicySpec, FeatureSpec
+from ..chunk import ChunkPolicySpec
 from .configuration_lawam import LaWAMConfig
 
 _lawam_deps_available = _transformers_available and _diffusers_available
@@ -206,13 +208,13 @@ class LaWAMPolicy(PreTrainedPolicy):
         self.reset()
 
     @classmethod
-    def _load_as_safetensor(
-        cls, model: LaWAMPolicy, model_file: str, map_location: str, strict: bool
+    def _load_checkpoint(
+        cls, model: LaWAMPolicy, checkpoint: SafetensorsCheckpoint, map_location: str, strict: bool
     ) -> LaWAMPolicy:
         """Stage LaWAM checkpoint loading on CPU to avoid duplicate accelerator weights."""
         del map_location
         model.to("cpu")
-        return super()._load_as_safetensor(model, model_file, "cpu", strict)
+        return super()._load_checkpoint(model, checkpoint, "cpu", strict)
 
     def reset(self) -> None:
         """Clear the queued action chunk used by step-wise inference."""
@@ -290,11 +292,14 @@ class LaWAMPolicy(PreTrainedPolicy):
         return loss, logs
 
     @torch.no_grad()
-    def predict_action_chunk(self, batch: dict[str, Tensor], noise: Tensor | None = None) -> Tensor:
-        """Predict a normalized action chunk for each observation in the batch."""
-        del noise
+    def predict_action_chunk(self, batch: dict[str, Tensor], *, noise: Tensor | None = None) -> Tensor:
+        """Predict a normalized action chunk for each observation in the batch.
+
+        `noise` is the starting sample of the flow, shaped `(batch_size, chunk_size, flow_action_dim)`.
+        When it is None, it is drawn with `torch.randn`.
+        """
         self.eval()
-        output = self.model.predict_action(batch)
+        output = self.model.predict_action(batch, noise=noise)
         actions = output.get("normalized_actions") if isinstance(output, dict) else output
         if actions is None:
             raise KeyError("LaWAM inference output is missing normalized actions.")
@@ -313,12 +318,11 @@ class LaWAMPolicy(PreTrainedPolicy):
         return actions_tensor[:, : self.config.action_horizon]
 
     @torch.no_grad()
-    def select_action(self, batch: dict[str, Tensor], noise: Tensor | None = None) -> Tensor:
+    def select_action(self, batch: dict[str, Tensor], *, noise: Tensor | None = None) -> Tensor:
         """Return the next action, refilling the action queue when necessary."""
-        del noise
         self.eval()
         self._queues = populate_queues(self._queues, batch, exclude_keys=[ACTION])
         if len(self._queues[ACTION]) == 0:
-            actions = self.predict_action_chunk(batch)
+            actions = self.predict_action_chunk(batch, noise=noise)
             self._queues[ACTION].extend(actions.transpose(0, 1)[: self.config.n_action_steps])
         return self._queues[ACTION].popleft()

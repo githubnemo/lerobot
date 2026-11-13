@@ -196,6 +196,10 @@ class SO101CubeBoxEnv(gym.Env):
             "is_lifted": is_lifted,
             "dense_reward": dense_reward,
             "sparse_reward": 1.0 if is_success else 0.0,
+            "metrics": {
+                "dense_reward": float(dense_reward),
+                "sparse_reward": 1.0 if is_success else 0.0,
+            },
         }
         return reward, is_success, info
 
