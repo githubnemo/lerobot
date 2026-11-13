@@ -64,7 +64,7 @@ pre-commit run --all-files                           # Lint + format (ruff, typo
 
 Parent-model tokens should be used primarily for judgment, architecture, and review.
 
-- **Subagent Model**: Always use **Gemini 3.8 Flash** as the subagent model.
+- **Subagent Model**: Always use **Gemini 4 Hydrogen Priority** (`Regulaido Gateway/gemini-4-hydrogen-priority`) as the subagent model.
 - **Exploration (Parallel)**: Delegate broad codebase exploration to one or more parallel explore subagents. Provide precise briefs requesting relevant paths, symbols, data flows, and constraints.
 - **Design & Architecture**: Decide the solution at the orchestrator/parent level. Define affected files, interfaces, behavior, and invariants.
 - **Implementation**: Delegate multi-file or substantial edits with an explicit implementation specification. Review the resulting diff and resume the same subagent for corrections.
@@ -98,10 +98,18 @@ If user prompt ends with:
 
 ---
 
-## Git Hygiene
+## Git Hygiene & Multi-Host Workflow (`abakus` / `sahni`)
 
 - **Branches**: New branch names use `feat-ABC` or `fix-ABC` (avoid slashes if possible).
 - **Commits**: Never amend commits; create follow-up commits. Do not commit or push unless explicitly requested.
+- **Hosts & Remotes**:
+  - **`abakus`** (`/home/anton/lerobot-video-vam`, `.venv`, RTX 4090 24 GB): primary GPU training & RPC inference host; holds push access to `origin` (`git@github.com:githubnemo/lerobot.git`). When pushing from Mac, push to `abakus` and fast-forward/push `origin` from `abakus`.
+  - **`sahni`** (`~/code/hf/lerobot/githubnemo`, `/home/nemo/envs/lerobot`, RTX 3050 8 GB): physical SO-101 robot (`shabby` on `/dev/ttyACM0`, wrist cam `/dev/video0`). Always check `ps -ef | grep -E "run_mac_vam_rpc|lerobot-rollout"` before modifying git state or touching hardware on `sahni`.
+  - **Git LFS `.stl` quirk**: 15 `src/lerobot/envs/so101_assets/assets/*.stl` files were historically committed as raw blobs under `.gitattributes` `filter=lfs`. If branch sync on `sahni` marks them modified (or inside `firejail` where `git-lfs` and `~/.ssh` are unavailable), clear them with `git -c filter.lfs.smudge= -c filter.lfs.process= -c filter.lfs.clean= -c filter.lfs.required=false checkout -- src/lerobot/envs/so101_assets/assets/`.
+- **Physical Eval Defaults (`run_mac_vam_rpc.py` / `eval_cosmos3_best.sh`)**:
+  - Pass `--no-rpc` to run inference directly in-process on the local GPU without SSH tunnels or `rpc_server.py` (works inside `firejail` too).
+  - For 30 Hz `Orellius/so101_sort_cubes_no_top` policies, always run with `--camera-fps 30 --fps 30` and an in-distribution start pose (`--home-pose -0.3 -86.7 88.2 71.1 -53.4 17.7`).
+  - Keep checkpoint configs portable across `/home/anton` and `/home/nemo` (`_resolve_cosmos3_checkpoint_path` checks `~/.cache/video-vam/cosmos3-edge`, `$HF_HOME/hub`, `~/.cache/huggingface/hub`, and `~/.cache/pysandbox-lerobot/huggingface/hub`).
 
 ---
 
