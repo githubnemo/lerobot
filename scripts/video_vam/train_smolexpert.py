@@ -731,12 +731,14 @@ class OnlineVideoDataset(torch.utils.data.Dataset[OnlineVideoItem]):
         episodes: Sequence[int],
         stride: int = 1,
         contract: Any = CUBE_OUT_OF_BOX_CONTRACT,
+        ram_headroom_gb: int = 26,
     ) -> None:
         self.repo_id = repo_id
         self.root = Path(root).expanduser().resolve() if root is not None else None
         self.episodes = tuple(sorted(episodes))
         self.stride = stride
         self.contract = contract
+        self.ram_headroom_gb = ram_headroom_gb
         self.manifest_path = Path(f"online://{repo_id}?stride={stride}&episodes={len(episodes)}")
         revision = getattr(contract, "revision", None) if contract.repo_id == repo_id else None
         self.payload: dict[str, Any] = {
@@ -781,6 +783,8 @@ class OnlineVideoDataset(torch.utils.data.Dataset[OnlineVideoItem]):
         self._ram_paddings: list[Tensor] = []
         self._ep_video_info: dict[int, tuple[Path, float, list[float]]] = {}
         self._cam_delta_indices: list[int] = [-4, -3, -2, -1, 0]
+        self._tolerance_s: float = 1e-4
+        self._video_backend: str | None = None
         self._maybe_preload_to_ram()
 
     @staticmethod
@@ -838,6 +842,8 @@ class OnlineVideoDataset(torch.utils.data.Dataset[OnlineVideoItem]):
 
         t0 = time.perf_counter()
         reader = self.lerobot_ds._ensure_reader()
+        self._tolerance_s = reader._tolerance_s
+        self._video_backend = reader._video_backend
         hf_ds = reader.hf_dataset if reader.hf_dataset is not None else reader.load_and_activate()
         vid_key = self.contract.camera_key
         if reader.delta_indices is not None and vid_key in reader.delta_indices:
@@ -875,7 +881,7 @@ class OnlineVideoDataset(torch.utils.data.Dataset[OnlineVideoItem]):
         frame_bytes = cam_h * cam_w * cam_c
         required_bytes = total_frames * frame_bytes
         avail_ram_bytes = self._get_available_ram_bytes()
-        ram_headroom_bytes = 26 * (1024**3)
+        ram_headroom_bytes = self.ram_headroom_gb * (1024**3)
         usable_ram_bytes = max(0, avail_ram_bytes - ram_headroom_bytes)
 
         usable_vram_bytes = 0
@@ -982,12 +988,11 @@ class OnlineVideoDataset(torch.utils.data.Dataset[OnlineVideoItem]):
             ep_len = len(ep_ts)
             win = [max(0, min(ep_len - 1, frame + d)) for d in self._cam_delta_indices]
             win_ts = shift_timestamps([ep_ts[w] for w in win], from_ts)
-            reader = self.lerobot_ds._ensure_reader()
             camera = decode_video_frames(
                 video_path,
                 win_ts,
-                reader._tolerance_s,
-                reader._video_backend,
+                self._tolerance_s,
+                self._video_backend,
                 return_uint8=True,
             ).squeeze(0)
             return OnlineVideoItem(
@@ -2692,6 +2697,7 @@ def main(argv: list[str] | None = None) -> int:
             episodes=train_eps,
             stride=args.train_stride,
             contract=dataset_contract,
+            ram_headroom_gb=20 if args.augment else 26,
         )
         print(
             f"Loaded online video training dataset with {len(train_dataset)} windows (stride {args.train_stride}, augment={args.augment})"
@@ -3211,8 +3217,30 @@ def main(argv: list[str] | None = None) -> int:
 
     from concurrent.futures import Future, ThreadPoolExecutor
 
+    decode_pool = ThreadPoolExecutor(max_workers=8) if (is_online and not args.dry_run) else None
+
     def _fetch_batch(batch_indices: list[int]) -> list[Any]:
-        return [train_dataset[i] for i in batch_indices]
+        if decode_pool is None:
+            return [train_dataset[i] for i in batch_indices]
+        ep_frames = getattr(train_dataset, "_ram_ep_frames", None)
+        idx_map = getattr(train_dataset, "index_map", None)
+        if ep_frames is not None and idx_map is not None:
+            out: list[Any] = [None] * len(batch_indices)
+            miss_pos: list[int] = []
+            miss_idx: list[int] = []
+            for pos, b_idx in enumerate(batch_indices):
+                if idx_map[b_idx][0] in ep_frames:
+                    out[pos] = train_dataset[b_idx]
+                else:
+                    miss_pos.append(pos)
+                    miss_idx.append(b_idx)
+            if miss_idx:
+                for pos, item in zip(
+                    miss_pos, decode_pool.map(train_dataset.__getitem__, miss_idx), strict=True
+                ):
+                    out[pos] = item
+            return out
+        return list(decode_pool.map(train_dataset.__getitem__, batch_indices))
 
     def _next_batch_indices() -> list[int]:
         nonlocal data_idx
@@ -3542,6 +3570,10 @@ def main(argv: list[str] | None = None) -> int:
                 break
 
     total_time = time.time() - start_time
+    if prefetch_pool is not None:
+        prefetch_pool.shutdown(wait=False, cancel_futures=True)
+    if decode_pool is not None:
+        decode_pool.shutdown(wait=False, cancel_futures=True)
 
     # Save live final weights before loading best for final evaluation.
     save_weights_artifact(args.output_dir, "last", decoder.state_dict(), opt_step, run_manifest)

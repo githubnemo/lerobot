@@ -1,4 +1,4 @@
-# Pure frozen base Cosmos 3 Edge (no SO-101 LoRA) + fresh SmolExpert for 1 epoch (46,527 windows / BS 16 = 2,908 steps).
+# Pure frozen base Cosmos 3 Edge (no SO-101 LoRA) + fresh SmolExpert with physics augmentation for 1 epoch (46,527 windows / BS 16 = 2,908 steps).
 #! include: _smolexpert_online_base
 #! include: _sort_cubes
 --online-backbone cosmos3_edge
@@ -7,7 +7,9 @@
 --backbone-prompt 'Grab the purple cube and put it into the cardboard box, ignore the other objects'
 --dataset-revision a7c156de0e84a81e19457e6d783e4316e9f901e1
 --normalizer-path outputs/train/sort-cubes-cosmos3-edge-optimized-bs64/normalizer.safetensors
---no-augment
+--augment
+--aug-strategy physics
+--no-spatial-crop
 --batch-size 16
 --grad-accum-steps 1
 --lr 3e-4
