@@ -4,8 +4,20 @@
 
 """OpenGalaxea G0.5 policy integration."""
 
+from typing import TYPE_CHECKING
+
 from .configuration_g05 import G05Config
-from .modeling_g05 import G05Policy
 from .processor_g05 import make_g05_pre_post_processors
 
+if TYPE_CHECKING:
+    from .modeling_g05 import G05Policy
+
 __all__ = ["G05Config", "G05Policy", "make_g05_pre_post_processors"]
+
+
+def __getattr__(name: str):
+    if name == "G05Policy":
+        from .modeling_g05 import G05Policy
+
+        return G05Policy
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
