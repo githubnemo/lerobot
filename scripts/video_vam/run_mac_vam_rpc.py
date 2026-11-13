@@ -987,9 +987,17 @@ def _run_single_episode(
                     deadline = min(deadline, time.monotonic() + 1.0)
                 future = None
                 if phase == "warmup":
+                    # Clear frames buffered across in-process torch.compile GIL stalls so the next
+                    # snapshot refills a fresh, evenly-spaced observation history.
+                    client.frames.clear()
+                    client.frame_times.clear()
+                    previous_observation = None
                     # Warm up RTC guided branch as well before starting episode execution.
                     phase = "warmup_rtc" if rtc else "initial"
                 elif phase == "warmup_rtc":
+                    client.frames.clear()
+                    client.frame_times.clear()
+                    previous_observation = None
                     phase = "initial"
                 else:
                     actions = torch.clamp(actions, min=lower, max=upper)

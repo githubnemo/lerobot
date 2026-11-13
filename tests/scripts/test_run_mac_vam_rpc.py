@@ -984,3 +984,48 @@ def test_configure_sandbox_triton_env_noop_when_unlocked(monkeypatch, tmp_path):
     assert "TRITON_LIBCUDA_PATH" not in os.environ
     assert "TRITON_CACHE_DIR" not in os.environ
     assert "TORCHINDUCTOR_CACHE_DIR" not in os.environ
+
+
+@pytest.mark.parametrize("inference_type", ["sync", "rtc"])
+def test_warmup_gil_stall_refreshes_30hz_observation_history(
+    monkeypatch, launcher, clock, inference_type
+):
+    robot, executor, client, options = rollout(
+        monkeypatch,
+        launcher,
+        clock,
+        policy="video_vam",
+        delays=(0.05,) * 8,
+        fps=30,
+        camera_fps=30,
+        duration=1.0,
+        inference_type=inference_type,
+    )
+    client.fps = 30
+    client.health = health("video_vam", horizon=30)
+
+    def predict_30(snapshot):
+        chunk = [[5.0, 5.0, 5.0, 5.0, 5.0, 50.0]] * 30
+        return {"original_chunk": chunk, "action_chunk": chunk}
+
+    monkeypatch.setattr(client, "request", predict_30)
+    orig_submit = executor.submit
+    stalled_phases: list[int] = []
+
+    def compile_stalling_submit(function, snapshot):
+        fut = orig_submit(function, snapshot)
+        warmup_count = 2 if inference_type == "rtc" else 1
+        if len(stalled_phases) < warmup_count:
+            stalled_phases.append(len(stalled_phases))
+            # Simulate a 6.2s in-process torch.compile GIL freeze starving the 30 Hz camera loop.
+            clock.now += 6.2
+        return fut
+
+    monkeypatch.setattr(executor, "submit", compile_stalling_submit)
+    launcher._run_rollout(options, client)
+
+    expected_warmups = 2 if inference_type == "rtc" else 1
+    assert len(executor.snapshots) >= expected_warmups + 1
+    initial_snap = executor.snapshots[expected_warmups]
+    assert initial_snap["frame_index"] >= expected_warmups * 5 + 4
+    assert robot.disconnected and executor.shutdown_called
