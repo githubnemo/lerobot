@@ -1,7 +1,25 @@
 # Video-VAM status
 
-**Last updated:** 2026-10-31. Supersedes `archive/video_vam_roadmap.md`, `archive/video_vam_technical_report.md`, `archive/EXPERIMENTS_OVERVIEW.md` and `archive/video_vam_execution_plan.md`.
+**Last updated:** 2026-11-14. Supersedes `archive/video_vam_roadmap.md`, `archive/video_vam_technical_report.md`, `archive/EXPERIMENTS_OVERVIEW.md` and `archive/video_vam_execution_plan.md`.
 Numbers here are summaries; the [leaderboard](./video_vam_leaderboard.md) is authoritative.
+
+## 0b. Current Training & Rollout Status (2026-11-14)
+
+- **Active `abakus` training queue (`tmux` session `vam_queue`)** on `Orellius/so101_sort_cubes_no_top@a7c156de` (eps `0..67` train / `68..76` val, `30 Hz`, `physics` aug, `--select-metric val_flow_loss`, `--val-every 500 --patience 5` = `2,500`-step early stopping):
+  1. **`c3_base_sort_cubes_10ep` (running now)**: Frozen `Cosmos3-Edge` (L20/28, `600×2048`), `BS=16`, `grad_accum=1`, `lr=3e-4`, max `29,080` steps (`10` epochs). Progressed cleanly past step `1,840/29,080` (~`12.8 GiB` VRAM); evals so far: `@500` `val_flow_loss=0.1217` (`RMSE 19.41`, `H1 11.59°`, `F5 12.37°`) → `@1000` `0.1040` (`18.64`, `9.32°`, `10.11°`) → `@1500` `0.0871` (`17.71`, `7.83°`, `9.55°`).
+  2. **`c3_nano_l18_bs8_10ep` (queued next)**: Frozen `Cosmos3-Nano` early-exit (`L18/36`, `4096-dim`), `BS=8`, `grad_accum=1`, `lr=1.5e-4`, max `58,160` steps (`12.83 GB` peak VRAM verified on RTX 4090).
+  3. **`c3_nano_l24_bs8_10ep` (queued third)**: Frozen `Cosmos3-Nano` early-exit (`L24/36`, `4096-dim`), `BS=8`, `grad_accum=1`, `lr=1.5e-4`, max `58,160` steps (`14.44 GB` peak VRAM verified on RTX 4090).
+- **Completed recent runs on `abakus` (`2026-11-13` – `2026-11-14`)**:
+  - **`c3_bs64_joint_lora_warmstart_fixed`** (best @ step `400/589`, wall-clock cap `2400s`): **`Full-30 14.764`**, Arm `15.725°`, Grip `8.453`, **`H1 4.230°`**, **`First-5 5.712°`** (`5.794°` pooled), `val_flow_loss=0.0746` (@ `589`).
+  - **`c3_base_sort_cubes_1ep`** (best @ step `2,908/2,908`): `Full-30 15.642`, Arm `16.743°`, Grip `8.143`, `H1 5.391°`, `First-5 7.141°` (`7.232°` pooled), `val_flow_loss=0.0588`.
+  - **`c3_base_sort_cubes_cont10ep`**: warm-starting from the 1-ep checkpoint without optimizer state at `lr=1.5e-4` perturbed weights and early-stopped at step `2,000` (best step `0` at `0.0588`, regressed to `0.0667` / `RMSE 15.813` / `F5 7.528°`), motivating the fresh `c3_base_sort_cubes_10ep` run.
+  - **`c3_nano_sort_cubes_2ep`** (`BS=1`, `L18/36`): early-stopped at step `18,000` due to `BS=1` update noise (best `val_flow_loss=0.0784` @ step `10,000`: `RMSE 17.886`, `H1 7.758°`, `F5 9.719°`; at step `18,000`: `val_flow_loss=0.0789`, `RMSE 17.445`, `H1 6.113°`, `F5 7.905°`), motivating the `BS=8` `L18`/`L24` queue above.
+- **Physical SO-101 (`sahni`) rollout findings (`--debug-dir`, `da0f26ac`)**:
+  - `c3_base_sort_cubes_1ep` was undertrained (produced `-10°` `elbow_flex` jump at `t=0` even on held-out ep `68`).
+  - `c3_bs64_joint_lora_warmstart_fixed` grasped the cube on `sahni`, but running with `--euler-steps 3` caps RTC `max_guidance_weight` at `0.90` (`smol_expert.py:975`), causing a 2-chunk ping-pong oscillation (`-2° <-> -65°`) with `blend_len=6` after RPC latency spikes. Next physical eval should run **without `--euler-steps 3`** (default `10` Euler steps, `max_guidance_weight=2.0`), and use `--no-rpc` on `sahni` while `vam_queue` uses `abakus`.
+- **Open infra / eval observation**:
+  - `val_flow_loss` currently samples random flow timesteps per validation pass, adding variance to early stopping (`--select-metric val_flow_loss`); making validation flow timesteps deterministic/seeded is a planned cleanup.
+  - `nvidia/Cosmos3-Nano` (`30 GB`) is downloaded on `abakus` (`/home/anton/.cache/video-vam/cosmos3-nano`) with early-exit support (`0be33847`) and `transformers==5.5.4` lazy-import fixes (`55b7ea5c`, `bd5757d3`).
 
 ## 0a. Todo List with Nemo (2026-10-31)
 
@@ -126,6 +144,7 @@ Deferred research bets (from the old roadmap): compact multi-frame student backb
 | :------------------ | :------------- | :-------------------------- | :------------------------------------- | :-------------------------------- | :---------------------------------------------------------------------------- |
 | Cosmos-Predict2-2B  | 2.0B           | 28 / 2048                   | layer 20                               | 4,800 (T=16 pool2) or 2,400 (T=2) | VAE 8× spatial, 4× temporal; bidirectional DiT; ~1.2 s (T=16) / ~204 ms (T=2) |
 | Cosmos 3 Edge       | 3.37B measured | 28 / 2048, MoT (und/gen)    | layer 20, clean observed vision tokens | 600 (2×15×20)                     | Wan 2.2 VAE; ~80–92 ms                                                        |
+| Cosmos 3 Nano       | —              | 36 / 4096                   | layer 18 or 24 (early-exit)            | —                                 | Wan 2.2 VAE; `L18 BS=8` 12.83 GB, `L24 BS=8` 14.44 GB VRAM                    |
 | LTX-2.5 (distilled) | 22B            | 48 / 4096                   | block 34                               | 2,400 or 640                      | 32× spatial VAE; ~1.2 s with CPU offload                                      |
 | Cosmos-1.0 7B       | 7B             | 28 / 4096                   | layers 14+20                           | 64                                | EDM objective                                                                 |
 | Cosmos-1.0 14B      | 14.25B         | 36 / 5120                   | layers 18+30                           | pooled                            | FP8 + block streaming on 24 GB                                                |
