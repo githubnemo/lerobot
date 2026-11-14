@@ -1,0 +1,23 @@
+# Pure frozen base Cosmos 3 Edge (layer 20/28) + fresh SmolExpert with physics augmentation for up to 10 epochs (BS 16, grad_accum 1 = 29,080 steps), early-stopping on val_flow_loss after 2,500 steps without improvement.
+#! include: _smolexpert_online_base
+#! include: _sort_cubes
+--online-backbone cosmos3_edge
+--backbone-checkpoint /home/anton/.cache/video-vam/cosmos3-edge
+--backbone-layer 20
+--backbone-prompt 'Grab the purple cube and put it into the cardboard box, ignore the other objects'
+--dataset-revision a7c156de0e84a81e19457e6d783e4316e9f901e1
+--normalizer-path outputs/train/sort-cubes-cosmos3-edge-optimized-bs64/normalizer.safetensors
+--augment
+--aug-strategy physics
+--no-spatial-crop
+--batch-size 16
+--grad-accum-steps 1
+--lr 3e-4
+--warmup-steps 200
+--min-steps 0
+--max-steps 29080
+--val-every 500
+--patience 5
+--select-metric val_flow_loss
+--num-steps 3
+--no-wandb
