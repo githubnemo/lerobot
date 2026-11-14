@@ -1,0 +1,23 @@
+# Pure frozen base Cosmos 3 Nano (early-exit layer 18/36, 4096-dim) + SmolExpert with physics aug for 2 epochs (BS 1, no grad accum = 93,054 steps).
+#! include: _smolexpert_online_base
+#! include: _sort_cubes
+--online-backbone cosmos3_nano
+--backbone-checkpoint /home/anton/.cache/video-vam/cosmos3-nano
+--backbone-layer 18
+--backbone-prompt 'Grab the purple cube and put it into the cardboard box, ignore the other objects'
+--dataset-revision a7c156de0e84a81e19457e6d783e4316e9f901e1
+--normalizer-path outputs/train/sort-cubes-cosmos3-edge-optimized-bs64/normalizer.safetensors
+--augment
+--aug-strategy physics
+--no-spatial-crop
+--batch-size 1
+--grad-accum-steps 1
+--lr 5e-5
+--warmup-steps 500
+--min-steps 0
+--max-steps 93054
+--val-every 2000
+--patience 4
+--select-metric val_flow_loss
+--num-steps 3
+--no-wandb

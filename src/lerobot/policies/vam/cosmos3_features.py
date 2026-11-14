@@ -740,6 +740,12 @@ class Cosmos3ExtractorConfig(BaseExtractorConfig):
 
     def __post_init__(self) -> None:
         BaseExtractorConfig.__post_init__(self)
+        backbone_key = self.backbone_name.replace("-", "_").lower()
+        if backbone_key == "cosmos3_nano":
+            if self.hidden_dim == 2048:
+                self.hidden_dim = 4096
+            if self.num_layers == 28:
+                self.num_layers = 36
         for layer_idx in self.hidden_layers:
             if layer_idx < 1 or layer_idx > self.num_layers:
                 raise ValueError(f"hidden_layer {layer_idx} out of range [1, {self.num_layers}] for Cosmos 3")
@@ -809,13 +815,27 @@ class Cosmos3FeatureExtractor(BaseVAMExtractor):
 
         # 1. Initialize or assign Transformer (keep on CPU until unused blocks/heads are pruned)
         loaded_transformer_from_disk = False
+        is_nano = self.config.backbone_name.replace("-", "_").lower() == "cosmos3_nano"
         if config.checkpoint_path is not None and not Path(config.checkpoint_path).exists():
-            fallback_dir = Path.home() / ".cache/video-vam/cosmos3-edge"
+            fallback_dir = Path.home() / (
+                ".cache/video-vam/cosmos3-nano" if is_nano else ".cache/video-vam/cosmos3-edge"
+            )
             if not (fallback_dir / "transformer").is_dir():
                 from huggingface_hub import snapshot_download
 
                 fallback_dir.mkdir(parents=True, exist_ok=True)
-                snapshot_download("nvidia/Cosmos3-Edge", local_dir=str(fallback_dir))
+                snapshot_download(
+                    "nvidia/Cosmos3-Nano" if is_nano else "nvidia/Cosmos3-Edge",
+                    local_dir=str(fallback_dir),
+                    allow_patterns=[
+                        "transformer/*",
+                        "vae/*",
+                        "text_tokenizer/*",
+                        "scheduler/*",
+                        "*.json",
+                        "*.jinja",
+                    ],
+                )
             config.checkpoint_path = fallback_dir
             self.config.checkpoint_path = fallback_dir
         if transformer is not None:
@@ -840,6 +860,7 @@ class Cosmos3FeatureExtractor(BaseVAMExtractor):
         max_layer = max(self.config.hidden_layers)
         if loaded_transformer_from_disk and hasattr(self.transformer, "layers") and len(self.transformer.layers) > max_layer:
             self.transformer.layers = self.transformer.layers[:max_layer]
+            gc.collect()
 
         if config.lora_checkpoint is not None:
             from lerobot.policies.vam.cosmos3_lora import (
@@ -1267,8 +1288,9 @@ class Cosmos3FeatureExtractor(BaseVAMExtractor):
         return (t, math.ceil(h / p), math.ceil(w / p))
 
     def get_provenance(self) -> dict[str, Any]:
+        is_nano = self.config.backbone_name.replace("-", "_").lower() == "cosmos3_nano"
         prov: dict[str, Any] = {
-            "model_type": "Cosmos3-Edge",
+            "model_type": "Cosmos3-Nano" if is_nano else "Cosmos3-Edge",
             "hidden_layers": list(self.config.hidden_layers),
             "latent_patch_size": self.config.latent_patch_size,
             "fps": self.config.fps,
@@ -1281,8 +1303,11 @@ class Cosmos3FeatureExtractor(BaseVAMExtractor):
             chk = Path(self.config.checkpoint_path)
             prov["checkpoint_path"] = str(chk)
             chk_file = chk / "transformer" / "diffusion_pytorch_model.safetensors"
+            idx_file = chk / "transformer" / "diffusion_pytorch_model.safetensors.index.json"
             if chk_file.is_file():
                 prov["transformer_sha256"] = sha256_file(chk_file)
+            elif idx_file.is_file():
+                prov["transformer_index_sha256"] = sha256_file(idx_file)
         if self.config.lora_checkpoint:
             from lerobot.policies.vam.cosmos3_lora import cosmos3_adapter_weights_file
 

@@ -101,6 +101,7 @@ class VideoVAMConfig(PreTrainedConfig):
     cosmos_lora_rank: int | None = None
     cosmos_lora_alpha: float | None = None
     cosmos3_checkpoint: Path = Path("/home/anton/.cache/video-vam/cosmos3-edge")
+    cosmos3_layer: int | None = None
     cosmos3_lora_weights: Path | None = None
     cosmos3_lora_rank: int | None = None
     cosmos3_lora_alpha: float | None = None
@@ -161,8 +162,10 @@ class VideoVAMConfig(PreTrainedConfig):
             raise ValueError("jepa_planning_mode must be 'none', 'best_of_n', or 'mppi'")
         if self.jepa_num_candidates < 1:
             raise ValueError("jepa_num_candidates must be >= 1")
-        if self.backend not in {"cosmos", "cosmos3_edge", "ltx"}:
-            raise ValueError("backend must be 'cosmos' or 'ltx'")
+        if self.backend not in {"cosmos", "cosmos3_edge", "cosmos3_nano", "ltx"}:
+            raise ValueError("backend must be 'cosmos', 'cosmos3_edge', 'cosmos3_nano', or 'ltx'")
+        if self.cosmos3_layer is not None and self.cosmos3_layer < 1:
+            raise ValueError("cosmos3_layer must be a positive integer or None")
         if self.cosmos_state_t not in (2, 16):
             raise ValueError("cosmos_state_t must be 2 (observed-only) or 16")
         if self.action_euler_steps is not None and self.action_euler_steps < 1:

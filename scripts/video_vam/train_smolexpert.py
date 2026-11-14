@@ -267,7 +267,11 @@ SCALE100_V2_REVISION = "5d0325cc1412f4774223a0beb528958108814962"
 
 
 def is_cosmos3(backbone: str | None) -> bool:
-    return backbone is not None and backbone.replace("-", "_").lower() in {"cosmos3", "cosmos3_edge"}
+    return backbone is not None and backbone.replace("-", "_").lower() in {
+        "cosmos3",
+        "cosmos3_edge",
+        "cosmos3_nano",
+    }
 
 
 def _read_json_object(path: Path) -> dict[str, Any]:
@@ -291,6 +295,7 @@ def cosmos3_eval_identity(
     lora_alpha: float,
     hidden_layer: int,
     prompt: str,
+    backbone_name: str = "cosmos3-edge",
 ) -> dict[str, Any]:
     """Resolve current file identity without constructing a backbone or using a GPU."""
     from lerobot.policies.vam.cosmos3_features import checkpoint_digest
@@ -308,7 +313,9 @@ def cosmos3_eval_identity(
         ):
             raise FileNotFoundError(f"Cosmos3 checkpoint lacks nonempty {component} weights: {directory}")
 
-    if type(hidden_layer) is not int or not 1 <= hidden_layer <= 28 or not isinstance(prompt, str):
+    is_nano = backbone_name.replace("-", "_").lower() == "cosmos3_nano"
+    max_layers = 36 if is_nano else 28
+    if type(hidden_layer) is not int or not 1 <= hidden_layer <= max_layers or not isinstance(prompt, str):
         raise ValueError("Invalid Cosmos3 layer or prompt")
     lora_sha = None
     rank = None
@@ -331,7 +338,7 @@ def cosmos3_eval_identity(
         if rank <= 0 or not math.isfinite(alpha) or alpha <= 0:
             raise ValueError(f"Invalid Cosmos3 LoRA rank/alpha: {lora_checkpoint}")
     return {
-        "backbone": "cosmos3-edge",
+        "backbone": "cosmos3-nano" if is_nano else "cosmos3-edge",
         # This producer's legacy field is a directory digest, NOT the single
         # transformer-file hash returned by Cosmos3FeatureExtractor.get_provenance().
         "transformer_sha256": checkpoint_digest(checkpoint_path),
@@ -344,7 +351,7 @@ def cosmos3_eval_identity(
         "fps": 10.0,
         "base_fps": 24.0,
         "context_tokens": 600,
-        "context_dim": 2048,
+        "context_dim": 4096 if is_nano else 2048,
     }
 
 
@@ -470,13 +477,16 @@ def validate_online_eval_cache_identity(path: Path, args: argparse.Namespace, *,
 
 
 def _cosmos3_identity_from_args(args: argparse.Namespace) -> dict[str, Any]:
+    is_nano = (args.online_backbone or "").replace("-", "_").lower() == "cosmos3_nano"
+    default_ckpt = Path("/home/anton/.cache/video-vam/cosmos3-nano") if is_nano else COSMOS3_CHECKPOINT_DIR
     return cosmos3_eval_identity(
-        checkpoint_path=args.backbone_checkpoint or COSMOS3_CHECKPOINT_DIR,
+        checkpoint_path=args.backbone_checkpoint or default_ckpt,
         lora_checkpoint=args.backbone_lora_weights,
         lora_rank=args.backbone_lora_rank,
         lora_alpha=args.backbone_lora_alpha,
         hidden_layer=args.backbone_layer,
         prompt=args.backbone_prompt,
+        backbone_name="cosmos3-nano" if is_nano else "cosmos3-edge",
     )
 
 
@@ -1319,6 +1329,7 @@ def evaluate_validation(
                 lora_alpha=config.lora_alpha,
                 hidden_layer=config.hidden_layers[0],
                 prompt=config.prompt,
+                backbone_name=getattr(config, "backbone_name", "cosmos3-edge"),
             )
             cast(Any, extractor)._smolexpert_eval_identity = identity
         validate_cosmos3_cache_identity(
@@ -1987,6 +1998,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         type=int,
         default=15,
         help="Early stopping patience in evaluations (default: 15).",
+    )
+    parser.add_argument(
+        "--select-metric",
+        type=str,
+        choices=("val_rmse", "val_flow_loss"),
+        default="val_rmse",
+        help="Validation metric used for best-checkpoint selection and early stopping (default: val_rmse).",
     )
     parser.add_argument(
         "--num-steps",
@@ -2811,7 +2829,10 @@ def main(argv: list[str] | None = None) -> int:
         num_tokens = sample_context.shape[0]
     elif is_online:
         b_key = args.online_backbone.replace("-", "_").lower()
-        if b_key in ("cosmos3_edge", "cosmos3"):
+        if b_key == "cosmos3_nano":
+            input_channels = 4096
+            num_tokens = 600
+        elif b_key in ("cosmos3_edge", "cosmos3"):
             input_channels = 2048
             num_tokens = 600
         elif any(k in b_key for k in ("cosmos2b", "cosmos_2b", "cosmos_t2", "cosmos")):
@@ -2829,13 +2850,19 @@ def main(argv: list[str] | None = None) -> int:
 
     if is_online and not args.dry_run:
         b_key = args.online_backbone.replace("-", "_").lower()
-        if b_key in ("cosmos3_edge", "cosmos3"):
+        if b_key in ("cosmos3_edge", "cosmos3", "cosmos3_nano"):
             from lerobot.policies.vam.cosmos3_features import (
                 Cosmos3ExtractorConfig,
                 Cosmos3FeatureExtractor,
             )
 
-            ckpt_dir = args.backbone_checkpoint or Path("/home/anton/.cache/video-vam/cosmos3-edge")
+            is_nano = b_key == "cosmos3_nano"
+            default_ckpt = Path(
+                "/home/anton/.cache/video-vam/cosmos3-nano"
+                if is_nano
+                else "/home/anton/.cache/video-vam/cosmos3-edge"
+            )
+            ckpt_dir = args.backbone_checkpoint or default_ckpt
             train_bb_lora = bool(getattr(args, "train_backbone_lora", False))
             if getattr(args, "backbone_fps", None) is not None:
                 resolved_cosmos3_fps = float(args.backbone_fps)
@@ -2844,7 +2871,7 @@ def main(argv: list[str] | None = None) -> int:
             else:
                 resolved_cosmos3_fps = float(dataset_contract.fps)
             b_cfg = Cosmos3ExtractorConfig(
-                backbone_name="cosmos3-edge",
+                backbone_name="cosmos3-nano" if is_nano else "cosmos3-edge",
                 checkpoint_path=ckpt_dir,
                 hidden_layers=(args.backbone_layer,),
                 device=str(device),
@@ -3216,8 +3243,45 @@ def main(argv: list[str] | None = None) -> int:
         f"Arm RMSE: {val_metrics['arm_rmse_deg']:.3f}°, "
         f"Gripper RMSE: {val_metrics['gripper_rmse']:.3f}, "
         f"H1: {val_metrics['val_h1']:.3f}, "
-        f"Flow Loss: {val_metrics['val_flow_loss']:.4f}"
+        f"Flow Loss: {val_metrics['val_flow_loss']:.4f} "
+        f"(select_metric={args.select_metric})"
     )
+    if args.model_checkpoint and args.model_checkpoint.is_file():
+        init_select_val = float(val_metrics[args.select_metric])
+        early_stopping.update(init_select_val, 0)
+        save_weights_artifact(
+            args.output_dir, "best", decoder.state_dict(), 0, run_manifest, metric=init_select_val
+        )
+        if backbone_trainable_params and hasattr(backbone_extractor, "transformer"):
+            from lerobot.policies.vam.cosmos3_lora import save_cosmos3_lora
+
+            save_cosmos3_lora(
+                backbone_extractor.transformer,
+                args.output_dir / "best_backbone_lora.safetensors",
+                rank=args.backbone_lora_rank,
+                alpha=args.backbone_lora_alpha,
+                use_dora=bool(getattr(args, "backbone_lora_dora", False)),
+            )
+        init_best_meta = {
+            "step": 0,
+            "select_metric": args.select_metric,
+            "val_rmse": float(val_metrics["val_rmse"]),
+            "val_h1": float(val_metrics["val_h1"]),
+            "val_first5": float(val_metrics["val_first5"]),
+            "val_first5_pooled_rmse": float(val_metrics["val_first5_pooled_rmse"]),
+            "arm_rmse_deg": float(val_metrics["arm_rmse_deg"]),
+            "gripper_rmse": float(val_metrics["gripper_rmse"]),
+            "val_flow_loss": float(val_metrics["val_flow_loss"]),
+            "eval1_rmse": float(val_metrics["val_rmse"]),
+            "eval1_h1": float(val_metrics["val_h1"]),
+            "eval1_first5": float(val_metrics["val_first5"]),
+            "eval1_flow_loss": float(val_metrics["val_flow_loss"]),
+            "backbone": args.backbone,
+            "protocol": effective_protocol,
+            "train_episodes": list(train_eps),
+            "val_episodes": list(val_eps),
+        }
+        (args.output_dir / "best_metrics.json").write_text(json.dumps(init_best_meta, indent=2) + "\n")
 
     # 7. Training Loop with Exact Gradient Accumulation
     if args.compile_loss and device.type == "cuda" and not args.dry_run:
@@ -3458,8 +3522,9 @@ def main(argv: list[str] | None = None) -> int:
                 eval2_first5 = float(eval2_metrics["val_first5"])
                 eval2_flow = float(eval2_metrics["val_flow_loss"])
 
-            is_best = early_stopping.update(rmse, opt_step)
-            marker = " *** BEST ***" if is_best else ""
+            select_val = float(val_metrics[args.select_metric])
+            is_best = early_stopping.update(select_val, opt_step)
+            marker = f" *** BEST ({args.select_metric}) ***" if is_best else ""
             if eval2_dataset is not None:
                 print(
                     f"[Eval @ {opt_step}] Eval-1 Val Loss: {flow:.4f} | RMSE: {rmse:.3f} (Arm: {arm_rmse:.3f}°, Grip: {gripper_rmse:.3f}) | H1: {h1:.3f} | First-5: {first5:.3f} "
@@ -3491,6 +3556,7 @@ def main(argv: list[str] | None = None) -> int:
                 "eval1_h1": h1,
                 "eval1_first5": first5,
                 "eval1_flow_loss": flow,
+                "select_metric": args.select_metric,
                 "is_best": is_best,
                 "bad_evaluations": early_stopping.bad_evaluations,
                 "protocol": effective_protocol,
@@ -3511,7 +3577,7 @@ def main(argv: list[str] | None = None) -> int:
 
             if is_best:
                 save_weights_artifact(
-                    args.output_dir, "best", decoder.state_dict(), opt_step, run_manifest, metric=rmse
+                    args.output_dir, "best", decoder.state_dict(), opt_step, run_manifest, metric=select_val
                 )
                 if backbone_trainable_params and hasattr(backbone_extractor, "transformer"):
                     from lerobot.policies.vam.cosmos3_lora import save_cosmos3_lora
@@ -3525,6 +3591,7 @@ def main(argv: list[str] | None = None) -> int:
                     )
                 best_meta = {
                     "step": opt_step,
+                    "select_metric": args.select_metric,
                     "val_rmse": rmse,
                     "val_h1": h1,
                     "val_first5": first5,
@@ -3558,9 +3625,14 @@ def main(argv: list[str] | None = None) -> int:
             decoder.train()
 
             if early_stopping.should_stop:
+                best_fmt = (
+                    f"Best Val Flow Loss: {early_stopping.best_metric:.4f}"
+                    if args.select_metric == "val_flow_loss"
+                    else f"Best RMSE: {early_stopping.best_metric:.3f}"
+                )
                 print(
-                    f"Early stopping triggered at step {opt_step}: no validation improvement "
-                    f"for {early_stopping.patience} evaluations. Best RMSE: {early_stopping.best_metric:.3f} "
+                    f"Early stopping triggered at step {opt_step}: no {args.select_metric} improvement "
+                    f"for {early_stopping.patience} evaluations. {best_fmt} "
                     f"at step {early_stopping.best_step}."
                 )
                 break
@@ -3667,7 +3739,10 @@ def main(argv: list[str] | None = None) -> int:
         "status": "completed",
         "total_steps": opt_step,
         "best_step": early_stopping.best_step,
-        "best_val_rmse": early_stopping.best_metric,
+        "select_metric": args.select_metric,
+        "best_select_metric": early_stopping.best_metric,
+        "best_val_rmse": float(final_eval1["val_rmse"]),
+        "best_val_flow_loss": float(final_eval1["val_flow_loss"]),
         "total_time_seconds": total_time,
         "backbone": args.backbone,
         "protocol": effective_protocol,
@@ -3700,7 +3775,9 @@ def main(argv: list[str] | None = None) -> int:
     backend_val = args.backbone
     if is_online:
         b_k = args.online_backbone.replace("-", "_").lower()
-        if "cosmos3" in b_k:
+        if b_k == "cosmos3_nano":
+            backend_val = "cosmos3_nano"
+        elif "cosmos3" in b_k:
             backend_val = "cosmos3_edge"
         elif any(k in b_k for k in ("cosmos2b", "cosmos_2b", "cosmos_t2", "cosmos")):
             backend_val = "cosmos"
@@ -3741,11 +3818,15 @@ def main(argv: list[str] | None = None) -> int:
                 else (float(dataset_contract.fps) if is_online else 10.0)
             )
         )
+        default_c3_ckpt = (
+            "/home/anton/.cache/video-vam/cosmos3-nano"
+            if backend_val == "cosmos3_nano"
+            else "/home/anton/.cache/video-vam/cosmos3-edge"
+        )
         deployment_cfg.update(
             {
-                "cosmos3_checkpoint": str(
-                    args.backbone_checkpoint or "/home/anton/.cache/video-vam/cosmos3-edge"
-                ),
+                "cosmos3_checkpoint": str(args.backbone_checkpoint or default_c3_ckpt),
+                "cosmos3_layer": args.backbone_layer,
                 "cosmos3_lora_weights": resolved_lora_weights,
                 "cosmos3_lora_rank": args.backbone_lora_rank,
                 "cosmos3_lora_alpha": args.backbone_lora_alpha,

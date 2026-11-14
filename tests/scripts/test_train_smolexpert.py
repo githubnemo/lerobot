@@ -1729,3 +1729,156 @@ def test_backbone_lora_alpha_is_resolved_from_adapter_and_conflicts_rejected(tmp
     assert (args.backbone_lora_rank, args.backbone_lora_alpha) == (16, 16.0)
     with pytest.raises(SystemExit):
         parse_args([*base, "--backbone-lora-alpha", "32.0"])
+
+
+def test_select_metric_val_flow_loss_and_warmstart_seed(tmp_path: Path, monkeypatch):
+    from scripts.video_vam import train_smolexpert as trainer
+
+    train_dir = tmp_path / "train"
+    val_dir = tmp_path / "val"
+    train_dir.mkdir()
+    val_dir.mkdir()
+
+    f_tr = _create_mock_cache_item(
+        train_dir,
+        "tr.safetensors",
+        context=torch.randn(4, 16),
+        state=torch.zeros(ACTION_DIM),
+        action=torch.zeros(ACTION_HORIZON, ACTION_DIM),
+        action_is_pad=torch.zeros(ACTION_HORIZON, dtype=torch.bool),
+    )
+    train_m = train_dir / "manifest.json"
+    train_m.write_text(
+        json.dumps(
+            {
+                "entries": [
+                    {"safetensors": f_tr.name, "episode_index": 0, "frame_index": 0, "sample_id": "tr0"}
+                ]
+            }
+        )
+    )
+    f_va = _create_mock_cache_item(
+        val_dir,
+        "va.safetensors",
+        context=torch.randn(4, 16),
+        state=torch.zeros(ACTION_DIM),
+        action=torch.zeros(ACTION_HORIZON, ACTION_DIM),
+        action_is_pad=torch.zeros(ACTION_HORIZON, dtype=torch.bool),
+    )
+    val_m = val_dir / "manifest.json"
+    val_m.write_text(
+        json.dumps(
+            {
+                "entries": [
+                    {"safetensors": f_va.name, "episode_index": 32, "frame_index": 0, "sample_id": "va0"}
+                ]
+            }
+        )
+    )
+
+    init_ckpt = tmp_path / "init.safetensors"
+    init_decoder = build_synthetic_tiny_decoder(input_channels=16)
+    save_file(init_decoder.state_dict(), str(init_ckpt))
+
+    original_eval = trainer.evaluate_validation
+    eval_calls = 0
+    # step 0 (seed): loss=0.05; step 1: loss=0.04 (best); step 2: loss=0.06 (bad 1);
+    # step 3: loss=0.07 (bad 2 -> early stop even though val_rmse keeps dropping).
+    schedule = [(10.0, 0.05), (5.0, 0.04), (4.0, 0.06), (3.0, 0.07), (2.0, 0.03)]
+
+    def fake_evaluate(*args, **kwargs):
+        nonlocal eval_calls
+        metrics = original_eval(*args, **kwargs)
+        rmse_val, loss_val = schedule[min(eval_calls, len(schedule) - 1)]
+        eval_calls += 1
+        metrics["val_rmse"] = rmse_val
+        metrics["val_flow_loss"] = loss_val
+        return metrics
+
+    monkeypatch.setattr(trainer, "evaluate_validation", fake_evaluate)
+    out_dir = tmp_path / "out_flow"
+    ret = trainer.main(
+        [
+            "--train-manifest",
+            str(train_m),
+            "--val-manifest",
+            str(val_m),
+            "--output-dir",
+            str(out_dir),
+            "--model-checkpoint",
+            str(init_ckpt),
+            "--select-metric",
+            "val_flow_loss",
+            "--val-every",
+            "1",
+            "--patience",
+            "2",
+            "--min-steps",
+            "0",
+            "--max-steps",
+            "5",
+            "--dry-run",
+            "--device",
+            "cpu",
+            "--no-wandb",
+        ]
+    )
+    assert ret == 0
+    best_meta = json.loads((out_dir / "best_metrics.json").read_text())
+    summary = json.loads((out_dir / "training_summary.json").read_text())
+    assert best_meta["step"] == 1
+    assert best_meta["select_metric"] == "val_flow_loss"
+    assert best_meta["val_flow_loss"] == pytest.approx(0.04)
+    assert summary["best_step"] == 1
+    assert summary["select_metric"] == "val_flow_loss"
+    assert summary["best_select_metric"] == pytest.approx(0.04)
+    assert summary["total_steps"] == 3
+
+
+def test_cosmos3_nano_eval_identity_and_args(tmp_path: Path):
+    from scripts.video_vam.train_smolexpert import cosmos3_eval_identity, parse_args
+
+    ckpt = tmp_path / "cosmos3-nano"
+    for comp in ("transformer", "vae"):
+        (ckpt / comp).mkdir(parents=True)
+        save_file({"w": torch.ones(1)}, str(ckpt / comp / "diffusion_pytorch_model-00001-of-00002.safetensors"))
+
+    ident = cosmos3_eval_identity(
+        checkpoint_path=ckpt,
+        lora_checkpoint=None,
+        lora_rank=16,
+        lora_alpha=32.0,
+        hidden_layer=36,
+        prompt="grab cube",
+        backbone_name="cosmos3-nano",
+    )
+    assert ident["backbone"] == "cosmos3-nano"
+    assert ident["context_dim"] == 4096
+    assert ident["hidden_layer"] == 36
+
+    with pytest.raises(ValueError, match="Invalid Cosmos3 layer"):
+        cosmos3_eval_identity(
+            checkpoint_path=ckpt,
+            lora_checkpoint=None,
+            lora_rank=16,
+            lora_alpha=32.0,
+            hidden_layer=37,
+            prompt="grab cube",
+            backbone_name="cosmos3-nano",
+        )
+
+    args = parse_args(
+        [
+            "--online-backbone",
+            "cosmos3_nano",
+            "--backbone-layer",
+            "18",
+            "--select-metric",
+            "val_flow_loss",
+            "--val-manifest",
+            "v.json",
+        ]
+    )
+    assert args.online_backbone == "cosmos3_nano"
+    assert args.backbone_layer == 18
+    assert args.select_metric == "val_flow_loss"

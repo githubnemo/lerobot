@@ -1480,23 +1480,26 @@ def _ensure_cosmos3_backbone(resolved_checkpoint: str, policy: str) -> None:
     ckpt_cfg_path = Path(resolved_checkpoint) / "config.json"
     if ckpt_cfg_path.is_file():
         ckpt_cfg = json.loads(ckpt_cfg_path.read_text())
-        if ckpt_cfg.get("backend") == "cosmos3_edge":
+        backend = ckpt_cfg.get("backend")
+        if backend in ("cosmos3_edge", "cosmos3_nano"):
             from lerobot.policies.vam.modeling_video_vam import _resolve_cosmos3_checkpoint_path
 
+            is_nano = backend == "cosmos3_nano"
+            cache_sub = "cosmos3-nano" if is_nano else "cosmos3-edge"
+            repo_id = "nvidia/Cosmos3-Nano" if is_nano else "nvidia/Cosmos3-Edge"
             c3_path = _resolve_cosmos3_checkpoint_path(
-                ckpt_cfg.get("cosmos3_checkpoint", "/home/anton/.cache/video-vam/cosmos3-edge")
+                ckpt_cfg.get("cosmos3_checkpoint", f"/home/anton/.cache/video-vam/{cache_sub}"),
+                backend=backend,
             )
             if not (c3_path / "transformer").is_dir():
-                fallback_c3 = Path.home() / ".cache/video-vam/cosmos3-edge"
+                fallback_c3 = Path.home() / ".cache/video-vam" / cache_sub
                 if not (fallback_c3 / "transformer").is_dir():
                     from huggingface_hub import snapshot_download
 
-                    print(
-                        "[SETUP] Downloading nvidia/Cosmos3-Edge backbone to ~/.cache/video-vam/cosmos3-edge..."
-                    )
+                    print(f"[SETUP] Downloading {repo_id} backbone to ~/.cache/video-vam/{cache_sub}...")
                     fallback_c3.mkdir(parents=True, exist_ok=True)
                     snapshot_download(
-                        "nvidia/Cosmos3-Edge",
+                        repo_id,
                         local_dir=str(fallback_c3),
                         allow_patterns=[
                             "transformer/*",

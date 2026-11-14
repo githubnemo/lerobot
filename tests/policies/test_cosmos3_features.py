@@ -424,3 +424,44 @@ def test_cosmos3_extractor_compilation_and_batched():
     tapped = extractor.forward_transformer_blocks(latents_b2)
     assert 2 in tapped
     assert tapped[2].shape[0] == 2
+
+
+def test_cosmos3_nano_config_defaults_and_provenance(tmp_path: Path) -> None:
+    from lerobot.policies.vam.configuration_video_vam import VideoVAMConfig
+
+    nano_cfg = Cosmos3ExtractorConfig(backbone_name="cosmos3-nano", hidden_layers=(18,))
+    assert nano_cfg.hidden_dim == 4096
+    assert nano_cfg.num_layers == 36
+    assert Cosmos3ExtractorConfig(backbone_name="cosmos3-nano", hidden_layers=(36,)).num_layers == 36
+    with pytest.raises(ValueError, match="out of range"):
+        Cosmos3ExtractorConfig(backbone_name="cosmos3-nano", hidden_layers=(37,))
+
+    vam_cfg = VideoVAMConfig(backend="cosmos3_nano", cosmos3_layer=18)
+    assert vam_cfg.backend == "cosmos3_nano"
+    assert vam_cfg.cosmos3_layer == 18
+    with pytest.raises(ValueError, match="cosmos3_layer"):
+        VideoVAMConfig(backend="cosmos3_nano", cosmos3_layer=0)
+
+    ckpt_dir = tmp_path / "cosmos3-nano"
+    (ckpt_dir / "transformer").mkdir(parents=True)
+    index_file = ckpt_dir / "transformer" / "diffusion_pytorch_model.safetensors.index.json"
+    index_file.write_text(json.dumps({"weight_map": {}}))
+
+    transformer = build_tiny_real_cosmos3_transformer(num_layers=4, hidden_size=64)
+    vae = _MockWanVAE(z_dim=48)
+    tokenizer = MagicMock(return_value=type("Tokens", (), {"input_ids": [1, 2, 3]})())
+    cfg = Cosmos3ExtractorConfig(
+        backbone_name="cosmos3-nano",
+        checkpoint_path=ckpt_dir,
+        hidden_layers=(2,),
+        device="cpu",
+        dtype="float32",
+        hidden_dim=64,
+        num_layers=36,
+    )
+    extractor = Cosmos3FeatureExtractor(cfg, transformer=transformer, vae=vae, tokenizer=tokenizer)
+    out = extractor.extract(rgb_frames=torch.rand(1, 3, 5, 480, 640))
+    assert out.features.shape == (1, 600, 64)
+    prov = extractor.get_provenance()
+    assert prov["model_type"] == "Cosmos3-Nano"
+    assert prov["transformer_index_sha256"] == sha256_file(index_file)
