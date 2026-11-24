@@ -19,14 +19,15 @@ bash scripts/video_vam/run_experiment.sh c3_sort_cubes_portable \
   --backbone-lora-alpha 32 \
   --backbone-grad-checkpointing \
   --backbone-lora-lr 5e-5 \
-  --lr 2e-4 \
+  --lr 3e-4 \
   --batch-size 16 \
   --grad-accum-steps 2 \
-  --warmup-steps 300 \
+  --warmup-steps 200 \
   --val-every 250 \
   --patience 8 \
   --min-steps 500 \
-  --max-steps 10000 \
+  --max-steps 3500 \
+  --select-metric val_first5 \
   --val-flow-num-t 4 \
   --seed 42 \
   "$@"

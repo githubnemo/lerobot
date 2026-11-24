@@ -2024,7 +2024,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--select-metric",
         type=str,
-        choices=("val_rmse", "val_flow_loss"),
+        choices=("val_rmse", "val_flow_loss", "val_first5"),
         default="val_rmse",
         help="Validation metric used for best-checkpoint selection and early stopping (default: val_rmse).",
     )
@@ -3686,7 +3686,7 @@ def main(argv: list[str] | None = None) -> int:
                 best_fmt = (
                     f"Best Val Flow Loss: {early_stopping.best_metric:.4f}"
                     if args.select_metric == "val_flow_loss"
-                    else f"Best RMSE: {early_stopping.best_metric:.3f}"
+                    else f"Best {args.select_metric}: {early_stopping.best_metric:.3f}"
                 )
                 print(
                     f"Early stopping triggered at step {opt_step}: no {args.select_metric} improvement "
