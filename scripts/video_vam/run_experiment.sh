@@ -94,7 +94,7 @@ if [[ ${DRY_RUN:-0} == 1 ]]; then
     exit 0
 fi
 
-if [[ -f scripts/video_vam/cosmos_cuda_env.sh && -d "${VAM_VENV:-${REPO_ROOT}/.venv}/lib/python3.12/site-packages/nvidia" ]]; then
+if [[ -f scripts/video_vam/cosmos_cuda_env.sh && -d "${VAM_VENV:-${REPO_ROOT}/.venv}/lib/python3.12/site-packages/nvidia/cuda_runtime/lib" ]]; then
     # shellcheck source=/dev/null
     source scripts/video_vam/cosmos_cuda_env.sh
 else
