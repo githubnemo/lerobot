@@ -119,10 +119,12 @@ class ExpoResidualCritic(nn.Module):
         curr_scale: float = 0.06,
         max_delta_deg: float = 100.0,
         zero_init_edit: bool = False,
+        action_dim: int | None = None,
     ) -> None:
         super().__init__()
         self.ctx_dim = ctx_dim
         self.state_dim = state_dim
+        self.action_dim = state_dim if action_dim is None else action_dim
         self.chunk_len = chunk_len
         self.use_init_anchor = use_init_anchor
         self.base_alpha = base_alpha if use_init_anchor else 1.0
@@ -156,11 +158,11 @@ class ExpoResidualCritic(nn.Module):
             nn.SiLU(),
         )
         self.edit_net = nn.Sequential(
-            nn.Linear(256 + state_dim + 16 + chunk_len * state_dim, 512),
+            nn.Linear(256 + state_dim + 16 + chunk_len * self.action_dim, 512),
             nn.SiLU(),
             nn.Linear(512, 512),
             nn.SiLU(),
-            nn.Linear(512, chunk_len * state_dim),
+            nn.Linear(512, chunk_len * self.action_dim),
         )
         self.v_net = nn.Sequential(
             nn.Linear(256 + state_dim + 16, 256),
@@ -171,7 +173,7 @@ class ExpoResidualCritic(nn.Module):
         self.prec_net = nn.Sequential(
             nn.Linear(256 + state_dim + 16, 256),
             nn.SiLU(),
-            nn.Linear(256, chunk_len * state_dim),
+            nn.Linear(256, chunk_len * self.action_dim),
             nn.Softplus(),
         )
         if zero_init_edit:
@@ -196,7 +198,12 @@ class ExpoResidualCritic(nn.Module):
             return p12.expand(bsz, 2, 12, dim).reshape(bsz, 24, dim)
         h_g, w_g = (15, 20) if n_tok == 600 else (8, 10)
         x = ctx.float().reshape(bsz, 2, h_g, w_g, dim).permute(0, 1, 4, 2, 3).reshape(bsz * 2, dim, h_g, w_g)
-        return F.adaptive_avg_pool2d(x, (3, 4)).reshape(bsz, 2, dim, 12).permute(0, 1, 3, 2).reshape(bsz, 24, dim)
+        return (
+            F.adaptive_avg_pool2d(x, (3, 4))
+            .reshape(bsz, 2, dim, 12)
+            .permute(0, 1, 3, 2)
+            .reshape(bsz, 24, dim)
+        )
 
     def _encode_ctx(self, ctx: Tensor, init_ctx: Tensor | None = None) -> Tensor:
         grid = self.pool_ctx_tokens(ctx)
@@ -230,7 +237,7 @@ class ExpoResidualCritic(nn.Module):
         t_emb = self._time_emb(t_norm)
         base_scaled = (base_actions_deg * self.base_alpha).reshape(base_actions_deg.shape[0], -1) / 50.0
         inp = torch.cat([ctx_feat, state_scaled, t_emb, base_scaled], dim=-1)
-        delta = self.max_delta_deg * torch.tanh(self.edit_net(inp).view(-1, self.chunk_len, self.state_dim))
+        delta = self.max_delta_deg * torch.tanh(self.edit_net(inp).view(-1, self.chunk_len, self.action_dim))
         return base_actions_deg * self.base_alpha + delta, ctx_feat
 
     def forward_edit(
@@ -352,24 +359,28 @@ class ExpoResidualCritic(nn.Module):
         tnorm_list: list[Tensor] = []
         base_list: list[Tensor] = []
         exec_list: list[Tensor] = []
-        rew_list: list[ float ] = []
-        adv_list: list[ float ] = []
+        rew_list: list[float] = []
+        adv_list: list[float] = []
         ep_init_grids: list[Tensor] = []
 
         for ep_idx, ep in enumerate(valid_eps):
             ep_steps = ep["steps"]
-            init_g = self.pool_ctx_tokens(ep_steps[0]["ctx"].unsqueeze(0) if ep_steps[0]["ctx"].ndim == 2 else ep_steps[0]["ctx"])[0].cpu()
+            init_g = self.pool_ctx_tokens(
+                ep_steps[0]["ctx"].unsqueeze(0) if ep_steps[0]["ctx"].ndim == 2 else ep_steps[0]["ctx"]
+            )[0].cpu()
             ep_init_grids.append(init_g)
             r_val = rewards[ep_idx]
             a_val = float(adv_ep[ep_idx].item())
             for st in ep_steps:
-                c_tok = self.pool_ctx_tokens(st["ctx"].unsqueeze(0) if st["ctx"].ndim == 2 else st["ctx"])[0].cpu()
+                c_tok = self.pool_ctx_tokens(st["ctx"].unsqueeze(0) if st["ctx"].ndim == 2 else st["ctx"])[
+                    0
+                ].cpu()
                 ctx_list.append(c_tok)
                 init_list.append(init_g)
                 state_list.append(st["state"].view(-1).cpu().float())
                 tnorm_list.append(st["t_norm"].view(1).cpu().float())
-                base_list.append(st["base_action"].view(self.chunk_len, self.state_dim).cpu().float())
-                exec_list.append(st["exec_action"].view(self.chunk_len, self.state_dim).cpu().float())
+                base_list.append(st["base_action"].view(self.chunk_len, self.action_dim).cpu().float())
+                exec_list.append(st["exec_action"].view(self.chunk_len, self.action_dim).cpu().float())
                 rew_list.append(r_val)
                 adv_list.append(a_val)
 
@@ -399,19 +410,19 @@ class ExpoResidualCritic(nn.Module):
             i_b = init_all[idx]
             s_b = state_all[idx]
             t_b = tnorm_all[idx]
-            ba_b = base_all[idx]
+            base_b = base_all[idx]
             ex_b = exec_all[idx]
             r_b = rew_all[idx]
             a_b = adv_all[idx]
 
-            pred_edit, ctx_feat = self.forward_edit_with_feat(c_b, s_b, t_b, ba_b, init_ctx=i_b)
+            pred_edit, ctx_feat = self.forward_edit_with_feat(c_b, s_b, t_b, base_b, init_ctx=i_b)
             q_exec = self.forward_q_from_feat(ctx_feat.detach(), s_b, t_b, ex_b, pred_edit.detach())
             critic_loss = F.mse_loss(q_exec, r_b)
 
             # Dr. GRPO group advantage + Marek & Ryabinin Off-Policy Score Centering (arXiv:2609.20807)
             w_pos = torch.where(a_b > 0.0, a_b, 0.25 * r_b)
-            sc_loss = compute_marek_score_centered_loss(pred_edit, ex_b, ba_b, w_pos)
-            trust_reg = ((pred_edit - ba_b * self.base_alpha) / 50.0).pow(2).mean(dim=(1, 2))
+            sc_loss = compute_marek_score_centered_loss(pred_edit, ex_b, base_b, w_pos)
+            trust_reg = ((pred_edit - base_b * self.base_alpha) / 50.0).pow(2).mean(dim=(1, 2))
             actor_loss = sc_loss + (0.02 * (1.0 - r_b) * trust_reg).mean()
 
             loss = critic_loss + actor_loss

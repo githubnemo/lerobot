@@ -1,3 +1,4 @@
+# ruff: noqa: N803, N806, N812, E402
 """Cosmos 3 Edge feature extraction with native VAE encoding, 3D mRoPE, and gen_seq visual routing.
 
 Extracts intermediate representations (specifically layer 20 = after 20 transformer blocks, block index 19)
@@ -147,7 +148,9 @@ def triton_wan_rmsnorm_nhwc(
     B, C, T, H, W = x.shape
     HW = H * W
     T_out = T + pad_t
-    out = torch.empty((B, C, T_out, H, W), device=x.device, dtype=x.dtype, memory_format=torch.channels_last_3d)
+    out = torch.empty(
+        (B, C, T_out, H, W), device=x.device, dtype=x.dtype, memory_format=torch.channels_last_3d
+    )
     if pad_t > 0:
         out[:, :, :pad_t, :, :].zero_()
     BLOCK_C = triton.next_power_of_2(C)
@@ -171,14 +174,15 @@ def triton_wan_rmsnorm_nhwc(
 def optimize_wan_vae_encoder(vae: AutoencoderKLWan) -> None:
     """Optimize Wan2.2 3D Causal VAE encoder for single-pass channels_last_3d execution with fused Triton kernels."""
     import types
+
     import torch.nn.functional as F
     from diffusers.models.autoencoders.autoencoder_kl_wan import (
         AvgDown3D,
         WanCausalConv3d,
         WanEncoder3d,
+        WanResample,
         WanResidualBlock,
         WanResidualDownBlock,
-        WanResample,
         WanRMS_norm,
     )
 
@@ -191,7 +195,9 @@ def optimize_wan_vae_encoder(vae: AutoencoderKLWan) -> None:
         elif isinstance(m, nn.Conv2d):
             m.weight.data = m.weight.data.contiguous(memory_format=torch.channels_last)
 
-    def _fast_causal_conv_forward(self, x: Tensor, cache_x: Tensor | None = None, time_pre_padded: bool = False) -> Tensor:
+    def _fast_causal_conv_forward(
+        self, x: Tensor, cache_x: Tensor | None = None, time_pre_padded: bool = False
+    ) -> Tensor:
         pad_w, _, pad_h, _, pad_t, _ = self._padding
         if not time_pre_padded:
             if cache_x is not None and pad_t > 0:
@@ -213,7 +219,9 @@ def optimize_wan_vae_encoder(vae: AutoencoderKLWan) -> None:
             x = x.contiguous(memory_format=torch.channels_last_3d)
         return F.conv3d(x, self.weight, self.bias, self.stride, (0, pad_h, pad_w), self.dilation, self.groups)
 
-    def _fast_resblock_forward(self, x: Tensor, feat_cache: Any = None, feat_idx: list[int] | None = None) -> Tensor:
+    def _fast_resblock_forward(
+        self, x: Tensor, feat_cache: Any = None, feat_idx: list[int] | None = None
+    ) -> Tensor:
         if feat_cache is not None:
             return WanResidualBlock.forward(self, x, feat_cache=feat_cache, feat_idx=feat_idx or [0])
         h = self.conv_shortcut(x)
@@ -232,13 +240,24 @@ def optimize_wan_vae_encoder(vae: AutoencoderKLWan) -> None:
             x_c = F.pad(x_c, (0, 0, 0, 0, pad_t, 0))
         B, C, T, H, W = x_c.shape
         x_c = x_c.view(
-            B, C, T // self.factor_t, self.factor_t, H // self.factor_s, self.factor_s, W // self.factor_s, self.factor_s
+            B,
+            C,
+            T // self.factor_t,
+            self.factor_t,
+            H // self.factor_s,
+            self.factor_s,
+            W // self.factor_s,
+            self.factor_s,
         )
         x_c = x_c.permute(0, 1, 3, 5, 7, 2, 4, 6).contiguous()
-        x_c = x_c.view(B, self.out_channels, self.group_size, T // self.factor_t, H // self.factor_s, W // self.factor_s)
+        x_c = x_c.view(
+            B, self.out_channels, self.group_size, T // self.factor_t, H // self.factor_s, W // self.factor_s
+        )
         return x_c.mean(dim=2).contiguous(memory_format=torch.channels_last_3d)
 
-    def _fast_resdown_forward(self, x: Tensor, feat_cache: Any = None, feat_idx: list[int] | None = None) -> Tensor:
+    def _fast_resdown_forward(
+        self, x: Tensor, feat_cache: Any = None, feat_idx: list[int] | None = None
+    ) -> Tensor:
         x_in = x
         for resnet in self.resnets:
             x = resnet(x, feat_cache=feat_cache, feat_idx=feat_idx)
@@ -246,17 +265,25 @@ def optimize_wan_vae_encoder(vae: AutoencoderKLWan) -> None:
             x = self.downsampler(x, feat_cache=feat_cache, feat_idx=feat_idx)
         return x + self.avg_shortcut(x_in)
 
-    def _fast_resample_forward(self, x: Tensor, feat_cache: Any = None, feat_idx: list[int] | None = None) -> Tensor:
+    def _fast_resample_forward(
+        self, x: Tensor, feat_cache: Any = None, feat_idx: list[int] | None = None
+    ) -> Tensor:
         if feat_cache is not None:
             return WanResample.forward(self, x, feat_cache=feat_cache, feat_idx=feat_idx or [0])
         b, c, t, h, w = x.size()
         if x.is_contiguous(memory_format=torch.channels_last_3d):
             x_2d = x.permute(0, 2, 3, 4, 1).view(b * t, h, w, c).permute(0, 3, 1, 2)
         else:
-            x_2d = x.permute(0, 2, 1, 3, 4).reshape(b * t, c, h, w).contiguous(memory_format=torch.channels_last)
+            x_2d = (
+                x.permute(0, 2, 1, 3, 4).reshape(b * t, c, h, w).contiguous(memory_format=torch.channels_last)
+            )
         x_2d = self.resample(x_2d)
         if x_2d.is_contiguous(memory_format=torch.channels_last):
-            x = x_2d.permute(0, 2, 3, 1).view(b, t, x_2d.size(2), x_2d.size(3), x_2d.size(1)).permute(0, 4, 1, 2, 3)
+            x = (
+                x_2d.permute(0, 2, 3, 1)
+                .view(b, t, x_2d.size(2), x_2d.size(3), x_2d.size(1))
+                .permute(0, 4, 1, 2, 3)
+            )
         else:
             x = x_2d.view(b, t, x_2d.size(1), x_2d.size(2), x_2d.size(3)).permute(0, 2, 1, 3, 4)
         if self.mode == "downsample3d" and t > 1:
@@ -265,7 +292,9 @@ def optimize_wan_vae_encoder(vae: AutoencoderKLWan) -> None:
             )
         return x
 
-    def _fast_encoder_forward(self, x: Tensor, feat_cache: Any = None, feat_idx: list[int] | None = None) -> Tensor:
+    def _fast_encoder_forward(
+        self, x: Tensor, feat_cache: Any = None, feat_idx: list[int] | None = None
+    ) -> Tensor:
         if feat_cache is not None:
             return WanEncoder3d.forward(self, x, feat_cache=feat_cache, feat_idx=feat_idx or [0])
         x = self.conv_in(x)
@@ -336,6 +365,7 @@ def fused_rmsnorm_rope(
     cos_b = cos.unsqueeze(0).unsqueeze(2)
     sin_b = sin.unsqueeze(0).unsqueeze(2)
     return normed * cos_b + _rotate_half(normed) * sin_b
+
 
 from lerobot.policies.vam.base import (
     BaseExtractorConfig,
@@ -858,7 +888,11 @@ class Cosmos3FeatureExtractor(BaseVAMExtractor):
 
         # 2. Load or inject LoRA/DoRA if requested
         max_layer = max(self.config.hidden_layers)
-        if loaded_transformer_from_disk and hasattr(self.transformer, "layers") and len(self.transformer.layers) > max_layer:
+        if (
+            loaded_transformer_from_disk
+            and hasattr(self.transformer, "layers")
+            and len(self.transformer.layers) > max_layer
+        ):
             self.transformer.layers = self.transformer.layers[:max_layer]
             gc.collect()
 
@@ -883,7 +917,7 @@ class Cosmos3FeatureExtractor(BaseVAMExtractor):
                     rank=config.lora_rank,
                     alpha=config.lora_alpha,
                     block_indices=range(len(self.transformer.layers)),
-                    use_dora=config.lora_use_dora if config.trainable_lora else None,
+                    use_dora=True if (config.trainable_lora and config.lora_use_dora) else None,
                 )
                 if not config.trainable_lora:
                     merge_lora_into_base(self.transformer)
@@ -1072,7 +1106,13 @@ class Cosmos3FeatureExtractor(BaseVAMExtractor):
         self._cached_und_kv = self._compute_und_kv_for_embeds(self._cached_prompt_embeds)
         pruned_lora: dict[str, Tensor] = dict(getattr(self.transformer, "_pruned_lora_state_dict", {}))
         for idx, blk in enumerate(self.transformer.layers):
-            for sub_prefix in ("mlp", "self_attn.to_q", "self_attn.to_k", "self_attn.to_v", "self_attn.to_out"):
+            for sub_prefix in (
+                "mlp",
+                "self_attn.to_q",
+                "self_attn.to_k",
+                "self_attn.to_v",
+                "self_attn.to_out",
+            ):
                 try:
                     sub_mod = blk.get_submodule(sub_prefix)
                 except AttributeError:
@@ -1081,11 +1121,9 @@ class Cosmos3FeatureExtractor(BaseVAMExtractor):
                     continue
                 for p_name, param in sub_mod.named_parameters():
                     if p_name.endswith(("lora_A", "lora_B", "dora_magnitude")):
-                        clean_key = (
-                            f"layers.{idx}.{sub_prefix}.{p_name}"
-                            .replace("._checkpoint_wrapped_module.", ".")
-                            .replace("._orig_mod.", ".")
-                        )
+                        clean_key = f"layers.{idx}.{sub_prefix}.{p_name}".replace(
+                            "._checkpoint_wrapped_module.", "."
+                        ).replace("._orig_mod.", ".")
                         pruned_lora[clean_key] = param.detach().float().cpu().contiguous()
             if hasattr(blk, "mlp"):
                 blk.mlp = None
@@ -1101,7 +1139,9 @@ class Cosmos3FeatureExtractor(BaseVAMExtractor):
         if pruned_lora:
             self.transformer._pruned_lora_state_dict = pruned_lora
 
-    def _get_gen_rotary(self, num_text_tokens: int, grid_shape: tuple[int, int, int]) -> tuple[Tensor, Tensor]:
+    def _get_gen_rotary(
+        self, num_text_tokens: int, grid_shape: tuple[int, int, int]
+    ) -> tuple[Tensor, Tensor]:
         key = (num_text_tokens, *grid_shape)
         cached = self._cached_gen_rotary.get(key)
         if cached is not None:
@@ -1175,7 +1215,10 @@ class Cosmos3FeatureExtractor(BaseVAMExtractor):
 
         if (
             self._supports_fast_batched_gen()
-            and (self._cached_und_kv is not None or (self.config.trainable_lora and self._cached_prompt_embeds is not None))
+            and (
+                self._cached_und_kv is not None
+                or (self.config.trainable_lora and self._cached_prompt_embeds is not None)
+            )
             and text_conditioning is None
         ):
             packed_latent, grid_shape = patchify_and_pack_cosmos3_vision_latents(
@@ -1211,9 +1254,9 @@ class Cosmos3FeatureExtractor(BaseVAMExtractor):
                 k_g = fused_rmsnorm_rope(k_raw, attn.norm_added_k, cos_g, sin_g)
                 all_k = torch.cat([k_u_g.expand(b_cur, -1, -1, -1), k_g], dim=1)
                 all_v = torch.cat([v_u_g.expand(b_cur, -1, -1, -1), v_g], dim=1)
-                f_out = dispatch_attention_fn(
-                    q_g, all_k, all_v, is_causal=False, enable_gqa=True
-                ).flatten(-2, -1)
+                f_out = dispatch_attention_fn(q_g, all_k, all_v, is_causal=False, enable_gqa=True).flatten(
+                    -2, -1
+                )
                 res_g = g_in + attn.to_add_out(f_out)
                 return res_g + blk.mlp_moe_gen(blk.post_attention_layernorm_moe_gen(res_g))
 

@@ -15,10 +15,20 @@
 # Extra CLI args are appended, so later flags override preset flags for argparse/draccus.
 #
 # Environment:
-#   RUN_TAG     output/log tag (default: preset name)
-#   GPU_LOCK=0  skip scripts/video_vam/gpu_lock.sh (default: acquire when flock+nvidia-smi exist)
-#   DRY_RUN=1   print the resolved command and exit
+#   RUN_TAG         output/log tag (default: preset name)
+#   VAM_CACHE_DIR   model cache directory (default: ${HOME}/.cache/video-vam)
+#   HF_AUTO_UPLOAD  set to 1 to upload outputs/train/${RUN_TAG} to HF Hub on exit 0
+#   HF_REPO_ID      optional explicit HF repo ID when HF_AUTO_UPLOAD=1
+#   HF_UPLOAD_OWNER HF owner/org for auto-upload (default: Orellius)
+#   GPU_LOCK=0      skip scripts/video_vam/gpu_lock.sh (default: acquire when flock+nvidia-smi exist)
+#   DRY_RUN=1       print the resolved command and exit
 set -Eeuo pipefail
+
+export VAM_CACHE_DIR="${VAM_CACHE_DIR:-${HOME:-/tmp}/.cache/video-vam}"
+if [[ -n ${HOME:-} && -f "${HOME}/.env.ml" ]]; then
+    # shellcheck source=/dev/null
+    source "${HOME}/.env.ml"
+fi
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 REPO_ROOT="$(cd -- "${SCRIPT_DIR}/../.." && pwd -P)"
@@ -114,4 +124,13 @@ set +e
 status=$?
 set -e
 printf 'finished %s with status %s at %s\n' "$PRESET" "$status" "$(date)"
+
+if [[ $status -eq 0 && ${HF_AUTO_UPLOAD:-0} == 1 ]]; then
+    UPLOAD_ARGS=(--run-dir "outputs/train/${RUN_TAG}")
+    if [[ -n ${HF_REPO_ID:-} ]]; then
+        UPLOAD_ARGS+=(--repo-id "$HF_REPO_ID")
+    fi
+    printf 'uploading outputs/train/%s to Hugging Face Hub...\n' "$RUN_TAG"
+    "$PYTHON" scripts/video_vam/push_checkpoint_to_hf.py "${UPLOAD_ARGS[@]}"
+fi
 exit $status

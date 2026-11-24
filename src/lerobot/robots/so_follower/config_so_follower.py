@@ -52,6 +52,12 @@ class SOFollowerConfig:
     # failure, so the steady-state read cost is unchanged.
     num_read_retries: int = 2
 
+    # Optional extra Feetech STS3215 servo telemetry appended to observations (`*.vel`, `*.load`, `*.current`).
+    # All default to False so existing 6-D position-only datasets and policies remain unchanged.
+    record_velocity: bool = False
+    record_load: bool = False
+    record_current: bool = False
+
 
 @RobotConfig.register_subclass("so101_follower")
 @RobotConfig.register_subclass("so100_follower")

@@ -30,4 +30,11 @@ bash scripts/video_vam/run_experiment.sh <preset> \
 
 ## Index
 
-_(Experiments start at `exp001` for the 2026-11-24 RunPod 5090 sprint; historical pre-numbering runs are documented in `docs/video_vam_leaderboard.md` and `scripts/video_vam/presets/`.)_
+| ID       | Script                                       | Backbone / Method                                         | Dataset Split                            | Auto HF Repo                                             |
+| :------- | :------------------------------------------- | :-------------------------------------------------------- | :--------------------------------------- | :------------------------------------------------------- |
+| `exp001` | `exp001_c3_edge_joint_lora_bs64.sh`          | Cosmos 3 Edge (L20) + Joint LoRA (`gen_only`), BS 64      | `sort_cubes@a7c156de` (`0:68` / `68:77`) | `Orellius/so101_exp001_c3_edge_joint_lora_bs64`          |
+| `exp002` | `exp002_c3_nano_l24_joint_lora_bs32.sh`      | Cosmos 3 Nano (L24/36) + Joint LoRA (`gen_only`), BS 32   | `sort_cubes@a7c156de` (`0:68` / `68:77`) | `Orellius/so101_exp002_c3_nano_l24_joint_lora_bs32`      |
+| `exp003` | `exp003_c3_nano_l24_joint_dora_bs32.sh`      | Cosmos 3 Nano (L24/36) + Joint DoRA (`gen_only`), BS 32   | `sort_cubes@a7c156de` (`0:68` / `68:77`) | `Orellius/so101_exp003_c3_nano_l24_joint_dora_bs32`      |
+| `exp004` | `exp004_flux3_sort_cubes_lora_w1.sh`         | FLUX 3 Action SO-101 LoRA (W1 duplicated wrist) + P1 eval | `sort_cubes@a7c156de` (`0:68` / `68:77`) | `Orellius/so101_exp004_flux3_sort_cubes_lora_w1`         |
+| `exp005` | `exp005_flux3_sort_cubes_dora_w1.sh`         | FLUX 3 Action SO-101 DoRA (W1 duplicated wrist) + P1 eval | `sort_cubes@a7c156de` (`0:68` / `68:77`) | `Orellius/so101_exp005_flux3_sort_cubes_dora_w1`         |
+| `exp006` | `exp006_smolvla_sort_cubes_clean_heldout.sh` | SmolVLA 450M clean held-out baseline (50k steps, BS 32)   | `sort_cubes@a7c156de` (`0:68` / `68:77`) | `Orellius/so101_exp006_smolvla_sort_cubes_clean_heldout` |

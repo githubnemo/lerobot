@@ -257,7 +257,9 @@ class UnifiedFeatureCacheDataset:
         )
 
 
-COSMOS3_CHECKPOINT_DIR = Path("/home/anton/.cache/video-vam/cosmos3-edge")
+COSMOS3_CHECKPOINT_DIR = (
+    Path(os.environ.get("VAM_CACHE_DIR", str(Path.home() / ".cache/video-vam"))) / "cosmos3-edge"
+)
 COSMOS3_CACHE_BUILDER = "scripts/video_vam/extract_cosmos3_edge_pure_vision.py"
 
 
@@ -476,9 +478,18 @@ def validate_online_eval_cache_identity(path: Path, args: argparse.Namespace, *,
         )
 
 
+def _default_vam_cache_dir() -> Path:
+    return Path(os.environ.get("VAM_CACHE_DIR", str(Path.home() / ".cache/video-vam")))
+
+
+def _default_cosmos3_checkpoint(is_nano: bool) -> Path:
+    cache_dir = _default_vam_cache_dir()
+    return cache_dir / ("cosmos3-nano" if is_nano else "cosmos3-edge")
+
+
 def _cosmos3_identity_from_args(args: argparse.Namespace) -> dict[str, Any]:
     is_nano = (args.online_backbone or "").replace("-", "_").lower() == "cosmos3_nano"
-    default_ckpt = Path("/home/anton/.cache/video-vam/cosmos3-nano") if is_nano else COSMOS3_CHECKPOINT_DIR
+    default_ckpt = _default_cosmos3_checkpoint(is_nano) if is_nano else COSMOS3_CHECKPOINT_DIR
     return cosmos3_eval_identity(
         checkpoint_path=args.backbone_checkpoint or default_ckpt,
         lora_checkpoint=args.backbone_lora_weights,
@@ -558,10 +569,11 @@ def load_cosmos3_eval_cache(
     dataset = UnifiedFeatureCacheDataset(path, context_transform=context_transform)
     if dataset.payload != payload:
         raise ValueError(f"Cosmos3 manifest changed during validation: {path}")
+    expected_ctx_dim = int(expected.get("context_dim", 2048))
     for index in range(len(dataset)):
         context = dataset[index].context
-        if tuple(context.shape) != (600, 2048) or context.dtype != torch.bfloat16:
-            raise ValueError(f"Cosmos3 cache context must be bfloat16 [600, 2048]: {path}")
+        if tuple(context.shape) != (600, expected_ctx_dim) or context.dtype != torch.bfloat16:
+            raise ValueError(f"Cosmos3 cache context must be bfloat16 [600, {expected_ctx_dim}]: {path}")
     return dataset
 
 
@@ -926,7 +938,9 @@ class OnlineVideoDataset(torch.utils.data.Dataset[OnlineVideoItem]):
         rem_vram = usable_vram_bytes
         preload_frames_count = 0
         for ep in self.episodes:
-            ep_frame_cnt = len(ep_needed_frames[ep]) if sparse_windows else int(reader._meta.episodes[ep]["length"])
+            ep_frame_cnt = (
+                len(ep_needed_frames[ep]) if sparse_windows else int(reader._meta.episodes[ep]["length"])
+            )
             ep_b = ep_frame_cnt * frame_bytes
             if ep_b <= rem_ram:
                 selected_eps[ep] = "cpu"
@@ -1275,8 +1289,8 @@ def build_synthetic_tiny_decoder(
         head_dim=8,
         num_steps=2,
         input_channels=input_channels,
-        max_action_dim=16,
-        max_state_dim=16,
+        max_action_dim=32,
+        max_state_dim=32,
     )
     return decoder.to(device=device)
 
@@ -1290,6 +1304,7 @@ def evaluate_validation(
     batch_size: int = 8,
     num_steps: int = 10,
     seed: int = 42,
+    val_flow_num_t: int = 1,
     extractor: Any | None = None,
     kinematics: Any | None = None,
 ) -> dict[str, Any]:
@@ -1373,10 +1388,11 @@ def evaluate_validation(
             )
             if batch_items[0].context is not None:
                 contexts = torch.stack([item.context for item in batch_items]).to(device=device)
+                expected_ctx_dim = decoder.context_adapter.input_channels
                 if cosmos3_cached and (
-                    tuple(contexts.shape[1:]) != (600, 2048) or contexts.dtype != torch.bfloat16
+                    tuple(contexts.shape[1:]) != (600, expected_ctx_dim) or contexts.dtype != torch.bfloat16
                 ):
-                    raise ValueError("Cosmos3 cache context must be bfloat16 [600, 2048]")
+                    raise ValueError(f"Cosmos3 cache context must be bfloat16 [600, {expected_ctx_dim}]")
             elif extractor is not None:
                 has_trainable_bb = hasattr(extractor, "parameters") and any(
                     p.requires_grad for p in extractor.parameters()
@@ -1388,7 +1404,9 @@ def evaluate_validation(
                 val_cache: dict[str, Tensor] = cast(Any, extractor)._val_context_cache
                 val_lat_cache: dict[str, Tensor] = cast(Any, extractor)._val_latent_cache
                 if not has_trainable_bb and all(item.sample_id in val_cache for item in batch_items):
-                    contexts = torch.stack([val_cache[item.sample_id] for item in batch_items]).to(device=device)
+                    contexts = torch.stack([val_cache[item.sample_id] for item in batch_items]).to(
+                        device=device
+                    )
                 elif (
                     has_trainable_bb
                     and hasattr(extractor, "forward_transformer_blocks")
@@ -1435,8 +1453,6 @@ def evaluate_validation(
 
             # 1. Deterministic per-sample seeded noise generation (Stable across reorder and batching)
             sample_noises = []
-            sample_epsilons = []
-            sample_ts = []
             for item in batch_items:
                 # Noise seed isolated per dataset_id + sample_id
                 s_seed = stable_sample_seed(dataset_id, item.sample_id, seed, offset=0)
@@ -1446,23 +1462,7 @@ def evaluate_validation(
                 )
                 sample_noises.append(n)
 
-                # Deterministic epsilon & t for flow-matching loss (Beta(1.5, 1.0) * 0.999 + 0.001)
-                eps_seed = stable_sample_seed(dataset_id, item.sample_id, seed, offset=100_000)
-                gen_eps = torch.Generator(device=device).manual_seed(eps_seed)
-                eps = torch.randn(
-                    (1, ACTION_HORIZON, max_action_dim), device=device, dtype=dtype, generator=gen_eps
-                )
-                sample_epsilons.append(eps)
-
-                t_seed = stable_sample_seed(dataset_id, item.sample_id, seed, offset=200_000)
-                gen_t = torch.Generator(device="cpu").manual_seed(t_seed)
-                u = torch.rand(1, generator=gen_t).item()
-                t_val = (u ** (2.0 / 3.0)) * 0.999 + 0.001
-                sample_ts.append(t_val)
-
             noise = torch.cat(sample_noises, dim=0)
-            epsilon_tensor = torch.cat(sample_epsilons, dim=0)
-            t_tensor = torch.tensor(sample_ts, dtype=torch.float32, device=device)
 
             if kinematics is not None:
                 true_joint_actions = actions
@@ -1495,17 +1495,39 @@ def evaluate_validation(
                 prefix_squared_by_step[h] += (squared_err[:, h : h + 1] * vh).sum(dim=(0, 1))
                 prefix_tokens_by_step[h] += int(vh.sum().item())
 
-            # 4. Explicit Flow-matching loss computation
-            flow_loss = decoder.flow_matching_loss(
-                state=states,
-                action=actions,
-                context=contexts,
-                t=t_tensor,
-                epsilon=epsilon_tensor,
-                action_is_pad=paddings,
-            )
-            flow_total += float(flow_loss.float().item()) * max(batch_valid_tokens, 1)
-            flow_tokens += max(batch_valid_tokens, 1)
+            # 4. Explicit Flow-matching loss computation (optionally stratified across K deterministic t)
+            num_t_samples = max(int(val_flow_num_t), 1)
+            for t_idx in range(num_t_samples):
+                sample_epsilons = []
+                sample_ts = []
+                for item in batch_items:
+                    # Deterministic epsilon & t for flow-matching loss (Beta(1.5, 1.0) * 0.999 + 0.001)
+                    eps_seed = stable_sample_seed(dataset_id, item.sample_id, seed, offset=100_000 + t_idx)
+                    gen_eps = torch.Generator(device=device).manual_seed(eps_seed)
+                    eps = torch.randn(
+                        (1, ACTION_HORIZON, max_action_dim), device=device, dtype=dtype, generator=gen_eps
+                    )
+                    sample_epsilons.append(eps)
+
+                    t_seed = stable_sample_seed(dataset_id, item.sample_id, seed, offset=200_000 + t_idx)
+                    gen_t = torch.Generator(device="cpu").manual_seed(t_seed)
+                    u_raw = torch.rand(1, generator=gen_t).item()
+                    u = u_raw if num_t_samples == 1 else (t_idx + u_raw) / num_t_samples
+                    t_val = (u ** (2.0 / 3.0)) * 0.999 + 0.001
+                    sample_ts.append(t_val)
+
+                epsilon_tensor = torch.cat(sample_epsilons, dim=0)
+                t_tensor = torch.tensor(sample_ts, dtype=torch.float32, device=device)
+                flow_loss = decoder.flow_matching_loss(
+                    state=states,
+                    action=actions,
+                    context=contexts,
+                    t=t_tensor,
+                    epsilon=epsilon_tensor,
+                    action_is_pad=paddings,
+                )
+                flow_total += float(flow_loss.float().item()) * max(batch_valid_tokens, 1)
+                flow_tokens += max(batch_valid_tokens, 1)
 
     finally:
         decoder.train(was_training)
@@ -2007,6 +2029,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Validation metric used for best-checkpoint selection and early stopping (default: val_rmse).",
     )
     parser.add_argument(
+        "--val-flow-num-t",
+        type=int,
+        default=1,
+        help="Number of stratified deterministic flow timesteps per anchor for val_flow_loss (default: 1).",
+    )
+    parser.add_argument(
         "--num-steps",
         type=int,
         default=10,
@@ -2074,6 +2102,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "--eval2-manifest",
             "--device",
             "--batch-size",
+            "--val-flow-num-t",
         }
         explicit = {
             arg.split("=", 1)[0] for arg in (sys.argv[1:] if argv is None else argv) if arg.startswith("--")
@@ -2112,12 +2141,14 @@ def build_run_manifest(
         if dataset is None:
             continue
         if isinstance(dataset, OnlineVideoDataset):
+            b_key = (args.online_backbone or "").replace("-", "_").lower()
+            online_ctx_dim = 4096 if b_key == "cosmos3_nano" else 2048
             datasets[name] = {
                 "manifest_sha256": "online_video_dataset",
                 "source_path_hint": str(dataset.manifest_path),
                 "metadata": dataset.payload,
                 "episodes": list(dataset.episodes),
-                "context_shape": [600, 2048],
+                "context_shape": [600, online_ctx_dim],
             }
         else:
             datasets[name] = {
@@ -2445,13 +2476,14 @@ def evaluate_saved_run(cli: argparse.Namespace) -> int:
     }
     device = torch.device(cli.device)
     set_seed(args.seed)
+    saved_ctx_dim = int(datasets["val"][0].context.shape[-1])
     decoder = SmolExpertActionDecoder.from_training_checkpoint(
         checkpoint,
         normalizer=normalizer,
         expert_checkpoint=args.checkpoint_path,
         device=device,
         num_steps=args.num_steps,
-        input_channels=2048,
+        input_channels=saved_ctx_dim,
     )
     results = {}
     for split, seed in (("val", args.seed), ("eval2", args.seed + 1000)):
@@ -2462,6 +2494,7 @@ def evaluate_saved_run(cli: argparse.Namespace) -> int:
             batch_size=args.batch_size,
             num_steps=args.num_steps,
             seed=seed,
+            val_flow_num_t=cli.val_flow_num_t,
         )
     original_val = manifest.get("datasets", {}).get("val", {}).get("metadata", {})
     try:
@@ -2857,11 +2890,7 @@ def main(argv: list[str] | None = None) -> int:
             )
 
             is_nano = b_key == "cosmos3_nano"
-            default_ckpt = Path(
-                "/home/anton/.cache/video-vam/cosmos3-nano"
-                if is_nano
-                else "/home/anton/.cache/video-vam/cosmos3-edge"
-            )
+            default_ckpt = _default_cosmos3_checkpoint(is_nano)
             ckpt_dir = args.backbone_checkpoint or default_ckpt
             train_bb_lora = bool(getattr(args, "train_backbone_lora", False))
             if getattr(args, "backbone_fps", None) is not None:
@@ -2885,7 +2914,8 @@ def main(argv: list[str] | None = None) -> int:
                 trainable_lora=train_bb_lora,
                 lora_use_dora=bool(getattr(args, "backbone_lora_dora", False)),
                 lora_pathway=getattr(args, "backbone_lora_pathway", "gen_only"),
-                gradient_checkpointing=bool(getattr(args, "backbone_grad_checkpointing", True)) and train_bb_lora,
+                gradient_checkpointing=bool(getattr(args, "backbone_grad_checkpointing", True))
+                and train_bb_lora,
                 compile_dit=not train_bb_lora,
                 compile_vae=True,
                 vae_compile_mode="default",
@@ -3150,6 +3180,7 @@ def main(argv: list[str] | None = None) -> int:
             batch_size=args.batch_size,
             num_steps=args.num_steps,
             seed=args.seed,
+            val_flow_num_t=args.val_flow_num_t,
         )
         eval2_res = None
         if eval2_dataset is not None:
@@ -3161,6 +3192,7 @@ def main(argv: list[str] | None = None) -> int:
                 batch_size=args.batch_size,
                 num_steps=args.num_steps,
                 seed=args.seed + 1000,
+                val_flow_num_t=args.val_flow_num_t,
             )
 
         eval_out = {
@@ -3235,6 +3267,7 @@ def main(argv: list[str] | None = None) -> int:
         batch_size=args.batch_size,
         num_steps=min(args.num_steps, 5 if args.dry_run else args.num_steps),
         seed=args.seed,
+        val_flow_num_t=args.val_flow_num_t,
         extractor=backbone_extractor,
         kinematics=kinematics,
     )
@@ -3326,7 +3359,12 @@ def main(argv: list[str] | None = None) -> int:
         for _ in range(2):
             prefetch_queue.append(prefetch_pool.submit(_fetch_batch, _next_batch_indices()))
 
-    if is_online and not args.dry_run and backbone_extractor is not None and not hasattr(backbone_extractor, "_online_ram_cache"):
+    if (
+        is_online
+        and not args.dry_run
+        and backbone_extractor is not None
+        and not hasattr(backbone_extractor, "_online_ram_cache")
+    ):
         backbone_extractor._online_ram_cache = {}
         backbone_extractor._ram_cache_full = False
 
@@ -3352,7 +3390,11 @@ def main(argv: list[str] | None = None) -> int:
                     assert backbone_extractor is not None
                     train_bb = bool(backbone_trainable_params)
                     ram_cache: dict[str, Tensor] = getattr(backbone_extractor, "_online_ram_cache", {})
-                    if not train_bb and not args.augment and all(item.sample_id in ram_cache for item in batch_items):
+                    if (
+                        not train_bb
+                        and not args.augment
+                        and all(item.sample_id in ram_cache for item in batch_items)
+                    ):
                         contexts = torch.stack([ram_cache[item.sample_id] for item in batch_items]).to(
                             device=device
                         )
@@ -3370,8 +3412,10 @@ def main(argv: list[str] | None = None) -> int:
                         else:
                             rgb_in = unaugmented_temporal_window_gpu(raw_rgb)
 
-                        if train_bb and hasattr(backbone_extractor, "encode_latents") and hasattr(
-                            backbone_extractor, "forward_transformer_blocks"
+                        if (
+                            train_bb
+                            and hasattr(backbone_extractor, "encode_latents")
+                            and hasattr(backbone_extractor, "forward_transformer_blocks")
                         ):
                             if not hasattr(backbone_extractor, "_online_latent_cache"):
                                 backbone_extractor._online_latent_cache = {}
@@ -3381,7 +3425,10 @@ def main(argv: list[str] | None = None) -> int:
                                     [lat_cache[item.sample_id] for item in batch_items]
                                 ).to(device=device, non_blocking=True)
                             else:
-                                with torch.no_grad(), torch.autocast(device_type=device.type, dtype=torch.bfloat16):
+                                with (
+                                    torch.no_grad(),
+                                    torch.autocast(device_type=device.type, dtype=torch.bfloat16),
+                                ):
                                     latents_batch = backbone_extractor.encode_latents(rgb_in)
                                     if (
                                         not args.augment
@@ -3394,13 +3441,18 @@ def main(argv: list[str] | None = None) -> int:
                                         ):
                                             backbone_extractor._ram_cache_full = True
                                         else:
-                                            for b_item, lat_t in zip(batch_items, latents_batch, strict=False):
+                                            for b_item, lat_t in zip(
+                                                batch_items, latents_batch, strict=False
+                                            ):
                                                 lat_cache[b_item.sample_id] = lat_t.detach().cpu()
                             with torch.autocast(device_type=device.type, dtype=torch.bfloat16):
                                 tapped = backbone_extractor.forward_transformer_blocks(latents_batch)
                                 contexts = tapped[args.backbone_layer].to(device=device)
                         else:
-                            with torch.no_grad(), torch.autocast(device_type=device.type, dtype=torch.bfloat16):
+                            with (
+                                torch.no_grad(),
+                                torch.autocast(device_type=device.type, dtype=torch.bfloat16),
+                            ):
                                 if hasattr(backbone_extractor, "encode_latents") and hasattr(
                                     backbone_extractor, "forward_transformer_blocks"
                                 ):
@@ -3418,7 +3470,11 @@ def main(argv: list[str] | None = None) -> int:
                                     and not getattr(backbone_extractor, "_ram_cache_full", False)
                                     and len(ram_cache) < 4096
                                 ):
-                                    if len(ram_cache) % 128 == 0 and OnlineVideoDataset._get_available_ram_bytes() < 14 * (1024**3):
+                                    if len(
+                                        ram_cache
+                                    ) % 128 == 0 and OnlineVideoDataset._get_available_ram_bytes() < 14 * (
+                                        1024**3
+                                    ):
                                         backbone_extractor._ram_cache_full = True
                                     else:
                                         for b_item, ctx_t in zip(batch_items, contexts, strict=False):
@@ -3485,6 +3541,7 @@ def main(argv: list[str] | None = None) -> int:
                 batch_size=args.batch_size,
                 num_steps=args.num_steps,
                 seed=args.seed,
+                val_flow_num_t=args.val_flow_num_t,
                 extractor=backbone_extractor,
                 kinematics=kinematics,
             )
@@ -3513,6 +3570,7 @@ def main(argv: list[str] | None = None) -> int:
                     batch_size=args.batch_size,
                     num_steps=args.num_steps,
                     seed=args.seed + 1000,
+                    val_flow_num_t=args.val_flow_num_t,
                     extractor=backbone_extractor,
                 )
                 eval2_rmse = float(eval2_metrics["val_rmse"])
@@ -3667,7 +3725,11 @@ def main(argv: list[str] | None = None) -> int:
         best_state = load_file(str(best_checkpoint_path))
         decoder.load_state_dict(best_state)
         best_bb_lora_path = args.output_dir / "best_backbone_lora.safetensors"
-        if backbone_trainable_params and best_bb_lora_path.is_file() and hasattr(backbone_extractor, "transformer"):
+        if (
+            backbone_trainable_params
+            and best_bb_lora_path.is_file()
+            and hasattr(backbone_extractor, "transformer")
+        ):
             from lerobot.policies.vam.cosmos3_lora import load_cosmos3_lora
 
             load_cosmos3_lora(
@@ -3685,6 +3747,7 @@ def main(argv: list[str] | None = None) -> int:
         batch_size=args.batch_size,
         num_steps=args.num_steps,
         seed=args.seed,
+        val_flow_num_t=args.val_flow_num_t,
         extractor=backbone_extractor,
         kinematics=kinematics,
     )
@@ -3697,6 +3760,7 @@ def main(argv: list[str] | None = None) -> int:
             batch_size=args.batch_size,
             num_steps=args.num_steps,
             seed=args.seed + 1000,
+            val_flow_num_t=args.val_flow_num_t,
             extractor=backbone_extractor,
         )
 
@@ -3784,15 +3848,17 @@ def main(argv: list[str] | None = None) -> int:
         elif any(k in b_k for k in ("flux2", "flux")):
             backend_val = "flux2_klein"
 
+    state_dim_out = int(normalizer.state_mean.shape[0])
+    action_dim_out = int(normalizer.action_mean.shape[0])
     deployment_cfg = {
         "type": "video_vam",
         "backend": backend_val,
         "device": "cuda",
         "input_features": {
             "observation.images.front": {"type": "VISUAL", "shape": [3, 480, 640]},
-            "observation.state": {"type": "STATE", "shape": [6]},
+            "observation.state": {"type": "STATE", "shape": [state_dim_out]},
         },
-        "output_features": {"action": {"type": "ACTION", "shape": [6]}},
+        "output_features": {"action": {"type": "ACTION", "shape": [action_dim_out]}},
         "camera_key": "observation.images.front",
         "action_seed": 0,
         "online_trained": is_online,
@@ -3818,11 +3884,7 @@ def main(argv: list[str] | None = None) -> int:
                 else (float(dataset_contract.fps) if is_online else 10.0)
             )
         )
-        default_c3_ckpt = (
-            "/home/anton/.cache/video-vam/cosmos3-nano"
-            if backend_val == "cosmos3_nano"
-            else "/home/anton/.cache/video-vam/cosmos3-edge"
-        )
+        default_c3_ckpt = str(_default_cosmos3_checkpoint(backend_val == "cosmos3_nano"))
         deployment_cfg.update(
             {
                 "cosmos3_checkpoint": str(args.backbone_checkpoint or default_c3_ckpt),
@@ -3842,7 +3904,10 @@ def main(argv: list[str] | None = None) -> int:
                 "cosmos_context_transform": "none",
                 "cosmos_checkpoint": str(
                     args.backbone_checkpoint
-                    or "/home/anton/.cache/video-vam/mimic-video-f2833903/video_backbone/v2w_pretrained_cosmos.pt"
+                    or (
+                        _default_vam_cache_dir()
+                        / "mimic-video-f2833903/video_backbone/v2w_pretrained_cosmos.pt"
+                    )
                 ),
                 "cosmos_lora_weights": str(args.backbone_lora_weights)
                 if args.backbone_lora_weights

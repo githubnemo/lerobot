@@ -319,7 +319,11 @@ class VideoVAMPolicy(PreTrainedPolicy):
                     lora_ckpt = repo_root / lora_ckpt
                 elif run_dir is not None and (run_dir / Path(lora_ckpt).name).exists():
                     lora_ckpt = run_dir / Path(lora_ckpt).name
-            elif lora_ckpt is None and run_dir is not None and (run_dir / "best_backbone_lora.safetensors").is_file():
+            elif (
+                lora_ckpt is None
+                and run_dir is not None
+                and (run_dir / "best_backbone_lora.safetensors").is_file()
+            ):
                 lora_ckpt = run_dir / "best_backbone_lora.safetensors"
 
             default_layer = 18 if is_nano else 20
@@ -516,11 +520,12 @@ class VideoVAMPolicy(PreTrainedPolicy):
                 history = self._update_frame_history(batch)
             if not isinstance(history, Tensor):
                 raise ValueError(f"batch is missing {history_key}; use inference.observation_history_size=5")
+        expected_state_dim = getattr(self.decoder, "state_dim", 6)
         state = batch.get(OBS_STATE)
-        if isinstance(state, Tensor) and state.ndim == 1 and state.shape[0] == 6:
+        if isinstance(state, Tensor) and state.ndim == 1 and state.shape[0] == expected_state_dim:
             state = state.unsqueeze(0)
-        if not isinstance(state, Tensor) or tuple(state.shape) != (1, 6):
-            raise ValueError(f"{OBS_STATE} must have shape [1, 6]")
+        if not isinstance(state, Tensor) or tuple(state.shape) != (1, expected_state_dim):
+            raise ValueError(f"{OBS_STATE} must have shape [1, {expected_state_dim}]")
         images = restore_uint8_history(history)
         feature_seed = self._feature_seed(batch, feature_noise_seed)
         context = self._extract_context(images, feature_seed)
