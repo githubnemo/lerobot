@@ -2246,3 +2246,18 @@ Key takeaways:
 
 - Synchronized `RUNPOD_API_KEY`, `RUNPOD_S3_*`, `HF_TOKEN`, and `WANDB_API_KEY` across Mac (`~/.env.ml`, `lerobot/.env`) and `abakus` (`~/.env.ml`, `lerobot-video-vam/.env`, `~/.netrc`).
 - Added mandatory post-experiment logging and numbered immutable launch scripts (`scripts/video_vam/experiments/expNNN_<slug>.sh`) to `AGENTS.md`, plus the short-term RunPod 5090 + Cosmos 3 / FLUX 3 vs. SmolVLA + EXPO-FT RL goal.
+
+---
+
+## 2026-11-24 (Evening) — RunPod Blackwell 96 GB `exp001` Results & `val_flow_loss` vs. `First-5` Divergence
+
+- **Hardware**: RTX 5090 had 0 global Secure Cloud stock on RunPod; deployed **RTX PRO 6000 Blackwell (96 GB)** (`sfijmgdsbo1wgi`, `EU-NL-1`, `$2.69/hr`) with reusable 200 GB Network Volume `lerobot-vam-vol` (`fbqcvkw7so`).
+- **Infra fixes discovered on Blackwell**:
+  - `diffusers 0.39.0` lacked Cosmos 3 Edge nemotron config keys → upgraded pod to `diffusers==0.44.0.dev0`.
+  - `BS=32` triggered `CUDA_ERROR_ILLEGAL_ADDRESS` inside Wan2.2 VAE 3D Conv (`32×256×5×240×320 = 3.14B > INT32_MAX`) → fixed cleanly in `0a203b833` by chunking `Cosmos3FeatureExtractor.encode_latents` to `max_vae_batch=8`.
+  - Transferred `black-forest-labs/flux-3-action-so101` (13 GB) from `abakus` to `/workspace/.cache/video-vam/flux3-action-so101` for `exp004`/`exp005`.
+- **`exp001_c3_edge_joint_lora_bs64` (`scripts/video_vam/experiments/exp001_c3_edge_joint_lora_bs64.sh`)**:
+  - Full-from-scratch Cosmos 3 Edge (L20) + Joint LoRA (`gen_only`, `r=16, α=32`), effective BS 64 (`32×2`), `physics` aug, `--val-flow-num-t 4`, `13,263s` (`~15.8 samples/s`, 17.2 GiB VRAM).
+  - **Key finding**: Stratified `val_flow_loss` reached its minimum early at step `1,250` (`0.0707`, `Full-30 15.472`, `H1 6.034°`, `F5 7.104°`), then slowly rose (`0.0782` @ `3,250`) while action-space RMSE **kept improving dramatically**: `@2250` `H1=4.397° / F5=5.968°`, `@2750` `Full-30=15.151 / Grip=7.768`, `@3250` `Full-30=15.047 / Arm=16.105° / Grip=7.846 / H1=4.630° / F5=6.072°`.
+  - Uploaded both `best` (`@1250`) and `last` (`@3250`) to `Orellius/so101_exp001_c3_edge_joint_lora_bs64`.
+- **Next decision**: Added `--select-metric val_first5` (`51b8b0cbe`) and launched `exp002_c3_nano_l24_joint_lora_bs32.sh` (Cosmos 3 Nano L24/36 Joint LoRA, 3,500-step cosine schedule so LR decays cleanly to 0) on the Blackwell pod.
