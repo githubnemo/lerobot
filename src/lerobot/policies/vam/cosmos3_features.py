@@ -1195,13 +1195,29 @@ class Cosmos3FeatureExtractor(BaseVAMExtractor):
         if self.vae is not None and hasattr(self.vae, "encoder"):
             self.vae.encoder = torch.compile(self.vae.encoder, mode=mode)
 
-    def encode_latents(self, rgb_frames: Tensor) -> Tensor:
-        """Encode RGB video [B, 3, T, H, W] into normalized VAE latents [B, 48, T_lat, H_lat, W_lat]."""
+    def encode_latents(self, rgb_frames: Tensor, *, max_vae_batch: int = 8) -> Tensor:
+        """Encode RGB video [B, 3, T, H, W] into normalized VAE latents [B, 48, T_lat, H_lat, W_lat].
+
+        Chunks large batches (`B > max_vae_batch`) to prevent 32-bit index overflow inside 3D Conv
+        kernels on high-resolution 5-frame windows (e.g. B=32 * 256 * 5 * 240 * 320 > 2^31).
+        """
         if self.vae is None:
             raise Cosmos3FeatureError("VAE model is required for encode_latents()")
-        if hasattr(torch.compiler, "cudagraph_mark_step_begin"):
-            torch.compiler.cudagraph_mark_step_begin()
-        return encode_cosmos3_video(self.vae, rgb_frames, sample_mode="argmax")
+        bsz = int(rgb_frames.shape[0])
+        if bsz <= max_vae_batch:
+            if hasattr(torch.compiler, "cudagraph_mark_step_begin"):
+                torch.compiler.cudagraph_mark_step_begin()
+            return encode_cosmos3_video(self.vae, rgb_frames, sample_mode="argmax")
+        chunks = []
+        for start in range(0, bsz, max_vae_batch):
+            if hasattr(torch.compiler, "cudagraph_mark_step_begin"):
+                torch.compiler.cudagraph_mark_step_begin()
+            chunks.append(
+                encode_cosmos3_video(
+                    self.vae, rgb_frames[start : start + max_vae_batch], sample_mode="argmax"
+                ).clone()
+            )
+        return torch.cat(chunks, dim=0)
 
     def forward_transformer_blocks(
         self,
