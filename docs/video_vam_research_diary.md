@@ -2173,7 +2173,7 @@ Before pushing, the uncommitted working tree on abakus (at `f576307f`) was diffe
 
 ### 1. Native SO-101 Wrist-Camera MuJoCo Environment (`lerobot/SO101CubeBox-v0`)
 
-We built a physical digital twin for the `Orellius/so101_sort_cubes_no_top` task (*"Grab the purple cube and put it into the cardboard box, ignore the other objects"*) in `src/lerobot/envs/so101_cube_box.py` + `src/lerobot/envs/so101_assets/so101_cube_box_scene.xml`:
+We built a physical digital twin for the `Orellius/so101_sort_cubes_no_top` task (_"Grab the purple cube and put it into the cardboard box, ignore the other objects"_) in `src/lerobot/envs/so101_cube_box.py` + `src/lerobot/envs/so101_assets/so101_cube_box_scene.xml`:
 
 - **Embodiment & Camera**: Official TheRobotStudio SO-101 STL meshes, calibrated degree-to-radian servo mapping (`lerobot_to_mujoco_qpos` / `mujoco_to_lerobot_qpos`), high-friction jaw contact pads (`fixed_jaw_pad`, `moving_jaw_pad`), and the Hex-Nut UVC wrist camera (`pos="0.002 0.056 -0.032"`, `xyaxes="-1 0 0 0 -0.66 0.75"`, `fovy="62"`, 640×480 RGB @ 30 Hz).
 - **Rollout Frame-History Bugfix (`9880aa6a`)**: Fixed `VideoVAMPolicy.select_action` and `predict_action_chunk` in `src/lerobot/policies/vam/modeling_video_vam.py` so `_frame_history` updates on every control step rather than only when `_action_queue` empties (every 30 steps), ensuring the 5-frame causal window spans consecutive 30 Hz frames `[t-4..t]` instead of 150 steps.
@@ -2182,16 +2182,16 @@ We built a physical digital twin for the `Orellius/so101_sort_cubes_no_top` task
 
 We trained three 30-minute Cosmos 3 Edge checkpoints at `BS=16` on `Orellius/so101_sort_cubes_no_top` (train `0:68`, held-out `68:77`), uploaded each to a dedicated Hugging Face repository, and benchmarked them in closed-loop simulation across held-out episodes `68..72` with the purple cube spawned at each episode's FK grasp coordinates:
 
-| Metric | **Frozen Backbone** (`2,580` steps) | **Joint DoRA** (`936` steps) | **Joint LoRA** (`1,020` steps) | Correlation Finding |
-| :--- | :---: | :---: | :---: | :--- |
-| **HF Repository** | [`..._cosmos3_edge_smolexpert`](https://huggingface.co/Orellius/so101_sort_cubes_no_top_cosmos3_edge_smolexpert) | [`..._cosmos3_edge_dora_smolexpert`](https://huggingface.co/Orellius/so101_sort_cubes_no_top_cosmos3_edge_dora_smolexpert) | [`..._cosmos3_edge_lora_smolexpert`](https://huggingface.co/Orellius/so101_sort_cubes_no_top_cosmos3_edge_lora_smolexpert) | Separate repos uploaded |
-| **Offline Val Flow Loss** | `0.0688` | **`0.0684`** | `0.0710` | DoRA lowest flow loss |
-| **Offline Val Full-30 RMSE** | `16.637` | `16.335` | **`16.322`** | LoRA lowest 30-step RMSE |
-| **Offline Val First-5 RMSE** | `8.007` | `7.775` | **`7.744`** | Strongly predicts closed-loop tracking |
-| **Closed-Loop Trajectory RMSE** | `25.24°` | **`21.83°`** (-13.5%) | `21.94°` (-13.1%) | Joint PEFT cuts closed-loop drift by >3.3° |
-| **Mean Min Gripper-to-Cube Dist** | `8.42 cm` | `4.96 cm` | **`4.68 cm`** | LoRA reaches **3.74 cm closer** on average |
-| **Best Single-Episode Approach** | `4.0 cm` (Ep 69) | `2.7 cm` (Ep 69) | **`1.7 cm`** (Ep 69, lifted `1.2 cm`) | LoRA physically contacts & lifts cube |
-| **Mean Max Shaped Reward** | `0.1900` | `0.2146` | **`0.2166`** | Strictly monotonic with First-5 RMSE |
+| Metric                            |                                       **Frozen Backbone** (`2,580` steps)                                        |                                                **Joint DoRA** (`936` steps)                                                |                                               **Joint LoRA** (`1,020` steps)                                               | Correlation Finding                        |
+| :-------------------------------- | :--------------------------------------------------------------------------------------------------------------: | :------------------------------------------------------------------------------------------------------------------------: | :------------------------------------------------------------------------------------------------------------------------: | :----------------------------------------- |
+| **HF Repository**                 | [`..._cosmos3_edge_smolexpert`](https://huggingface.co/Orellius/so101_sort_cubes_no_top_cosmos3_edge_smolexpert) | [`..._cosmos3_edge_dora_smolexpert`](https://huggingface.co/Orellius/so101_sort_cubes_no_top_cosmos3_edge_dora_smolexpert) | [`..._cosmos3_edge_lora_smolexpert`](https://huggingface.co/Orellius/so101_sort_cubes_no_top_cosmos3_edge_lora_smolexpert) | Separate repos uploaded                    |
+| **Offline Val Flow Loss**         |                                                     `0.0688`                                                     |                                                        **`0.0684`**                                                        |                                                          `0.0710`                                                          | DoRA lowest flow loss                      |
+| **Offline Val Full-30 RMSE**      |                                                     `16.637`                                                     |                                                          `16.335`                                                          |                                                        **`16.322`**                                                        | LoRA lowest 30-step RMSE                   |
+| **Offline Val First-5 RMSE**      |                                                     `8.007`                                                      |                                                          `7.775`                                                           |                                                        **`7.744`**                                                         | Strongly predicts closed-loop tracking     |
+| **Closed-Loop Trajectory RMSE**   |                                                     `25.24°`                                                     |                                                   **`21.83°`** (-13.5%)                                                    |                                                     `21.94°` (-13.1%)                                                      | Joint PEFT cuts closed-loop drift by >3.3° |
+| **Mean Min Gripper-to-Cube Dist** |                                                    `8.42 cm`                                                     |                                                         `4.96 cm`                                                          |                                                       **`4.68 cm`**                                                        | LoRA reaches **3.74 cm closer** on average |
+| **Best Single-Episode Approach**  |                                                 `4.0 cm` (Ep 69)                                                 |                                                      `2.7 cm` (Ep 69)                                                      |                                           **`1.7 cm`** (Ep 69, lifted `1.2 cm`)                                            | LoRA physically contacts & lifts cube      |
+| **Mean Max Shaped Reward**        |                                                     `0.1900`                                                     |                                                          `0.2146`                                                          |                                                        **`0.2166`**                                                        | Strictly monotonic with First-5 RMSE       |
 
 ### 3. Sim Post-Training: Sim-FT + Online DAgger vs. EXPO-FT Residual RL
 
@@ -2204,11 +2204,11 @@ We evaluated both post-training paradigms across 5 randomized cube spawns (`eval
 3. **Why EXPO-FT Residual RL Outperforms Direct Decoder Fine-Tuning**:
    Following Perry Dong & Chelsea Finn's EXPO-FT framework, keeping the pretrained 100M-parameter flow-matching decoder anchored preserves its smooth 25,000-frame visual representation, while a lightweight $3 \times 4$ spatially-pooled residual action editor $\Delta a_\phi$ + concave value critic $Q_\psi$ (evaluating $K=6$ edited action chunks) adapts the trajectory without overfitting high-resolution background patches.
 
-| Post-Training Method | Mean Max Reward | Mean Min EE-to-Cube (`cm`) | Mean Max Cube Lift (`cm`) | Task Success Rate (`5` Spawns) | Key Behavior |
-| :--- | :---: | :---: | :---: | :---: | :--- |
-| **Zero-Shot LoRA** (Real-Trained Base) | `0.2002` | `6.96 cm` | `0.40 cm` | `0%` (`0/5`) | Approaches workspace, misses cube by ~4–9 cm due to sim visual gap |
-| **Method 1: Sim-FT + Online DAgger** | `0.2874` (up to `0.3904`) | `3.54 cm` (best `2.70 cm`) | `0.92 cm` (up to `4.50 cm`, peak `17.4 cm`) | `0%` (`0/5`) | Cuts approach error by **49%** (`1.5–2.4 cm` on best trials) and lifts cube up to `17.4 cm`, but 600-token cross-attention is sensitive to wrist-camera tilt |
-| **Method 2: EXPO-FT Residual RL** ($\Delta a_\phi + Q_\psi$) | **`0.6908`** (+245%) | **`2.46 cm`** (best `0.99 cm`) | **`13.04 cm`** (up to `21.8 cm`) | **`60%`** (`3/5` single ckpt; `4/5 = 80%` across 2 LR seeds) | Grasps, lifts (`19.7–23.6 cm`), transports across desk, and drops purple cube inside the cardboard box (`reward = 1.000`) |
+| Post-Training Method                                         |      Mean Max Reward      |   Mean Min EE-to-Cube (`cm`)   |          Mean Max Cube Lift (`cm`)          |                Task Success Rate (`5` Spawns)                | Key Behavior                                                                                                                                                 |
+| :----------------------------------------------------------- | :-----------------------: | :----------------------------: | :-----------------------------------------: | :----------------------------------------------------------: | :----------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Zero-Shot LoRA** (Real-Trained Base)                       |         `0.2002`          |           `6.96 cm`            |                  `0.40 cm`                  |                         `0%` (`0/5`)                         | Approaches workspace, misses cube by ~4–9 cm due to sim visual gap                                                                                           |
+| **Method 1: Sim-FT + Online DAgger**                         | `0.2874` (up to `0.3904`) |   `3.54 cm` (best `2.70 cm`)   | `0.92 cm` (up to `4.50 cm`, peak `17.4 cm`) |                         `0%` (`0/5`)                         | Cuts approach error by **49%** (`1.5–2.4 cm` on best trials) and lifts cube up to `17.4 cm`, but 600-token cross-attention is sensitive to wrist-camera tilt |
+| **Method 2: EXPO-FT Residual RL** ($\Delta a_\phi + Q_\psi$) |   **`0.6908`** (+245%)    | **`2.46 cm`** (best `0.99 cm`) |      **`13.04 cm`** (up to `21.8 cm`)       | **`60%`** (`3/5` single ckpt; `4/5 = 80%` across 2 LR seeds) | Grasps, lifts (`19.7–23.6 cm`), transports across desk, and drops purple cube inside the cardboard box (`reward = 1.000`)                                    |
 
 ### 4. Boosted Real-Data Multi-Frame Sequence Detector & 10-Spawn EXPO vs. Score-Centered EXPO (Dr. GRPO) Ablation
 
@@ -2221,3 +2221,28 @@ We evaluated both post-training paradigms across 5 randomized cube spawns (`eval
    - **Why Score Centering (Dr. GRPO) Outperforms Vanilla Uncentered EXPO**:
      - Under **Vanilla EXPO** ($w_i = \exp(\beta R_i)$ without subtracting group mean $\bar{R}_g$), failed rollouts ($R=0$) retain positive weight $w_0 = \exp(0) > 0$ and easy spawns outnumber hard spawns $4:1$, creating a **`2.25°` target bias** (`7.33°` on peripheral Spawn 6, `4.09°` on Spawn 8). Consequently, Vanilla EXPO plateaus at **`7/10 (70%)`** under the learned sequence detector even when doubling training to 5,000 steps.
      - Under **Score-Centered EXPO (Dr. GRPO)** ($A_{g,i} = R_{g,i} - \bar{R}_g$ without dividing by $\sigma_g$), failed rollouts ($A_{g,i} \le 0$) receive **exact zero** actor weight (`0.00°` oracle target bias, `0.13°` detector target bias—**17x lower bias**) while hard peripheral spawns ($\bar{R}_g = 1/6 \implies A_{g,i} = 0.833$) are automatically upweighted. Doubling training from 2,500 to **5,000 steps (`2x`)** boosts closed-loop success to **`9/10 (90%)`** under both the **100% Learned Multi-Frame Sequence Detector** (`min_ee = 1.68 cm`, `max_lift = 19.32 cm`, `dense_rew = 0.922`) and the **Sparse Oracle** (`min_ee = 1.53 cm`, `max_lift = 19.64 cm`, `dense_rew = 0.922`).
+
+---
+
+## 2026-11-14 → 2026-11-24 — Nov 14 Queue Final Results, Experiment Reproducibility Rules & RunPod 5090 Pivot
+
+### 1. Completed Nov 14 `abakus` Queue (`Orellius/so101_sort_cubes_no_top@a7c156de`, Protocol 1.0 eps `68..76`)
+
+All three frozen-backbone runs queued on Nov 14 finished cleanly with `status 0` (`--select-metric val_flow_loss`, `--val-every 500 --patience 5`, `physics` aug):
+
+| Run Tag                   | Backbone / Tap                | Batch / LR     | Best / Stop Step  | Wall Time | `val_flow_loss` | Full-30 RMSE |   Arm RMSE    |   Gripper   |      H1      | First-5 (Mean / Pooled) |
+| :------------------------ | :---------------------------- | :------------- | :---------------: | :-------: | :-------------: | :----------: | :-----------: | :---------: | :----------: | :---------------------: |
+| `c3_base_sort_cubes_10ep` | Frozen Cosmos 3 Edge (L20/28) | BS 16, `3e-4`  |  `5,500 / 8,000`  | `9,353s`  |    `0.0707`     |   `15.832`   |   `16.941°`   |   `8.304`   |   `5.907°`   |    `7.474° / 7.547°`    |
+| `c3_nano_l18_bs8_10ep`    | Frozen Cosmos 3 Nano (L18/36) | BS 8, `1.5e-4` | `9,000 / 11,500`  | `8,908s`  |    `0.0695`     |   `16.283`   |   `17.420°`   |   `8.575`   |   `6.134°`   |    `7.662° / 7.729°`    |
+| `c3_nano_l24_bs8_10ep`    | Frozen Cosmos 3 Nano (L24/36) | BS 8, `1.5e-4` | `10,000 / 12,500` | `10,770s` |  **`0.0662`**   | **`15.782`** | **`16.935°`** | **`7.779`** | **`5.688°`** |  **`7.305° / 7.380°`**  |
+
+Key takeaways:
+
+1. **Cosmos 3 Nano L24 beats both Nano L18 and frozen Edge 10ep** on every metric (`val_flow_loss 0.0662`, Gripper `7.779`, First-5 `7.305°`), showing deeper early-exit tap (L24/36 vs L18/36) gives materially stronger manipulation features.
+2. **Frozen BS 16 still trails BS 64 + Joint LoRA warm-start** (`c3_bs64_joint_lora_warmstart_fixed`: `Full-30 14.764`, `H1 4.230°`, `First-5 5.712°`), highlighting that larger effective batch size + joint backbone PEFT (LoRA/DoRA) remain the biggest levers for lowering RMSE.
+3. **Artifact preservation**: Recovered 3 untracked files from `abakus` (`scripts/video_vam/presets/c3_bs64_joint_lora_warmstart_fixed.args`, `scripts/video_vam/evaluate_smolvla_hub_models.py`, `scripts/video_vam/train_real_expo_warmstart.py`) into the local checkout.
+
+### 2. Reproducibility & Infra Sync (2026-11-24)
+
+- Synchronized `RUNPOD_API_KEY`, `RUNPOD_S3_*`, `HF_TOKEN`, and `WANDB_API_KEY` across Mac (`~/.env.ml`, `lerobot/.env`) and `abakus` (`~/.env.ml`, `lerobot-video-vam/.env`, `~/.netrc`).
+- Added mandatory post-experiment logging and numbered immutable launch scripts (`scripts/video_vam/experiments/expNNN_<slug>.sh`) to `AGENTS.md`, plus the short-term RunPod 5090 + Cosmos 3 / FLUX 3 vs. SmolVLA + EXPO-FT RL goal.

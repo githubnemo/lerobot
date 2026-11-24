@@ -44,7 +44,7 @@ pre-commit run --all-files                           # Lint + format (ruff, typo
 - **`.github/workflows/`** — CI: `quality.yml` (pre-commit), `fast_tests.yml` (one tier per extra, selected by pytest mark, every PR), `full_tests.yml` (all extras + E2E, GPU job runs `-m gpu`, post-approval), `latest_deps_tests.yml` (daily lockfile upgrade), `security.yml` (TruffleHog), `release.yml` (PyPI publish on tags).
 - **`docs/source/`** — HF documentation (`.mdx` files). Per-policy READMEs, hardware guides, tutorials. Built separately via `docs-requirements.txt` and CI workflows.
 - **`docs/video_vam_*.md`** — Video-VAM research (this fork). Start at `docs/video_vam_index.md`; current state in `docs/video_vam_status.md`, all numbers in `docs/video_vam_leaderboard.md`, chronological log in `docs/video_vam_research_diary.md`. Superseded docs in `docs/archive/`.
-- **`scripts/video_vam/`** — Video-VAM tooling. Launch experiments via `run_experiment.sh <preset>` (presets in `scripts/video_vam/presets/`); see `docs/video_vam_scripts.md`. Do not add new one-off `run_*.sh` wrappers; add a preset instead.
+- **`scripts/video_vam/`** — Video-VAM tooling. Launch experiments via numbered scripts in `scripts/video_vam/experiments/expNNN_<slug>.sh` (wrapping `run_experiment.sh <preset>`, presets in `scripts/video_vam/presets/`); see `docs/video_vam_scripts.md` and the Experiment Logging Protocol below.
 - **`examples/`** — End-user tutorials and scripts organized by use case (dataset creation, training, hardware setup).
 - **`docker/`** — Dockerfiles for user (`Dockerfile.user`) and CI (`Dockerfile.internal`).
 - **`benchmarks/`** — Performance benchmarking scripts.
@@ -111,6 +111,39 @@ If user prompt ends with:
   - Pass `--no-rpc` to run inference directly in-process on the local GPU without SSH tunnels or `rpc_server.py` (works inside `firejail` too).
   - For 30 Hz `Orellius/so101_sort_cubes_no_top` policies, always run with `--camera-fps 30 --fps 30` and an in-distribution start pose (`--home-pose -0.3 -86.7 88.2 71.1 -53.4 17.7`).
   - Keep checkpoint configs portable across `/home/anton` and `/home/nemo` (`_resolve_cosmos3_checkpoint_path` checks `~/.cache/video-vam/cosmos3-edge`, `$HF_HOME/hub`, `~/.cache/huggingface/hub`, and `~/.cache/pysandbox-lerobot/huggingface/hub`).
+
+---
+
+## Experiment Reproducibility & Logging Protocol (Mandatory)
+
+Every training, evaluation, or RL post-training experiment MUST leave a complete, reproducible trail before the task is considered finished:
+
+1. **Numbered, immutable experiment launch scripts (`scripts/video_vam/experiments/`)**:
+   - Store every launched experiment as a sequentially numbered script: `scripts/video_vam/experiments/expNNN_<slug>.sh` (e.g. `exp001_c3_edge_lora_bs64.sh`, `exp002_c3_nano_l24_lora.sh`, `exp003_flux3_dora_w1.sh`).
+   - Each script must pin: `RUN_TAG="expNNN_<slug>"`, exact preset / CLI arguments, dataset repo + `--dataset-revision` SHA, seed, and target trainer (`run_experiment.sh` or RL script).
+   - **Never overwrite or mutate a script after it has been executed.** To tweak hyperparameters, copy it to the next sequential number (`exp(N+1)_...`) so historical runs remain 100% reproducible.
+   - Never leave executed presets or experiment scripts untracked only on a remote host (`abakus` or RunPod); keep them in the repo.
+2. **Mandatory post-run log entries (no exceptions — including early-stopped or failed runs)**:
+   - **`docs/video_vam_leaderboard.md`**: Append a row with `expNNN`, date, model/recipe, dataset + revision, split, `val_flow_loss`, `Full-30`, `H1`, `First-5`, `Arm`, `Gripper`, commit SHA, artifact path / HF repo, and validity tag (`VALID` / `NON-COMPARABLE` / `FAILED`).
+   - **`docs/video_vam_status.md`**: Update current best results, active/completed queue status, and checkpoint locations (local / `abakus` / HF Hub).
+   - **`docs/video_vam_research_diary.md`**: Add a short entry capturing hypothesis, exact launch script (`expNNN`), observed metrics, and next decision.
+3. **Checkpoint portability (RunPod / `abakus` / `sahni` / Mac)**:
+   - Never hardcode `/home/anton/...` in new presets or `expNNN` scripts; resolve model caches via `${VAM_CACHE_DIR:-$HOME/.cache/video-vam}` and compute/save normalizers inside the run output dir when training on a new dataset.
+   - Push candidate checkpoints intended for live robot testing or cross-host RL post-training to Hugging Face Hub (`Orellius/...`) and record the HF repo ID in the leaderboard.
+
+---
+
+## Short-Term Goal (2026-11-24, Anton — Active Sprint)
+
+_(Additive to the long-term Video-VAM & SO-101 goals below; do not remove existing goals.)_
+
+1. **Benchmark Cosmos 3 (Edge & Nano) and FLUX 3 Action vs. SmolVLA**:
+   - Train and evaluate **Cosmos 3 Edge**, **Cosmos 3 Nano**, and **FLUX 3 Action** against **SmolVLA** on identical held-out splits to verify whether stronger video pretraining + temporal context beats SmolVLA in practice.
+   - Use rented **RunPod GPUs (e.g., RTX 5090 32 GB)** while `abakus` is busy to run fast training sweeps and drive validation loss & First-5 RMSE as low as possible.
+2. **Verify Validation Loss ↔ Downstream Performance Correlation**:
+   - Track consistent offline validation metrics (`val_flow_loss`, `First-5`, `H1`, `Full-30`, `Gripper`) and test top models **live on the physical SO-101 robot** and on a **new dataset** to verify offline-to-physical correlation.
+3. **Reinforcement Learning Post-Training (`EXPO-FT` + Score Centering)**:
+   - Fine-tune the best pretrained/SFT video-backbone policy with our existing **EXPO-FT + Dr. GRPO / Marek Score-Centered RL** pipeline to demonstrate a policy that measurably improves over its base checkpoint.
 
 ---
 

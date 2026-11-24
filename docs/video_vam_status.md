@@ -1,24 +1,43 @@
 # Video-VAM status
 
-**Last updated:** 2026-11-14. Supersedes `archive/video_vam_roadmap.md`, `archive/video_vam_technical_report.md`, `archive/EXPERIMENTS_OVERVIEW.md` and `archive/video_vam_execution_plan.md`.
+**Last updated:** 2026-11-24. Supersedes `archive/video_vam_roadmap.md`, `archive/video_vam_technical_report.md`, `archive/EXPERIMENTS_OVERVIEW.md` and `archive/video_vam_execution_plan.md`.
 Numbers here are summaries; the [leaderboard](./video_vam_leaderboard.md) is authoritative.
 
-## 0b. Current Training & Rollout Status (2026-11-14)
+## 0c. Short-Term Goal (2026-11-24, Anton — additive to §0 & §0a)
 
-- **Active `abakus` training queue (`tmux` session `vam_queue`)** on `Orellius/so101_sort_cubes_no_top@a7c156de` (eps `0..67` train / `68..76` val, `30 Hz`, `physics` aug, `--select-metric val_flow_loss`, `--val-every 500 --patience 5` = `2,500`-step early stopping):
-  1. **`c3_base_sort_cubes_10ep` (running now)**: Frozen `Cosmos3-Edge` (L20/28, `600×2048`), `BS=16`, `grad_accum=1`, `lr=3e-4`, max `29,080` steps (`10` epochs). Progressed cleanly past step `1,840/29,080` (~`12.8 GiB` VRAM); evals so far: `@500` `val_flow_loss=0.1217` (`RMSE 19.41`, `H1 11.59°`, `F5 12.37°`) → `@1000` `0.1040` (`18.64`, `9.32°`, `10.11°`) → `@1500` `0.0871` (`17.71`, `7.83°`, `9.55°`).
-  2. **`c3_nano_l18_bs8_10ep` (queued next)**: Frozen `Cosmos3-Nano` early-exit (`L18/36`, `4096-dim`), `BS=8`, `grad_accum=1`, `lr=1.5e-4`, max `58,160` steps (`12.83 GB` peak VRAM verified on RTX 4090).
-  3. **`c3_nano_l24_bs8_10ep` (queued third)**: Frozen `Cosmos3-Nano` early-exit (`L24/36`, `4096-dim`), `BS=8`, `grad_accum=1`, `lr=1.5e-4`, max `58,160` steps (`14.44 GB` peak VRAM verified on RTX 4090).
-- **Completed recent runs on `abakus` (`2026-11-13` – `2026-11-14`)**:
-  - **`c3_bs64_joint_lora_warmstart_fixed`** (best @ step `400/589`, wall-clock cap `2400s`): **`Full-30 14.764`**, Arm `15.725°`, Grip `8.453`, **`H1 4.230°`**, **`First-5 5.712°`** (`5.794°` pooled), `val_flow_loss=0.0746` (@ `589`).
+1. **Head-to-head backbone evaluation (low validation loss + live & new-dataset test)**:
+   - Train and evaluate **Cosmos 3 Edge**, **Cosmos 3 Nano**, and **FLUX 3 Action** against **SmolVLA** on the exact same held-out splits (both `Orellius/so101_sort_cubes_no_top` and a new dataset), verifying whether stronger video pretraining + temporal context outperforms SmolVLA.
+   - Drive down validation loss / First-5 RMSE on a rented **RunPod RTX 5090 (32 GB)** while `abakus` is busy, then test the best policy live on the physical SO-101 arm.
+2. **Validate offline-to-online correlation**:
+   - Confirm how strongly offline `val_flow_loss` and `First-5 / H1 RMSE` predict actual downstream closed-loop performance across backbones.
+3. **RL post-training that measurably improves the policy**:
+   - Apply our existing **EXPO-FT + Score Centering (Dr. GRPO / Marek)** RL pipeline on top of the best pretrained/fine-tuned policy to demonstrate reliable real/closed-loop policy improvement.
+4. **Strict experiment reproducibility**:
+   - Every new run gets a preserved, sequentially numbered launch script in `scripts/video_vam/experiments/expNNN_<slug>.sh` and a mandatory post-run entry in `docs/video_vam_leaderboard.md`, `docs/video_vam_status.md`, and `docs/video_vam_research_diary.md`.
+
+## 0b. Current Training & Rollout Status (2026-11-24)
+
+- **Completed `abakus` training queue (`2026-11-14`)** on `Orellius/so101_sort_cubes_no_top@a7c156de` (eps `0..67` train / `68..76` val, `30 Hz`, `physics` aug, `--select-metric val_flow_loss`, `--val-every 500 --patience 5` = `2,500`-step early stopping):
+  1. **`c3_base_sort_cubes_10ep` (completed, best @ `5,500/8,000`, `9,353s`)**: Frozen `Cosmos3-Edge` (L20/28, `600×2048`), `BS=16`, `lr=3e-4`. **`val_flow_loss=0.0707`**, `Full-30 15.832`, Arm `16.941°`, Grip `8.304`, `H1 5.907°`, `First-5 7.474°` (`7.547°` pooled).
+  2. **`c3_nano_l18_bs8_10ep` (completed, best @ `9,000/11,500`, `8,908s`)**: Frozen `Cosmos3-Nano` early-exit (`L18/36`, `4096-dim`), `BS=8`, `lr=1.5e-4`. **`val_flow_loss=0.0695`**, `Full-30 16.283`, Arm `17.420°`, Grip `8.575`, `H1 6.134°`, `First-5 7.662°` (`7.729°` pooled).
+  3. **`c3_nano_l24_bs8_10ep` (completed, best @ `10,000/12,500`, `10,770s`)**: Frozen `Cosmos3-Nano` early-exit (`L24/36`, `4096-dim`), `BS=8`, `lr=1.5e-4`. **`val_flow_loss=0.0662`** (lowest of the queue), **`Full-30 15.782`**, Arm `16.935°`, **Grip `7.779`**, `H1 5.688°`, `First-5 7.305°` (`7.380°` pooled). Outperformed both frozen Edge 10ep and Nano L18 across every metric.
+- **Checkpoint hosting status**:
+  - Pushed to Hugging Face Hub (`2026-11-24`):
+    - `c3_bs64_joint_lora_warmstart_fixed` → [`Orellius/so101_sort_cubes_no_top_cosmos3_edge_bs64_joint_lora_fixed`](https://huggingface.co/Orellius/so101_sort_cubes_no_top_cosmos3_edge_bs64_joint_lora_fixed)
+    - `c3_nano_l24_bs8_10ep` → [`Orellius/so101_sort_cubes_no_top_cosmos3_nano_l24_bs8_10ep`](https://huggingface.co/Orellius/so101_sort_cubes_no_top_cosmos3_nano_l24_bs8_10ep)
+  - All Nov 13–14 runs also remain archived on `abakus` (`outputs/train/` symlinked to `/mnt/archive/anton/nvme_archive/lerobot-video-vam/outputs/train/`).
+- **Compute status (`2026-11-24`)**: `abakus` RTX 4090 is occupied by `v132_flagship` (`~/lerobot` on `feat/rl-test-anon`). Next Video-VAM / FLUX 3 / RL training sweeps will run on a rented **RunPod RTX 5090** (`RUNPOD_API_KEY`, `HF_TOKEN`, `WANDB_API_KEY` synced to `~/.env.ml` and `.env` on Mac and `abakus`).
+- **Earlier completed runs on `abakus` (`2026-11-13` – `2026-11-14`)**:
+  - **`c3_bs64_joint_lora_warmstart_fixed`** (best @ step `400/589`, wall-clock cap `2400s`): **`Full-30 14.764`**, Arm `15.725°`, Grip `8.453`, **`H1 4.230°`**, **`First-5 5.712°`** (`5.794°` pooled), `val_flow_loss=0.0746` (@ `589`). Preset recovered into `scripts/video_vam/presets/c3_bs64_joint_lora_warmstart_fixed.args`.
   - **`c3_base_sort_cubes_1ep`** (best @ step `2,908/2,908`): `Full-30 15.642`, Arm `16.743°`, Grip `8.143`, `H1 5.391°`, `First-5 7.141°` (`7.232°` pooled), `val_flow_loss=0.0588`.
   - **`c3_base_sort_cubes_cont10ep`**: warm-starting from the 1-ep checkpoint without optimizer state at `lr=1.5e-4` perturbed weights and early-stopped at step `2,000` (best step `0` at `0.0588`, regressed to `0.0667` / `RMSE 15.813` / `F5 7.528°`), motivating the fresh `c3_base_sort_cubes_10ep` run.
   - **`c3_nano_sort_cubes_2ep`** (`BS=1`, `L18/36`): early-stopped at step `18,000` due to `BS=1` update noise (best `val_flow_loss=0.0784` @ step `10,000`: `RMSE 17.886`, `H1 7.758°`, `F5 9.719°`; at step `18,000`: `val_flow_loss=0.0789`, `RMSE 17.445`, `H1 6.113°`, `F5 7.905°`), motivating the `BS=8` `L18`/`L24` queue above.
 - **Physical SO-101 (`sahni`) rollout findings (`--debug-dir`, `da0f26ac`)**:
   - `c3_base_sort_cubes_1ep` was undertrained (produced `-10°` `elbow_flex` jump at `t=0` even on held-out ep `68`).
-  - `c3_bs64_joint_lora_warmstart_fixed` grasped the cube on `sahni`, but running with `--euler-steps 3` caps RTC `max_guidance_weight` at `0.90` (`smol_expert.py:975`), causing a 2-chunk ping-pong oscillation (`-2° <-> -65°`) with `blend_len=6` after RPC latency spikes. Next physical eval should run **without `--euler-steps 3`** (default `10` Euler steps, `max_guidance_weight=2.0`), and use `--no-rpc` on `sahni` while `vam_queue` uses `abakus`.
-- **Open infra / eval observation**:
-  - `val_flow_loss` currently samples random flow timesteps per validation pass, adding variance to early stopping (`--select-metric val_flow_loss`); making validation flow timesteps deterministic/seeded is a planned cleanup.
+  - `c3_bs64_joint_lora_warmstart_fixed` grasped the cube on `sahni`, but running with `--euler-steps 3` caps RTC `max_guidance_weight` at `0.90` (`smol_expert.py:975`), causing a 2-chunk ping-pong oscillation (`-2° <-> -65°`) with `blend_len=6` after RPC latency spikes. Next physical eval should run **without `--euler-steps 3`** (default `10` Euler steps, `max_guidance_weight=2.0`), and use `--no-rpc` on `sahni` when remote GPU is busy.
+- **Open infra / eval observations**:
+  - `evaluate_validation` (`train_smolexpert.py:1440-1465`) already seeds `(noise, epsilon, t)` deterministically per sample via `stable_sample_seed`, but evaluates only **1 flow timestep `t` per anchor** (a multi-point stratified `t` grid reduces `val_flow_loss` variance further; also note `val_flow_loss` is only comparable within the same normalizer/policy family, whereas physical-unit `First-5` / `H1` / `Full-30` RMSE compares across Cosmos 3, FLUX 3, and SmolVLA).
+  - Existing Cosmos 3 presets (`c3_base_sort_cubes_10ep.args`, `c3_nano_*`) hardcode `/home/anton/.cache/video-vam/...` and a pre-existing `normalizer.safetensors` path; portable RunPod/new-dataset presets must resolve `${HOME}/.cache/video-vam/...` and auto-compute normalizers from the training split.
   - `nvidia/Cosmos3-Nano` (`30 GB`) is downloaded on `abakus` (`/home/anton/.cache/video-vam/cosmos3-nano`) with early-exit support (`0be33847`) and `transformers==5.5.4` lazy-import fixes (`55b7ea5c`, `bd5757d3`).
 
 ## 0a. Todo List with Nemo (2026-10-31)
@@ -67,21 +86,21 @@ Frozen or video-LoRA-adapted video DiT features (Cosmos-Predict2-2B, Cosmos 3 Ed
 
 ## 2. Datasets
 
-| Name               | Repo @ revision                                     | Episodes / frames                                               | Status                                                                                                                                                                                                                                                              |
-| :----------------- | :-------------------------------------------------- | :-------------------------------------------------------------- | :------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| **v1** (canonical) | `hubnemo/cube_out_of_box_dataset` @ `243370c3…`     | 40 / 6,536 @ 10 fps                                             | Protocol 1.0: train 0–31, val 32–39 (88 anchors, stride 20)                                                                                                                                                                                                         |
-| **v2 / Scale-100** | `Orellius/cube_out_of_box_v2` @ `5d0325cc…`         | metadata says 100 / 12,163; files contain 140 eps / 15,998 rows | **Integrity unresolved.** The 09-08 quarantine was never formally lifted, but all Scale-100 and Phase 6 runs used this snapshot (train 0–31 + 40–89, Eval-1 32–39, Eval-2 90–99). Treat Scale-100 numbers as provisional until the extra 40 episodes are explained. |
-| **sort-cubes**     | `Orellius/so101_sort_cubes_no_top` @ `a7c156de…` | 77 eps / 54,777 frames @ 30 fps | Train 0–67, held-out 68–76 (405 anchors, stride 20). Different task and dataset: **not comparable** to cube numbers. Runs before 09-24 did not pin a revision; the trainer now requires `--dataset-revision`. |
+| Name               | Repo @ revision                                  | Episodes / frames                                               | Status                                                                                                                                                                                                                                                              |
+| :----------------- | :----------------------------------------------- | :-------------------------------------------------------------- | :------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| **v1** (canonical) | `hubnemo/cube_out_of_box_dataset` @ `243370c3…`  | 40 / 6,536 @ 10 fps                                             | Protocol 1.0: train 0–31, val 32–39 (88 anchors, stride 20)                                                                                                                                                                                                         |
+| **v2 / Scale-100** | `Orellius/cube_out_of_box_v2` @ `5d0325cc…`      | metadata says 100 / 12,163; files contain 140 eps / 15,998 rows | **Integrity unresolved.** The 09-08 quarantine was never formally lifted, but all Scale-100 and Phase 6 runs used this snapshot (train 0–31 + 40–89, Eval-1 32–39, Eval-2 90–99). Treat Scale-100 numbers as provisional until the extra 40 episodes are explained. |
+| **sort-cubes**     | `Orellius/so101_sort_cubes_no_top` @ `a7c156de…` | 77 eps / 54,777 frames @ 30 fps                                 | Train 0–67, held-out 68–76 (405 anchors, stride 20). Different task and dataset: **not comparable** to cube numbers. Runs before 09-24 did not pin a revision; the trainer now requires `--dataset-revision`.                                                       |
 
 Dataset shift inside v1: early vs late episodes differ strongly in joint posture and pace (two recording sessions/operators or a recalibration; the exact cause and changepoint, ~ep 20 vs ~ep 24, are **not established**). Val 32–39 lies entirely in the late regime, so v1 validation measures cross-session generalization.
 
 ## 3. Current best results (single seed, see leaderboard for full list)
 
-| Benchmark                                   | Best VAM / WAM                                                                                                                                    | SmolVLA                                    | Trivial                                      |
-| :------------------------------------------ | :------------------------------------------------------------------------------------------------------------------------------------------------ | :----------------------------------------- | :------------------------------------------- |
-| v1 Protocol 1.0 (32→8 eps)                  | 13.06 Cosmos-2B video-LoRA T=16 pool2 (~1.2 s); 13.48 T=2 distilled re-train (~204 ms); **13.63** Cosmos 3 Edge PEFT LoRA (~80 ms); 15.74 FLUX 3 Action LoRA (~1.0 s) | 14.83 (1 h)                                | command-repeat 18.19; state-repeat 18.86     |
-| Scale-100 Eval-1 / Eval-2 (provisional, §2) | 13.49 / 17.20 Cosmos 3 Edge video-LoRA                                                                                                            | — (v2 SmolVLA not scored on this protocol) | —                                            |
-| sort-cubes held-out 68–76                   | **14.20** FLUX 3 Action LoRA (~1.84 s unmerged / ~1.26 s base); **14.81** Cosmos 3 Edge BS 64 (`H1 = 4.31°`, `F5 = 5.79°`, ~80 ms); 15.45 BS 8; 15.54 Cosmos 3 Edge PEFT LoRA | 16.96 (`1.0 s` horizon, `H1 = 6.09°`, `F5 @ 10Hz = 11.51°`, ~215 ms) | command-repeat 19.69; state-repeat 22.38     |
+| Benchmark                                   | Best VAM / WAM                                                                                                                                                                | SmolVLA                                                              | Trivial                                  |
+| :------------------------------------------ | :---------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | :------------------------------------------------------------------- | :--------------------------------------- |
+| v1 Protocol 1.0 (32→8 eps)                  | 13.06 Cosmos-2B video-LoRA T=16 pool2 (~1.2 s); 13.48 T=2 distilled re-train (~204 ms); **13.63** Cosmos 3 Edge PEFT LoRA (~80 ms); 15.74 FLUX 3 Action LoRA (~1.0 s)         | 14.83 (1 h)                                                          | command-repeat 18.19; state-repeat 18.86 |
+| Scale-100 Eval-1 / Eval-2 (provisional, §2) | 13.49 / 17.20 Cosmos 3 Edge video-LoRA                                                                                                                                        | — (v2 SmolVLA not scored on this protocol)                           | —                                        |
+| sort-cubes held-out 68–76                   | **14.20** FLUX 3 Action LoRA (~1.84 s unmerged / ~1.26 s base); **14.81** Cosmos 3 Edge BS 64 (`H1 = 4.31°`, `F5 = 5.79°`, ~80 ms); 15.45 BS 8; 15.54 Cosmos 3 Edge PEFT LoRA | 16.96 (`1.0 s` horizon, `H1 = 6.09°`, `F5 @ 10Hz = 11.51°`, ~215 ms) | command-repeat 19.69; state-repeat 22.38 |
 
 Caveats that apply to every row: single seed; no confidence interval; 0.1–0.8 differences are likely within noise; full-30 RMSE is dominated by far-horizon error that RTC never executes; the T=2 undistilled and distilled heads were re-trained on 09-09 (13.65 / 13.48 — the gap shrank from 0.59 to 0.16); only the teacher-reference head is still missing.
 

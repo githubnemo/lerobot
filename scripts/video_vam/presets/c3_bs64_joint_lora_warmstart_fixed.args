@@ -1,0 +1,24 @@
+# Corrected Cosmos 3 Edge joint GEN-LoRA + SmolExpert warm-start from bs64 with physics photometric/shadow aug (~40m).
+#! include: _cosmos3_edge
+#! include: _sort_cubes
+--dataset-revision a7c156de0e84a81e19457e6d783e4316e9f901e1
+--model-checkpoint outputs/train/sort-cubes-cosmos3-edge-optimized-bs64/best.safetensors
+--normalizer-path outputs/train/sort-cubes-cosmos3-edge-optimized-bs64/normalizer.safetensors
+--train-backbone-lora
+--backbone-lora-pathway gen_only
+--backbone-grad-checkpointing
+--backbone-lora-lr 5e-5
+--lr 5e-5
+--batch-size 16
+--grad-accum-steps 2
+--warmup-steps 100
+--val-every 200
+--patience 15
+--min-steps 0
+--max-steps 5000
+--num-steps 3
+--augment
+--aug-strategy physics
+--no-spatial-crop
+--max-train-seconds 2400
+--no-wandb
