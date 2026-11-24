@@ -29,7 +29,7 @@ API_URL = "https://api.runpod.io/graphql"
 USER_AGENT = "lerobot-runpod-provisioner/1.0"
 DEFAULT_GPU = "NVIDIA GeForce RTX 5090"
 # Blackwell (sm_120) requires PyTorch built with CUDA 12.8+
-DEFAULT_IMAGE = "runpod/pytorch:2.8.0-py3.12-cuda12.8.1-cudnn-devel-ubuntu22.04"
+DEFAULT_IMAGE = "runpod/pytorch:1.0.2-cu1281-torch280-ubuntu2404"
 DEFAULT_VOLUME_NAME = "lerobot-vam-vol"
 DEFAULT_VOLUME_SIZE_GB = 200
 DEFAULT_CONTAINER_DISK_GB = 50
