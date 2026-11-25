@@ -3870,9 +3870,17 @@ def main(argv: list[str] | None = None) -> int:
         trained_bb_lora = args.output_dir / "best_backbone_lora.safetensors"
         if not trained_bb_lora.is_file():
             trained_bb_lora = args.output_dir / "last_backbone_lora.safetensors"
+        if not backbone_trainable_params and args.backbone_lora_weights:
+            src_lora = Path(args.backbone_lora_weights).expanduser().resolve()
+            if src_lora.is_file() and not trained_bb_lora.is_file():
+                import shutil
+
+                dst_lora = args.output_dir / "best_backbone_lora.safetensors"
+                shutil.copy2(src_lora, dst_lora)
+                trained_bb_lora = dst_lora
         resolved_lora_weights = (
             str(trained_bb_lora)
-            if (backbone_trainable_params and trained_bb_lora.is_file())
+            if trained_bb_lora.is_file()
             else (str(args.backbone_lora_weights) if args.backbone_lora_weights else None)
         )
         resolved_cfg_fps = (

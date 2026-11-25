@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
 import random
 import sys
 import time
@@ -41,10 +42,11 @@ except ModuleNotFoundError:
         sys.path.insert(0, repo_root)
     from scripts.video_vam.smoke_test_cosmos_extractor import _relative_index
 
-DEFAULT_CHECKPOINT_DIR = Path("/home/anton/.cache/video-vam/cosmos3-edge")
-DEFAULT_DATASET_ROOT = Path("/home/anton/.cache/video-vam/cube-out-of-box-dataset")
-DEFAULT_OUTPUT_DIR = Path("/home/anton/.cache/video-vam/runs/cosmos3-edge-video-lora-20260903")
-DEFAULT_CACHE_DIR = Path("/home/anton/.cache/video-vam/cosmos3-edge-latents-cache")
+_VAM_CACHE_DIR = Path(os.environ.get("VAM_CACHE_DIR", str(Path.home() / ".cache/video-vam")))
+DEFAULT_CHECKPOINT_DIR = _VAM_CACHE_DIR / "cosmos3-edge"
+DEFAULT_DATASET_ROOT = _VAM_CACHE_DIR / "cube-out-of-box-dataset"
+DEFAULT_OUTPUT_DIR = _VAM_CACHE_DIR / "runs/cosmos3-edge-video-lora"
+DEFAULT_CACHE_DIR = _VAM_CACHE_DIR / "cosmos3-edge-latents-cache"
 
 
 def parse_args() -> argparse.Namespace:
@@ -234,7 +236,7 @@ def main() -> int:
         root=str(args.dataset_root) if args.dataset_root else None,
         revision=args.dataset_revision,
         return_uint8=True,
-        download_videos=False,
+        download_videos=args.dataset_root is None,
     )
     video_fps = float(dataset.meta.fps) / args.frame_step
     print(f"Dataset fps {dataset.meta.fps}, frame step {args.frame_step} -> model video fps {video_fps:g}")

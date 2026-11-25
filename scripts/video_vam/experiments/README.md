@@ -30,11 +30,15 @@ bash scripts/video_vam/run_experiment.sh <preset> \
 
 ## Index
 
-| ID       | Script                                       | Backbone / Method                                         | Dataset Split                            | Auto HF Repo                                             |
-| :------- | :------------------------------------------- | :-------------------------------------------------------- | :--------------------------------------- | :------------------------------------------------------- |
-| `exp001` | `exp001_c3_edge_joint_lora_bs64.sh`          | Cosmos 3 Edge (L20) + Joint LoRA (`gen_only`), BS 64      | `sort_cubes@a7c156de` (`0:68` / `68:77`) | `Orellius/so101_exp001_c3_edge_joint_lora_bs64`          |
-| `exp002` | `exp002_c3_nano_l24_joint_lora_bs32.sh`      | Cosmos 3 Nano (L24/36) + Joint LoRA (`gen_only`), BS 32   | `sort_cubes@a7c156de` (`0:68` / `68:77`) | `Orellius/so101_exp002_c3_nano_l24_joint_lora_bs32`      |
-| `exp003` | `exp003_c3_nano_l24_joint_dora_bs32.sh`      | Cosmos 3 Nano (L24/36) + Joint DoRA (`gen_only`), BS 32   | `sort_cubes@a7c156de` (`0:68` / `68:77`) | `Orellius/so101_exp003_c3_nano_l24_joint_dora_bs32`      |
-| `exp004` | `exp004_flux3_sort_cubes_lora_w1.sh`         | FLUX 3 Action SO-101 LoRA (W1 duplicated wrist) + P1 eval | `sort_cubes@a7c156de` (`0:68` / `68:77`) | `Orellius/so101_exp004_flux3_sort_cubes_lora_w1`         |
-| `exp005` | `exp005_flux3_sort_cubes_dora_w1.sh`         | FLUX 3 Action SO-101 DoRA (W1 duplicated wrist) + P1 eval | `sort_cubes@a7c156de` (`0:68` / `68:77`) | `Orellius/so101_exp005_flux3_sort_cubes_dora_w1`         |
-| `exp006` | `exp006_smolvla_sort_cubes_clean_heldout.sh` | SmolVLA 450M clean held-out baseline (50k steps, BS 32)   | `sort_cubes@a7c156de` (`0:68` / `68:77`) | `Orellius/so101_exp006_smolvla_sort_cubes_clean_heldout` |
+| ID       | Script                                             | Backbone / Method                                         | Dataset Split                            | Auto HF Repo                                                   |
+| :------- | :------------------------------------------------- | :-------------------------------------------------------- | :--------------------------------------- | :------------------------------------------------------------- |
+| `exp001` | `exp001_c3_edge_joint_lora_bs64.sh`                | Cosmos 3 Edge (L20) + Joint LoRA (`gen_only`), BS 64      | `sort_cubes@a7c156de` (`0:68` / `68:77`) | `Orellius/so101_exp001_c3_edge_joint_lora_bs64`                |
+| `exp002` | `exp002_c3_nano_l24_joint_lora_bs32.sh`            | Cosmos 3 Nano (L24/36) + Joint LoRA (`gen_only`), BS 32   | `sort_cubes@a7c156de` (`0:68` / `68:77`) | `Orellius/so101_exp002_c3_nano_l24_joint_lora_bs32`            |
+| `exp003` | `exp003_c3_nano_l24_joint_dora_bs32.sh`            | Cosmos 3 Nano (L24/36) + Joint DoRA (`gen_only`), BS 32   | `sort_cubes@a7c156de` (`0:68` / `68:77`) | `Orellius/so101_exp003_c3_nano_l24_joint_dora_bs32`            |
+| `exp004` | `exp004_flux3_sort_cubes_lora_w1.sh`               | FLUX 3 Action SO-101 LoRA (W1 duplicated wrist) + P1 eval | `sort_cubes@a7c156de` (`0:68` / `68:77`) | `Orellius/so101_exp004_flux3_sort_cubes_lora_w1`               |
+| `exp005` | `exp005_flux3_sort_cubes_dora_w1.sh`               | FLUX 3 Action SO-101 DoRA (W1 duplicated wrist) + P1 eval | `sort_cubes@a7c156de` (`0:68` / `68:77`) | `Orellius/so101_exp005_flux3_sort_cubes_dora_w1`               |
+| `exp006` | `exp006_smolvla_sort_cubes_clean_heldout.sh`       | SmolVLA 450M clean held-out baseline (50k steps, BS 32)   | `sort_cubes@a7c156de` (`0:68` / `68:77`) | `Orellius/so101_exp006_smolvla_sort_cubes_clean_heldout`       |
+| `exp007` | `exp007_c3_edge_direct_action_lora_3500.sh`        | Cosmos 3 Edge (L20, 8GB-fit) Direct 1-Stage Action-LoRA   | `sort_cubes@a7c156de` (`0:68` / `68:77`) | `Orellius/so101_exp007_c3_edge_direct_action_lora_3500`        |
+| `exp008` | `exp008_c3_edge_video_pred_lora.sh`                | Cosmos 3 Edge Stage 1 Video-Prediction LoRA (`gen_only`)  | `sort_cubes@a7c156de` (`0:68` / `68:77`) | _(Stage 1 adapter for `exp009` / `exp010`)_                    |
+| `exp009` | `exp009_c3_edge_vidlora_then_frozen_action.sh`     | Cosmos 3 Edge `exp008` Video-LoRA (frozen) -> SmolExpert  | `sort_cubes@a7c156de` (`0:68` / `68:77`) | `Orellius/so101_exp009_c3_edge_vidlora_then_frozen_action`     |
+| `exp010` | `exp010_c3_edge_vidlora_then_joint_action_lora.sh` | Cosmos 3 Edge `exp008` Video-LoRA -> Joint Action-LoRA    | `sort_cubes@a7c156de` (`0:68` / `68:77`) | `Orellius/so101_exp010_c3_edge_vidlora_then_joint_action_lora` |
