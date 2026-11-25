@@ -2261,3 +2261,20 @@ Key takeaways:
   - **Key finding**: Stratified `val_flow_loss` reached its minimum early at step `1,250` (`0.0707`, `Full-30 15.472`, `H1 6.034°`, `F5 7.104°`), then slowly rose (`0.0782` @ `3,250`) while action-space RMSE **kept improving dramatically**: `@2250` `H1=4.397° / F5=5.968°`, `@2750` `Full-30=15.151 / Grip=7.768`, `@3250` `Full-30=15.047 / Arm=16.105° / Grip=7.846 / H1=4.630° / F5=6.072°`.
   - Uploaded both `best` (`@1250`) and `last` (`@3250`) to `Orellius/so101_exp001_c3_edge_joint_lora_bs64`.
 - **Next decision**: Added `--select-metric val_first5` (`51b8b0cbe`) and launched `exp002_c3_nano_l24_joint_lora_bs32.sh` (Cosmos 3 Nano L24/36 Joint LoRA, 3,500-step cosine schedule so LR decays cleanly to 0) on the Blackwell pod.
+
+---
+
+## 2026-11-25 (Morning) — Overnight `exp002` Cosmos 3 Nano L24 Joint LoRA Sets All-Time Record & Pod Auto-Shutdown
+
+- **Pod status**: `sfijmgdsbo1wgi` (`RTX PRO 6000 Blackwell 96 GB`, `EU-NL-1`) automatically stopped cleanly via its `EXIT` trap (`status=EXITED`, current spend `$0.052/hr` storage only; 200 GB Network Volume `fbqcvkw7so` preserved).
+- **`exp002_c3_nano_l24_joint_lora_bs32` (`51b8b0cb`, `13,863s` / `3h 51m`)**:
+  - Trained 100% from scratch (`Cosmos 3 Nano` early-exit `L24/36`, `4096-dim` + `gen_only` LoRA `r=16, α=32` + `SmolExpert`, `BS 32`, `3,500`-step cosine LR decay, `physics` aug, `--select-metric val_first5`, `--val-flow-num-t 4`).
+  - Improved monotonically all the way to step `3,500/3,500`:
+    - `@1000`: `flow=0.0765 | Full-30=16.064 | H1=7.165° | F5=8.100°`
+    - `@1750`: `flow=0.0670 | Full-30=15.174 | H1=5.026° | F5=6.516°`
+    - `@2250`: **`flow=0.0624`** (all-time low) | `Full-30=14.838 | H1=4.351° | F5=5.855°`
+    - `@3000`: `flow=0.0655 | Full-30=14.794 | H1=4.105° | F5=5.571° | Grip=7.777`
+    - **`@3500` (best)**: **`Full-30=14.565 | Arm=15.581° | Grip=7.684 | H1=4.089° | First-5=5.497° (5.576° pooled) | flow=0.0661`**
+  - **Uploaded to HF Hub (`best` + `last`)**: `Orellius/so101_exp002_c3_nano_l24_joint_lora_bs32`.
+  - Decisively beats both `exp001` Cosmos 3 Edge LoRA (`15.047 / 4.63° / 6.07° / 7.85`) and clean matched SmolVLA (`H1 6.09°`, `F5 @ 10Hz 11.51°`, `1.0s 16.96°`).
+- **Overnight follow-ups (`exp004` FLUX 3 Action & `exp006` SmolVLA)**: Did not appear on HF Hub before pod shutdown — logs remain preserved on `/workspace/lerobot/outputs/logs/overnight_queue.log` on `fbqcvkw7so` to inspect when the pod is next resumed.
