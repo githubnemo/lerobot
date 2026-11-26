@@ -2293,3 +2293,18 @@ Key takeaways:
   2. **Unfreezing the video-LoRA during action fine-tuning is essential**: keeping it frozen (`exp009`) loses `+0.55° H1` and `+0.58° First-5` vs `exp010`.
   3. **Short-horizon vs. far-horizon tradeoff**: `exp010` wins short-horizon closed-loop control (`H1 -0.24°`, `First-5 -0.16°`), while `exp007` wins far-horizon 1.0s `Full-30` (`14.577` vs `15.163`) and stays slightly less overfit in `val_flow_loss` (`0.0741` vs `0.0818`).
 - **Next decision**: Physically A/B test **`exp010`** vs **`exp007`** locally (`--no-rpc`, default 10 Euler steps, `--camera-fps 30 --fps 30`) on `sahni`'s 8 GB RTX 3050 to see whether lower `H1/First-5` (`exp010`) or lower `Full-30` (`exp007`) translates into higher live pick-and-place success, then run EXPO-FT RL post-training on the winner!
+
+---
+
+## 2026-11-26 (Afternoon) — Negative Results: `Policy-DROID` Transfer (`exp011`) & 60B `Cosmos3-Super` 4-Bit NF4 QLoRA (`exp013`)
+
+- **Engineering shipped (`c87b208d`)**: Added streaming `meta`-device `und`-pathway pruning + `bitsandbytes` 4-bit NF4 QLoRA (`--backbone-quantize nf4`) and `cosmos3_super` (`64L`, `5120-dim`) support to `src/lerobot/policies/vam/cosmos3_features.py`, `configuration_video_vam.py`, `modeling_video_vam.py`, and `scripts/video_vam/train_smolexpert.py`.
+  - Verified on `abakus` RTX 4090 (`Cosmos3-Edge` NF4 = `895 MB` VRAM, `grad_ok=True`) and RunPod Blackwell 96 GB (**60B `Cosmos3-Super` `L42/64` NF4 = `11.26 GB` VRAM**, `90.6 ms` B=1 @ `240×320`, `14.37 GB` peak B=16 fwd+bwd — fits 24 GB RTX 4090 RPC!).
+- **Early-stopped training results (both clearly behind bf16 vanilla Cosmos 3 Edge/Nano)**:
+  1. **`exp011_c3_edge_policy_droid_joint_lora.sh`** (`nvidia/Cosmos3-Edge-Policy-DROID`, `abakus` RTX 4090, stopped @ `1,100/3,500`):
+     - `@250`: `Full-30 19.00 | H1 8.48° | F5 10.65°` → `@1000`: `Full-30 17.14 | H1 6.95° | F5 8.46° | val_flow 0.0726`.
+     - Trailed matched vanilla `Cosmos3-Edge` (`exp007` `@1000`: `15.56 / 5.64° / 7.12°`) by **`+1.58°` Full-30 / `+1.35°` F5**. DROID's 5 Hz multi-view Franka policy post-training narrowed visual features away from wrist-only SO-101. Stopped to free `abakus`; `exp012` (`Nano-Policy-DROID`) skipped.
+  2. **`exp013_c3_super_l42_nf4_qlora.sh`** (`nvidia/Cosmos3-Super` 60B `L42/64` 4-bit NF4 QLoRA, RunPod Blackwell `ewg51opg4zywzi`, stopped @ `760/3,500`):
+     - `@250`: `Full-30 29.09 | H1 26.46° | F5 26.89°` → `@500`: `22.60 / 19.98° / 19.79°` → `@750`: `21.94 / 19.29° / 19.14° | val_flow 0.1042`.
+     - 4-bit NF4 quantization noise across 42 layers + 5,120-dim linear projection severely slowed convergence compared to full bf16 Edge/Nano (`~6–7°` H1 at the same step). Stopped early and shut down `ewg51opg4zywzi` (`status=EXITED`).
+- **Decision**: Stick with full-precision **bf16 general pretrained Cosmos 3** backbones (`exp010` / `exp007` Edge for local 8 GB; `exp002` Nano + `FLUX 3 Action 14.20` for remote 4090 RPC) for tomorrow's live `sahni` tests.
