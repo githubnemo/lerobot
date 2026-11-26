@@ -188,7 +188,11 @@ def checkpoint_identity(args: argparse.Namespace) -> dict[str, Any]:
             "jepa_planning_mode": getattr(args, "jepa_planning_mode", "none"),
             "jepa_num_candidates": getattr(args, "jepa_num_candidates", 8),
             "expo_checkpoint": str(args.expo_checkpoint) if getattr(args, "expo_checkpoint", None) else None,
-            **({"euler_steps": int(args.euler_steps)} if getattr(args, "euler_steps", None) is not None else {}),
+            **(
+                {"euler_steps": int(args.euler_steps)}
+                if getattr(args, "euler_steps", None) is not None
+                else {}
+            ),
             **(
                 {"shared_detector_checkpoint": str(args.shared_detector_checkpoint)}
                 if getattr(args, "shared_detector_checkpoint", None)
@@ -279,6 +283,7 @@ class RPCApplication:
 
         self.expo_critic = None
         self.expo_checkpoint_path = getattr(args, "expo_checkpoint", None)
+        self.online_expo_enabled = bool(getattr(args, "online_expo", False))
         self.shared_detector = None
         self.multiframe_detector = None
         self.current_episode_steps: list[dict[str, Any]] = []
@@ -288,13 +293,15 @@ class RPCApplication:
         self.last_detector_loss: float | None = None
         self.detector_checkpoint_path = getattr(args, "shared_detector_checkpoint", None)
         self.detector_anchor_cache: dict[str, torch.Tensor] | None = None
-        anchor_file = Path(__file__).resolve().parents[2] / "outputs/sparse_seq_rl/real_detector_features_v2.pt"
+        anchor_file = (
+            Path(__file__).resolve().parents[2] / "outputs/sparse_seq_rl/real_detector_features_v2.pt"
+        )
         if anchor_file.is_file():
-            raw_anc = torch.load(anchor_file, map_location="cpu", weights_only=False)
-            if isinstance(raw_anc, dict) and "train" in raw_anc:
-                self.detector_anchor_cache = raw_anc["train"]
+            raw_anchor = torch.load(anchor_file, map_location="cpu", weights_only=False)  # nosec B614
+            if isinstance(raw_anchor, dict) and "train" in raw_anchor:
+                self.detector_anchor_cache = raw_anchor["train"]
         if getattr(args, "shared_detector_checkpoint", None) is not None:
-            det_ckpt = torch.load(
+            det_ckpt = torch.load(  # nosec B614
                 args.shared_detector_checkpoint, map_location=self.device, weights_only=False
             )
             det_state = (
@@ -303,9 +310,8 @@ class RPCApplication:
                 else det_ckpt
             )
             is_multiframe = (
-                (isinstance(det_ckpt, dict) and det_ckpt.get("detector_type") == "multiframe")
-                or any(k.startswith("stem.") or k.startswith("vis_in_norm.") for k in det_state)
-            )
+                isinstance(det_ckpt, dict) and det_ckpt.get("detector_type") == "multiframe"
+            ) or any(k.startswith("stem.") or k.startswith("vis_in_norm.") for k in det_state)
             if is_multiframe:
                 from lerobot.rewards.sequence_detector import MultiFrameSuccessDetector
 
@@ -325,14 +331,23 @@ class RPCApplication:
 
         if (
             self.expo_checkpoint_path is not None
+            or self.online_expo_enabled
             or self.shared_detector is not None
             or self.multiframe_detector is not None
         ):
             from lerobot.policies.vam.expo_residual import ExpoResidualCritic
 
-            default_ctx_dim = 512 if self.name == "smolvla" else 2048
+            backend_name = getattr(getattr(self, "config", None), "backend", "")
+            if self.name == "smolvla":
+                default_ctx_dim = 512
+            elif backend_name == "cosmos3_super":
+                default_ctx_dim = 5120
+            elif backend_name == "cosmos3_nano":
+                default_ctx_dim = 4096
+            else:
+                default_ctx_dim = 2048
             if self.expo_checkpoint_path is not None and Path(self.expo_checkpoint_path).is_file():
-                raw_ckpt = torch.load(
+                raw_ckpt = torch.load(  # nosec B614
                     self.expo_checkpoint_path, map_location=self.device, weights_only=False
                 )
                 if isinstance(raw_ckpt, dict) and "state_dict" in raw_ckpt:
@@ -367,7 +382,16 @@ class RPCApplication:
                     zero_init_edit=True,
                 ).to(self.device)
             else:
-                self.expo_critic = ExpoResidualCritic(use_init_anchor=True).to(self.device)
+                self.expo_critic = ExpoResidualCritic(
+                    ctx_dim=default_ctx_dim,
+                    state_dim=6,
+                    chunk_len=self.horizon,
+                    use_init_anchor=True,
+                    base_alpha=1.0,
+                    curr_scale=1.0,
+                    max_delta_deg=8.0,
+                    zero_init_edit=True,
+                ).to(self.device)
             self.expo_critic.eval()
         from lerobot.policies.rtc.configuration_rtc import RTCConfig
 
@@ -461,8 +485,11 @@ class RPCApplication:
             live_edit_norm = 0.0
             if isinstance(value, str):
                 self.latest_frame_b64 = value
-            if getattr(self, "expo_critic", None) is not None and getattr(self, "multiframe_detector", None) is not None:
-                import torch.nn.functional as F
+            if (
+                getattr(self, "expo_critic", None) is not None
+                and getattr(self, "multiframe_detector", None) is not None
+            ):
+                import torch.nn.functional as F  # noqa: N812
 
                 img_t = observation["observation.images.front"].unsqueeze(0).to(self.device)
                 img_128 = F.interpolate(img_t, size=(128, 128), mode="bilinear", align_corners=False)
@@ -478,7 +505,9 @@ class RPCApplication:
                 if self.rtc_enabled and "prev_chunk_left_over" not in kwargs:
                     self.current_episode_steps.clear()
                 ep_step_idx = len(self.current_episode_steps)
-                t_norm = torch.tensor([[min(1.0, ep_step_idx / 80.0)]], device=self.device, dtype=torch.float32)
+                t_norm = torch.tensor(
+                    [[min(1.0, ep_step_idx / 80.0)]], device=self.device, dtype=torch.float32
+                )
                 if ep_step_idx == 0:
                     self.expo_critic.reset_episode()
                 edited = self.expo_critic.forward_edit(
@@ -487,7 +516,11 @@ class RPCApplication:
                 live_edit_norm = float((edited - base_actions).abs().mean().item())
                 # Smooth low-amplitude exploration perturbation on arm joints for Score-Centered RL innovation
                 expl_gen = torch.Generator().manual_seed(
-                    int((supplied_seed or 0) * 1009 + self.frame_index * 37 + len(self.online_rollout_buffer) * 997)
+                    int(
+                        (supplied_seed or 0) * 1009
+                        + self.frame_index * 37
+                        + len(self.online_rollout_buffer) * 997
+                    )
                 )
                 arm_noise = torch.randn((1, 5), generator=expl_gen) * 1.0
                 ramp = torch.sin(torch.linspace(0.0, math.pi, self.horizon)).unsqueeze(-1)
@@ -516,8 +549,12 @@ class RPCApplication:
                         if stride == 2 and n_st < seq_len + 2:
                             continue
                         idxs = [max(0, end_i - (seq_len - 1 - k) * stride) for k in range(seq_len)]
-                        cand_vis.append(torch.stack([self.current_episode_steps[j]["vis_raw"] for j in idxs], dim=0))
-                        cand_st.append(torch.stack([self.current_episode_steps[j]["state"] for j in idxs], dim=0))
+                        cand_vis.append(
+                            torch.stack([self.current_episode_steps[j]["vis_raw"] for j in idxs], dim=0)
+                        )
+                        cand_st.append(
+                            torch.stack([self.current_episode_steps[j]["state"] for j in idxs], dim=0)
+                        )
                     vb = torch.stack(cand_vis, dim=0).to(self.device)
                     sb = torch.stack(cand_st, dim=0).to(self.device)
                     dummy_f = torch.empty(vb.shape[0], seq_len, 3, 1, 1, device=self.device)
@@ -547,19 +584,42 @@ class RPCApplication:
                 kwargs["feature_noise_seed"] = supplied_seed
             if "prev_chunk_left_over" in kwargs and self.backend.rtc_processor is None:
                 raise RuntimeError("RTC leftover received but rtc_processor is not initialized")
+            live_edit_norm = 0.0
             if getattr(self, "expo_critic", None) is not None:
                 from lerobot.policies.vam.modeling_video_vam import restore_uint8_history
 
                 images = restore_uint8_history(batch[self.history_key].to(self.device))
                 context = self.backend._extract_context(images, int(supplied_seed or frame_index))
                 state_t = state.unsqueeze(0).to(self.device, dtype=torch.float32)
-                t_norm = torch.tensor([[min(1.0, frame_index / 360.0)]], device=self.device, dtype=torch.float32)
+                if self.rtc_enabled and "prev_chunk_left_over" not in kwargs:
+                    self.current_episode_steps.clear()
+                ep_step_idx = len(self.current_episode_steps)
+                if ep_step_idx == 0:
+                    self.expo_critic.reset_episode()
+                t_norm = torch.tensor(
+                    [[min(1.0, ep_step_idx / 80.0)]], device=self.device, dtype=torch.float32
+                )
                 base_actions = self.backend.decoder.sample_actions(
                     state_t, context, seed=int(supplied_seed or 0), use_cuda_graph=False
                 )[0].cpu()
-                actions = self.expo_critic.select_best_edited_chunk(
+                edited = self.expo_critic.select_best_edited_chunk(
                     self.backend.decoder, state_t, context, t_norm, base_seed=int(supplied_seed or 0)
                 )[0].cpu()
+                live_edit_norm = float((edited - base_actions).abs().mean().item())
+                actions = edited
+                if getattr(self, "online_expo_enabled", False):
+                    expl_gen = torch.Generator().manual_seed(
+                        int(
+                            (supplied_seed or 0) * 1009
+                            + self.frame_index * 37
+                            + len(self.online_rollout_buffer) * 997
+                        )
+                    )
+                    arm_noise = torch.randn((1, 5), generator=expl_gen) * 1.0
+                    ramp = torch.sin(torch.linspace(0.0, math.pi, self.horizon)).unsqueeze(-1)
+                    expl_delta = torch.zeros_like(actions)
+                    expl_delta[:, :5] = ramp * arm_noise
+                    actions = actions + expl_delta
                 if self.lower is not None and self.upper is not None:
                     lo = torch.tensor(self.lower, dtype=actions.dtype)
                     hi = torch.tensor(self.upper, dtype=actions.dtype)
@@ -573,6 +633,7 @@ class RPCApplication:
                             "t_norm": t_norm[0].detach().cpu(),
                             "base_action": base_actions.detach().cpu(),
                             "exec_action": actions.detach().cpu(),
+                            "edit_norm": live_edit_norm,
                         }
                     )
             else:
@@ -603,7 +664,7 @@ class RPCApplication:
             "reward_detected": live_reward_detected if self.name == "smolvla" else False,
             "reward_prob": live_reward_prob if self.name == "smolvla" else 0.0,
             "pre_grasp_prob": live_pre_grasp_prob if self.name == "smolvla" else 0.0,
-            "edit_norm": live_edit_norm if self.name == "smolvla" else 0.0,
+            "edit_norm": live_edit_norm,
             "chunk_idx": len(getattr(self, "current_episode_steps", ())),
         }
 
@@ -755,7 +816,9 @@ class RPCApplication:
 
         steps = list(getattr(self, "current_episode_steps", []))
         last_step = steps[-1] if steps else None
-        state_vec = last_step["state"].tolist() if last_step is not None and "state" in last_step else [0.0] * 6
+        state_vec = (
+            last_step["state"].tolist() if last_step is not None and "state" in last_step else [0.0] * 6
+        )
         det_trace = [round(float(s.get("det_prob", 0.0)), 4) for s in steps]
         pre_trace = [round(float(s.get("pre_grasp_prob", 0.0)), 4) for s in steps]
         edit_trace = [round(float(s.get("edit_norm", 0.0)), 3) for s in steps]
@@ -983,7 +1046,9 @@ class Handler(BaseHTTPRequestHandler):
             self._send(404, {"error": "use POST /predict, /episode_complete, or /override_episode"})
             return
         try:
-            self.connection.settimeout(30.0 if self.path in ("/episode_complete", "/override_episode") else 10.0)
+            self.connection.settimeout(
+                30.0 if self.path in ("/episode_complete", "/override_episode") else 10.0
+            )
             length = int(self.headers.get("Content-Length", "0"))
             if not 0 < length <= MAX_REQUEST_BYTES:
                 raise ValueError("invalid request size")
@@ -1085,6 +1150,12 @@ def main(argv: list[str] | None = None) -> int:
         type=Path,
         default=None,
         help="Optional ExpoResidualCritic (.pt) checkpoint for score-centered residual action editing.",
+    )
+    parser.add_argument(
+        "--online-expo",
+        action="store_true",
+        default=False,
+        help="Enable online Score-Centered EXPO residual RL (zero-init actor + smooth exploration noise).",
     )
     parser.add_argument(
         "--shared-detector-checkpoint",

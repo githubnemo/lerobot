@@ -198,6 +198,8 @@ def _server_args(args: argparse.Namespace) -> list[str]:
         values += ["--joint-limits-max", *map(str, args.joint_limits_max)]
     if getattr(args, "expo_checkpoint", None) is not None:
         values += ["--expo-checkpoint", str(args.expo_checkpoint)]
+    if getattr(args, "online_expo_episodes", None):
+        values += ["--online-expo"]
     if getattr(args, "shared_detector_checkpoint", None) is not None:
         values += ["--shared-detector-checkpoint", str(args.shared_detector_checkpoint)]
     if getattr(args, "euler_steps", None) is not None:
@@ -412,7 +414,12 @@ class VideoVAMRPCClient:
 
         if isinstance(frame, Image.Image):
             image = frame.convert("RGB")
-        elif isinstance(frame, np.ndarray) and frame.dtype == np.uint8 and frame.ndim == 3 and frame.shape[2] == 3:
+        elif (
+            isinstance(frame, np.ndarray)
+            and frame.dtype == np.uint8
+            and frame.ndim == 3
+            and frame.shape[2] == 3
+        ):
             image = Image.fromarray(frame, "RGB")
         else:
             raise TypeError("front camera must supply an RGB uint8 [H,W,3] array or PIL image")
@@ -829,7 +836,102 @@ def _run_dry(args: argparse.Namespace, client: VideoVAMRPCClient) -> None:
     print("[DRY-RUN] RPC-only validation complete. Synthetic images/state; no camera or hardware was tested.")
 
 
+class SimSO101Robot:
+    """Simulated SO-101 follower wrapper for testing rollout + online EXPO RL without physical hardware.
+
+    Uses MuJoCo ``SO101CubeBoxEnv(reward_mode="sparse")`` when ``mujoco`` is installed, and falls back
+    to a lightweight 6-DOF kinematic wrist-camera simulator otherwise.
+    """
+
+    def __init__(self, *, randomize: bool = True, home_pose: list[float] | None = None) -> None:
+        self.calibration = {"sim": True}
+        self.is_calibrated = True
+        self.is_connected = False
+        self._randomize = randomize
+        self._home_pose = list(home_pose) if home_pose is not None else [-0.3, -86.7, 88.2, 71.1, -53.4, 17.7]
+        self._env: Any | None = None
+        self._state = list(self._home_pose)
+        self._frame: Any | None = None
+        self._step_count = 0
+        self._ep_count = 0
+        self._episode_success = False
+        self.sim_backend = "kinematic"
+
+    def connect(self, calibrate: bool = False) -> None:
+        del calibrate
+        try:
+            from lerobot.envs.so101_cube_box import SO101CubeBoxEnv
+
+            self._env = SO101CubeBoxEnv(
+                obs_type="pixels_agent_pos",
+                render_mode="rgb_array",
+                observation_width=640,
+                observation_height=480,
+                randomize=self._randomize,
+                reward_mode="sparse",
+            )
+            self.sim_backend = "mujoco:SO101CubeBoxSparse-v0"
+        except Exception as exc:
+            self._env = None
+            self.sim_backend = f"kinematic-mock ({type(exc).__name__})"
+        self.is_connected = True
+        self.reset_episode()
+        print(f"[SIM] Connected simulated SO-101 robot ({self.sim_backend})")
+
+    def reset_episode(self) -> None:
+        self._ep_count += 1
+        self._step_count = 0
+        self._episode_success = False
+        if self._env is not None:
+            obs, _ = self._env.reset(seed=self._ep_count)
+            self._state = [float(x) for x in obs["agent_pos"][:6]]
+            self._frame = obs["pixels"]
+        else:
+            import numpy as np
+
+            self._state = list(self._home_pose)
+            self._frame = np.full((480, 640, 3), 96, dtype=np.uint8)
+
+    def get_observation(self) -> dict[str, Any]:
+        obs: dict[str, Any] = {name: float(val) for name, val in zip(ACTION_NAMES, self._state, strict=True)}
+        obs["front"] = self._frame
+        return obs
+
+    def send_action(self, action: dict[str, float]) -> dict[str, float]:
+        import numpy as np
+
+        self._step_count += 1
+        target = [float(action[name]) for name in ACTION_NAMES]
+        if self._env is not None:
+            obs, reward, _terminated, _truncated, info = self._env.step(np.asarray(target, dtype=np.float32))
+            self._state = [float(x) for x in obs["agent_pos"][:6]]
+            self._frame = obs["pixels"]
+            if float(reward) >= 0.5 or bool(info.get("is_success", False)):
+                self._episode_success = True
+        else:
+            # Smoothly track commanded joints and generate a deterministic visual pattern
+            self._state = [0.5 * s + 0.5 * t for s, t in zip(self._state, target, strict=True)]
+            # Alternating synthetic outcome so multi-episode Dr. GRPO has both success (1.0) and fail (0.0)
+            if self._ep_count % 2 == 1 and self._step_count >= 5:
+                self._episode_success = True
+            intensity = int(64 + (self._step_count * 7) % 128)
+            self._frame = np.full((480, 640, 3), intensity, dtype=np.uint8)
+        return dict(action)
+
+    @property
+    def sim_auto_reward(self) -> float:
+        return 1.0 if self._episode_success else 0.0
+
+    def disconnect(self) -> None:
+        if self._env is not None:
+            self._env.close()
+            self._env = None
+        self.is_connected = False
+
+
 def _make_robot(args: argparse.Namespace) -> Any:
+    if getattr(args, "sim", False):
+        return SimSO101Robot(home_pose=getattr(args, "home_pose", None))
     from lerobot.robots import make_robot_from_config
     from lerobot.robots.so_follower.config_so_follower import SOFollowerRobotConfig
 
@@ -913,12 +1015,8 @@ def _save_debug_episode_trace(
     frames_dir = debug_ep_dir / "frames"
     frames_dir.mkdir(parents=True, exist_ok=True)
     (debug_ep_dir / "meta.json").write_text(json.dumps(meta, indent=2) + "\n")
-    (debug_ep_dir / "chunks.jsonl").write_text(
-        "".join(json.dumps(rec) + "\n" for rec in chunk_records)
-    )
-    (debug_ep_dir / "ticks.jsonl").write_text(
-        "".join(json.dumps(rec) + "\n" for rec in tick_records)
-    )
+    (debug_ep_dir / "chunks.jsonl").write_text("".join(json.dumps(rec) + "\n" for rec in chunk_records))
+    (debug_ep_dir / "ticks.jsonl").write_text("".join(json.dumps(rec) + "\n" for rec in tick_records))
     for c_idx, frame in saved_frames:
         if hasattr(frame, "save"):
             frame.save(frames_dir / f"chunk_{c_idx:04d}.jpg", format="JPEG", quality=85)
@@ -957,7 +1055,9 @@ def _run_single_episode(
     max_trackable_latency = min(1.5, max(0.35, (horizon - 4) / max(1, args.fps)))
 
     raw_debug_dir = getattr(args, "debug_dir", None)
-    debug_ep_dir = (Path(raw_debug_dir) / f"episode_{episode_index:03d}") if raw_debug_dir is not None else None
+    debug_ep_dir = (
+        (Path(raw_debug_dir) / f"episode_{episode_index:03d}") if raw_debug_dir is not None else None
+    )
     chunk_records: list[dict[str, Any]] = []
     tick_records: list[dict[str, Any]] = []
     saved_frames: list[tuple[int, Any]] = []
@@ -1046,19 +1146,16 @@ def _run_single_episode(
                             alpha = torch.linspace(
                                 0.0, 1.0, blend_len + 2, dtype=actions.dtype, device=actions.device
                             )[1:-1].unsqueeze(-1)
-                            post_delay[:blend_len] = (
-                                (1.0 - alpha) * prev_remaining[:blend_len].to(actions.device, actions.dtype)
-                                + alpha * post_delay[:blend_len]
-                            )
+                            post_delay[:blend_len] = (1.0 - alpha) * prev_remaining[:blend_len].to(
+                                actions.device, actions.dtype
+                            ) + alpha * post_delay[:blend_len]
                             actions = actions.clone()
                             actions[delay:] = post_delay
                             if prev_orig_remaining is not None and len(prev_orig_remaining) >= blend_len:
                                 orig_post = original[delay:].clone()
-                                orig_post[:blend_len] = (
-                                    (1.0 - alpha)
-                                    * prev_orig_remaining[:blend_len].to(original.device, original.dtype)
-                                    + alpha * orig_post[:blend_len]
-                                )
+                                orig_post[:blend_len] = (1.0 - alpha) * prev_orig_remaining[:blend_len].to(
+                                    original.device, original.dtype
+                                ) + alpha * orig_post[:blend_len]
                                 original = original.clone()
                                 original[delay:] = orig_post
                         elif last_action is not None and len(post_delay) > 0:
@@ -1071,7 +1168,9 @@ def _run_single_episode(
                             alpha = torch.linspace(
                                 0.0, 1.0, blend_len + 2, dtype=actions.dtype, device=actions.device
                             )[1:-1].unsqueeze(-1)
-                            post_delay[:blend_len] = (1.0 - alpha) * held.unsqueeze(0) + alpha * post_delay[:blend_len]
+                            post_delay[:blend_len] = (1.0 - alpha) * held.unsqueeze(0) + alpha * post_delay[
+                                :blend_len
+                            ]
                             actions = actions.clone()
                             actions[delay:] = post_delay
                             if client.health.get("original_space") == "physical" and len(original) > delay:
@@ -1081,10 +1180,9 @@ def _run_single_episode(
                                     device=original.device, dtype=original.dtype
                                 )
                                 orig_held = held.to(device=original.device, dtype=original.dtype)
-                                orig_post[:orig_blend_len] = (
-                                    (1.0 - orig_alpha) * orig_held.unsqueeze(0)
-                                    + orig_alpha * orig_post[:orig_blend_len]
-                                )
+                                orig_post[:orig_blend_len] = (1.0 - orig_alpha) * orig_held.unsqueeze(
+                                    0
+                                ) + orig_alpha * orig_post[:orig_blend_len]
                                 original = original.clone()
                                 original[delay:] = orig_post
                     elif running and not rtc and last_action is not None and len(actions) > 0:
@@ -1114,7 +1212,10 @@ def _run_single_episode(
                         next_tick = ep_start_t
                     if debug_ep_dir is not None:
                         snap_state = pending_snapshot_state if pending_snapshot_state is not None else state
-                        d0 = [round(float(a - s), 2) for a, s in zip(actions[0].tolist(), snap_state, strict=True)]
+                        d0 = [
+                            round(float(a - s), 2)
+                            for a, s in zip(actions[0].tolist(), snap_state, strict=True)
+                        ]
                         c_idx = len(chunk_records)
                         print(
                             f"  [DBG] chunk={c_idx} delay={delay} q={qsize_before}->{qsize_after} "
@@ -1148,7 +1249,9 @@ def _run_single_episode(
                 qsize = queue.qsize()
                 min_exec_before_prefetch = 1 if qsize <= est_delay + 4 else min(4, max(1, qsize // 4))
                 ready_after_merge = qsize == 0 or ticks_since_merge >= min_exec_before_prefetch
-                need_request = not running or ((qsize <= threshold and ready_after_merge) if rtc else queue.empty())
+                need_request = not running or (
+                    (qsize <= threshold and ready_after_merge) if rtc else queue.empty()
+                )
                 if need_request:
                     if phase == "warmup_rtc":
                         previous = torch.tensor([state] * max(1, horizon - 5), dtype=torch.float32)
@@ -1266,7 +1369,9 @@ def _run_single_episode(
                     if future is not None and last_action is not None:
                         starved_ticks += 1
                         if starved_ticks == 1 or starved_ticks % 15 == 0:
-                            print(f"[RTC] Waiting for in-flight RPC chunk (holding pose, tick {starved_ticks})...")
+                            print(
+                                f"[RTC] Waiting for in-flight RPC chunk (holding pose, tick {starved_ticks})..."
+                            )
                         robot.send_action(last_action)
                         if debug_ep_dir is not None:
                             held_vec = [float(last_action[name]) for name in ACTION_NAMES]
@@ -1384,15 +1489,25 @@ def _run_rollout(args: argparse.Namespace, client: VideoVAMRPCClient) -> None:
 
                 if online_enabled:
                     should_update = (episodes % update_interval == 0) or (episodes == target_episodes)
+                    effective_manual_reward = live_manual_reward
+                    if effective_manual_reward is None and getattr(args, "sim", False):
+                        sim_rew = getattr(robot, "sim_auto_reward", None)
+                        if sim_rew is not None and getattr(args, "shared_detector_checkpoint", None) is None:
+                            effective_manual_reward = float(sim_rew)
                     ep_stats = client.complete_episode(
                         spawn_group=getattr(args, "spawn_group", 0),
                         update_critic=should_update,
                         update_steps=getattr(args, "online_update_steps", 600),
                         save_checkpoint=getattr(args, "expo_checkpoint", None),
-                        manual_reward=live_manual_reward,
+                        manual_reward=effective_manual_reward,
                     )
                     rew_icon = "✅ SUCCESS (1.0)" if ep_stats.get("reward", 0.0) >= 0.5 else "❌ FAIL (0.0)"
-                    src_tag = "HUMAN-KEY" if live_manual_reward is not None else "DETECTOR"
+                    if live_manual_reward is not None:
+                        src_tag = "HUMAN-KEY"
+                    elif effective_manual_reward is not None:
+                        src_tag = "SIM-ENV"
+                    else:
+                        src_tag = "DETECTOR"
                     print(
                         f"[EXPO-ONLINE] Ep {episodes} ({src_tag}): {rew_icon} "
                         f"(p={ep_stats.get('reward_prob', 0.0):.3f}, "
@@ -1413,6 +1528,11 @@ def _run_rollout(args: argparse.Namespace, client: VideoVAMRPCClient) -> None:
                         )
 
                 if episodes < target_episodes:
+                    if getattr(args, "sim", False) and hasattr(robot, "reset_episode"):
+                        robot.reset_episode()
+                        client.frames.clear()
+                        client.frame_times.clear()
+                        continue
                     print(f"\n[RESET] Episode {episodes} complete. Smoothly returning to base position...")
                     _smooth_move_to(robot, home_pose, duration_s=getattr(args, "home_duration", 2.0))
                     print(
@@ -1467,6 +1587,15 @@ def _resolve_local_checkpoint(raw_checkpoint: str) -> str:
             candidate = local_repo / raw_checkpoint
             if candidate.exists():
                 return str(candidate)
+            if "/" in raw_checkpoint and len(raw_checkpoint.split("/")) == 2:
+                hf_dest = local_repo / "outputs/train" / raw_checkpoint.split("/")[1]
+                if not (hf_dest / "config.json").is_file():
+                    from huggingface_hub import snapshot_download
+
+                    print(f"[SETUP] Downloading HF checkpoint {raw_checkpoint} -> {hf_dest}...")
+                    hf_dest.mkdir(parents=True, exist_ok=True)
+                    snapshot_download(raw_checkpoint, local_dir=str(hf_dest))
+                return str(hf_dest)
         elif raw_checkpoint.startswith("/home/anton/lerobot-video-vam/"):
             candidate = local_repo / raw_checkpoint.removeprefix("/home/anton/lerobot-video-vam/")
             if candidate.exists():
@@ -1552,6 +1681,7 @@ def _load_in_process_app(args: argparse.Namespace) -> Any:
         jepa_planning_mode="none",
         jepa_num_candidates=8,
         expo_checkpoint=getattr(args, "expo_checkpoint", None),
+        online_expo=bool(getattr(args, "online_expo_episodes", None)),
         shared_detector_checkpoint=getattr(args, "shared_detector_checkpoint", None),
     )
     return module.RPCApplication(server_ns)
@@ -1742,6 +1872,12 @@ def main(argv: list[str] | None = None) -> int:
         help="Optional flow-matching Euler step override for video_vam server.",
     )
     parser.add_argument(
+        "--sim",
+        action="store_true",
+        default=False,
+        help="Run against simulated SO-101 (MuJoCo SO101CubeBoxSparse-v0 when installed, else kinematic mock) instead of physical hardware.",
+    )
+    parser.add_argument(
         "--debug-dir",
         type=Path,
         default=None,
@@ -1777,7 +1913,10 @@ def main(argv: list[str] | None = None) -> int:
         or any(a >= b for a, b in zip(args.joint_limits_min, args.joint_limits_max, strict=True))
     ):
         parser.error("joint limits must be finite and ordered")
-    if not args.dry_run and args.joint_limits_min is None:
+    if getattr(args, "sim", False) and args.joint_limits_min is None:
+        args.joint_limits_min = [-180.0, -180.0, -180.0, -180.0, -180.0, 0.0]
+        args.joint_limits_max = [180.0, 180.0, 180.0, 180.0, 180.0, 100.0]
+    if not args.dry_run and not getattr(args, "sim", False) and args.joint_limits_min is None:
         parser.error("hardware requires explicit six-dimensional absolute joint limits")
 
     # Universal Policy & Checkpoint Aliases
@@ -1850,6 +1989,22 @@ def main(argv: list[str] | None = None) -> int:
             "/home/anton/lerobot-video-vam/outputs/train/sort-cubes-smolvla-100k-exact/checkpoints/last/pretrained_model",
             "smolvla",
         ),
+        "exp010": (
+            "Orellius/so101_exp010_c3_edge_vidlora_then_joint_action_lora",
+            "video_vam",
+        ),
+        "exp007": (
+            "Orellius/so101_exp007_c3_edge_direct_action_lora_3500",
+            "video_vam",
+        ),
+        "exp009": (
+            "Orellius/so101_exp009_c3_edge_vidlora_then_frozen_action",
+            "video_vam",
+        ),
+        "exp002": (
+            "Orellius/so101_exp002_c3_nano_l24_joint_lora_bs32",
+            "video_vam",
+        ),
     }
 
     if args.checkpoint in aliases:
@@ -1863,7 +2018,7 @@ def main(argv: list[str] | None = None) -> int:
 
     # Cosmos 2B LoRA is now merged prior to torch.compile, so compile is supported
 
-    if not args.dry_run:
+    if not args.dry_run and not getattr(args, "sim", False):
         if not args.robot_port:
             import glob
 
@@ -1933,7 +2088,9 @@ def main(argv: list[str] | None = None) -> int:
 
             def _local_forward_alive() -> bool:
                 try:
-                    with urllib.request.urlopen(f"http://127.0.0.1:{args.port}/healthz", timeout=1.5) as r:
+                    with urllib.request.urlopen(  # nosec B310
+                        f"http://127.0.0.1:{args.port}/healthz", timeout=1.5
+                    ) as r:
                         return r.status == 200
                 except Exception:
                     return False
@@ -1956,7 +2113,7 @@ def main(argv: list[str] | None = None) -> int:
                     timeout=5,
                 )
             if not _local_forward_alive():
-                subprocess.run(
+                subprocess.run(  # nosec B607
                     ["pkill", "-f", f"ssh.*-L {args.port}:127.0.0.1:{args.port}"],
                     check=False,
                     stdin=subprocess.DEVNULL,
