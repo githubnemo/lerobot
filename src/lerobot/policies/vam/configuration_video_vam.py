@@ -106,6 +106,7 @@ class VideoVAMConfig(PreTrainedConfig):
     cosmos3_lora_rank: int | None = None
     cosmos3_lora_alpha: float | None = None
     cosmos3_lora_use_dora: bool = False
+    cosmos3_quantization: str | None = None
     cosmos3_prompt: str = "take cube out of box"
     cosmos3_fps: float = 10.0
     flux2_lora_weights: Path | None = None
@@ -162,8 +163,12 @@ class VideoVAMConfig(PreTrainedConfig):
             raise ValueError("jepa_planning_mode must be 'none', 'best_of_n', or 'mppi'")
         if self.jepa_num_candidates < 1:
             raise ValueError("jepa_num_candidates must be >= 1")
-        if self.backend not in {"cosmos", "cosmos3_edge", "cosmos3_nano", "ltx"}:
-            raise ValueError("backend must be 'cosmos', 'cosmos3_edge', 'cosmos3_nano', or 'ltx'")
+        if self.backend not in {"cosmos", "cosmos3_edge", "cosmos3_nano", "cosmos3_super", "ltx"}:
+            raise ValueError(
+                "backend must be 'cosmos', 'cosmos3_edge', 'cosmos3_nano', 'cosmos3_super', or 'ltx'"
+            )
+        if self.cosmos3_quantization not in {None, "none", "nf4"}:
+            raise ValueError("cosmos3_quantization must be None, 'none', or 'nf4'")
         if self.cosmos3_layer is not None and self.cosmos3_layer < 1:
             raise ValueError("cosmos3_layer must be a positive integer or None")
         if self.cosmos_state_t not in (2, 16):

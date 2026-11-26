@@ -171,3 +171,43 @@ def test_push_checkpoint_to_hf_resolve_sources(tmp_path: Path) -> None:
 
     with pytest.raises(FileNotFoundError):
         mod.resolve_upload_source(tmp_path / "empty_missing")
+
+
+def test_cosmos3_super_nf4_config_and_policy_droid_resolution(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Verify Cosmos3-Super (64L/5120d), NF4 quantization config, and Policy-DROID cache resolution."""
+    from lerobot.policies.vam.configuration_video_vam import VideoVAMConfig
+    from lerobot.policies.vam.cosmos3_features import Cosmos3ExtractorConfig
+    from lerobot.policies.vam.modeling_video_vam import _resolve_cosmos3_checkpoint_path
+
+    c3_cfg = Cosmos3ExtractorConfig(
+        backbone_name="cosmos3-super",
+        hidden_layers=(42,),
+        quantization="nf4",
+    )
+    assert c3_cfg.hidden_dim == 5120
+    assert c3_cfg.num_layers == 64
+    assert c3_cfg.quantization == "nf4"
+
+    with pytest.raises(ValueError, match="quantization"):
+        Cosmos3ExtractorConfig(backbone_name="cosmos3-super", hidden_layers=(42,), quantization="int2")
+
+    vam_cfg = VideoVAMConfig(
+        backend="cosmos3_super",
+        cosmos3_layer=42,
+        cosmos3_quantization="nf4",
+    )
+    assert vam_cfg.backend == "cosmos3_super"
+    assert vam_cfg.cosmos3_quantization == "nf4"
+
+    # Named Policy-DROID cache dir resolves via VAM_CACHE_DIR across hosts
+    fake_cache = tmp_path / "vam-cache"
+    droid_dir = fake_cache / "cosmos3-nano-policy-droid"
+    (droid_dir / "transformer").mkdir(parents=True)
+    monkeypatch.setenv("VAM_CACHE_DIR", str(fake_cache))
+    resolved = _resolve_cosmos3_checkpoint_path(
+        "/workspace/cache/video-vam/cosmos3-nano-policy-droid",
+        backend="cosmos3_nano",
+    )
+    assert resolved == droid_dir

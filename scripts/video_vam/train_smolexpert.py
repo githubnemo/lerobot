@@ -273,6 +273,7 @@ def is_cosmos3(backbone: str | None) -> bool:
         "cosmos3",
         "cosmos3_edge",
         "cosmos3_nano",
+        "cosmos3_super",
     }
 
 
@@ -315,8 +316,13 @@ def cosmos3_eval_identity(
         ):
             raise FileNotFoundError(f"Cosmos3 checkpoint lacks nonempty {component} weights: {directory}")
 
-    is_nano = backbone_name.replace("-", "_").lower() == "cosmos3_nano"
-    max_layers = 36 if is_nano else 28
+    b_key = backbone_name.replace("-", "_").lower()
+    if b_key == "cosmos3_super":
+        max_layers = 64
+    elif b_key == "cosmos3_nano":
+        max_layers = 36
+    else:
+        max_layers = 28
     if type(hidden_layer) is not int or not 1 <= hidden_layer <= max_layers or not isinstance(prompt, str):
         raise ValueError("Invalid Cosmos3 layer or prompt")
     lora_sha = None
@@ -339,8 +345,14 @@ def cosmos3_eval_identity(
             raise ValueError(f"Invalid Cosmos3 LoRA rank/alpha metadata: {lora_checkpoint}") from exc
         if rank <= 0 or not math.isfinite(alpha) or alpha <= 0:
             raise ValueError(f"Invalid Cosmos3 LoRA rank/alpha: {lora_checkpoint}")
+    if b_key == "cosmos3_super":
+        canonical_bb, ctx_dim = "cosmos3-super", 5120
+    elif b_key == "cosmos3_nano":
+        canonical_bb, ctx_dim = "cosmos3-nano", 4096
+    else:
+        canonical_bb, ctx_dim = "cosmos3-edge", 2048
     return {
-        "backbone": "cosmos3-nano" if is_nano else "cosmos3-edge",
+        "backbone": canonical_bb,
         # This producer's legacy field is a directory digest, NOT the single
         # transformer-file hash returned by Cosmos3FeatureExtractor.get_provenance().
         "transformer_sha256": checkpoint_digest(checkpoint_path),
@@ -353,7 +365,7 @@ def cosmos3_eval_identity(
         "fps": 10.0,
         "base_fps": 24.0,
         "context_tokens": 600,
-        "context_dim": 4096 if is_nano else 2048,
+        "context_dim": ctx_dim,
     }
 
 
@@ -482,14 +494,26 @@ def _default_vam_cache_dir() -> Path:
     return Path(os.environ.get("VAM_CACHE_DIR", str(Path.home() / ".cache/video-vam")))
 
 
-def _default_cosmos3_checkpoint(is_nano: bool) -> Path:
+def _default_cosmos3_checkpoint(backbone: str | bool) -> Path:
     cache_dir = _default_vam_cache_dir()
-    return cache_dir / ("cosmos3-nano" if is_nano else "cosmos3-edge")
+    if isinstance(backbone, bool):
+        return cache_dir / ("cosmos3-nano" if backbone else "cosmos3-edge")
+    b_key = backbone.replace("-", "_").lower()
+    if b_key == "cosmos3_super":
+        return cache_dir / "cosmos3-super"
+    if b_key == "cosmos3_nano":
+        return cache_dir / "cosmos3-nano"
+    return cache_dir / "cosmos3-edge"
 
 
 def _cosmos3_identity_from_args(args: argparse.Namespace) -> dict[str, Any]:
-    is_nano = (args.online_backbone or "").replace("-", "_").lower() == "cosmos3_nano"
-    default_ckpt = _default_cosmos3_checkpoint(is_nano) if is_nano else COSMOS3_CHECKPOINT_DIR
+    b_key = (args.online_backbone or "").replace("-", "_").lower()
+    if b_key == "cosmos3_super":
+        canonical, default_ckpt = "cosmos3-super", _default_cosmos3_checkpoint("cosmos3_super")
+    elif b_key == "cosmos3_nano":
+        canonical, default_ckpt = "cosmos3-nano", _default_cosmos3_checkpoint("cosmos3_nano")
+    else:
+        canonical, default_ckpt = "cosmos3-edge", COSMOS3_CHECKPOINT_DIR
     return cosmos3_eval_identity(
         checkpoint_path=args.backbone_checkpoint or default_ckpt,
         lora_checkpoint=args.backbone_lora_weights,
@@ -497,7 +521,7 @@ def _cosmos3_identity_from_args(args: argparse.Namespace) -> dict[str, Any]:
         lora_alpha=args.backbone_lora_alpha,
         hidden_layer=args.backbone_layer,
         prompt=args.backbone_prompt,
-        backbone_name="cosmos3-nano" if is_nano else "cosmos3-edge",
+        backbone_name=canonical,
     )
 
 
@@ -1756,6 +1780,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Use DoRA (Weight-Decomposed Low-Rank Adaptation) when training Cosmos 3 backbone adapters.",
     )
     parser.add_argument(
+        "--backbone-quantize",
+        type=str,
+        choices=["none", "nf4"],
+        default="none",
+        help="Optional backbone weight quantization for Cosmos 3 ('nf4' enables streaming 4-bit NF4 QLoRA).",
+    )
+    parser.add_argument(
         "--backbone-lora-lr",
         type=float,
         default=1e-4,
@@ -2142,7 +2173,7 @@ def build_run_manifest(
             continue
         if isinstance(dataset, OnlineVideoDataset):
             b_key = (args.online_backbone or "").replace("-", "_").lower()
-            online_ctx_dim = 4096 if b_key == "cosmos3_nano" else 2048
+            online_ctx_dim = 5120 if b_key == "cosmos3_super" else (4096 if b_key == "cosmos3_nano" else 2048)
             datasets[name] = {
                 "manifest_sha256": "online_video_dataset",
                 "source_path_hint": str(dataset.manifest_path),
@@ -2862,7 +2893,10 @@ def main(argv: list[str] | None = None) -> int:
         num_tokens = sample_context.shape[0]
     elif is_online:
         b_key = args.online_backbone.replace("-", "_").lower()
-        if b_key == "cosmos3_nano":
+        if b_key == "cosmos3_super":
+            input_channels = 5120
+            num_tokens = 600
+        elif b_key == "cosmos3_nano":
             input_channels = 4096
             num_tokens = 600
         elif b_key in ("cosmos3_edge", "cosmos3"):
@@ -2883,16 +2917,24 @@ def main(argv: list[str] | None = None) -> int:
 
     if is_online and not args.dry_run:
         b_key = args.online_backbone.replace("-", "_").lower()
-        if b_key in ("cosmos3_edge", "cosmos3", "cosmos3_nano"):
+        if b_key in ("cosmos3_edge", "cosmos3", "cosmos3_nano", "cosmos3_super"):
             from lerobot.policies.vam.cosmos3_features import (
                 Cosmos3ExtractorConfig,
                 Cosmos3FeatureExtractor,
             )
 
-            is_nano = b_key == "cosmos3_nano"
-            default_ckpt = _default_cosmos3_checkpoint(is_nano)
+            default_ckpt = _default_cosmos3_checkpoint(b_key)
             ckpt_dir = args.backbone_checkpoint or default_ckpt
             train_bb_lora = bool(getattr(args, "train_backbone_lora", False))
+            quant_mode = getattr(args, "backbone_quantize", "none")
+            if quant_mode == "none":
+                quant_mode = None
+            if b_key == "cosmos3_super":
+                canonical_name = "cosmos3-super"
+            elif b_key == "cosmos3_nano":
+                canonical_name = "cosmos3-nano"
+            else:
+                canonical_name = "cosmos3-edge"
             if getattr(args, "backbone_fps", None) is not None:
                 resolved_cosmos3_fps = float(args.backbone_fps)
             elif args.val_manifest is not None or args.eval2_manifest is not None:
@@ -2900,7 +2942,7 @@ def main(argv: list[str] | None = None) -> int:
             else:
                 resolved_cosmos3_fps = float(dataset_contract.fps)
             b_cfg = Cosmos3ExtractorConfig(
-                backbone_name="cosmos3-nano" if is_nano else "cosmos3-edge",
+                backbone_name=canonical_name,
                 checkpoint_path=ckpt_dir,
                 hidden_layers=(args.backbone_layer,),
                 device=str(device),
@@ -2914,9 +2956,10 @@ def main(argv: list[str] | None = None) -> int:
                 trainable_lora=train_bb_lora,
                 lora_use_dora=bool(getattr(args, "backbone_lora_dora", False)),
                 lora_pathway=getattr(args, "backbone_lora_pathway", "gen_only"),
+                quantization=quant_mode,
                 gradient_checkpointing=bool(getattr(args, "backbone_grad_checkpointing", True))
                 and train_bb_lora,
-                compile_dit=not train_bb_lora,
+                compile_dit=(not train_bb_lora) and (quant_mode is None),
                 compile_vae=True,
                 vae_compile_mode="default",
             )
@@ -2925,8 +2968,9 @@ def main(argv: list[str] | None = None) -> int:
                 if train_bb_lora
                 else f"frozen (lora: {args.backbone_lora_weights})"
             )
+            quant_str = f", quant={quant_mode}" if quant_mode else ""
             print(
-                f"Loading online backbone {args.online_backbone} (layer {args.backbone_layer}, {adapter_mode_str})..."
+                f"Loading online backbone {args.online_backbone} (layer {args.backbone_layer}, {adapter_mode_str}{quant_str})..."
             )
             backbone_extractor = Cosmos3FeatureExtractor(b_cfg)
             backbone_extractor._smolexpert_eval_identity = cosmos3_identity
@@ -3839,7 +3883,9 @@ def main(argv: list[str] | None = None) -> int:
     backend_val = args.backbone
     if is_online:
         b_k = args.online_backbone.replace("-", "_").lower()
-        if b_k == "cosmos3_nano":
+        if b_k == "cosmos3_super":
+            backend_val = "cosmos3_super"
+        elif b_k == "cosmos3_nano":
             backend_val = "cosmos3_nano"
         elif "cosmos3" in b_k:
             backend_val = "cosmos3_edge"
@@ -3892,7 +3938,8 @@ def main(argv: list[str] | None = None) -> int:
                 else (float(dataset_contract.fps) if is_online else 10.0)
             )
         )
-        default_c3_ckpt = str(_default_cosmos3_checkpoint(backend_val == "cosmos3_nano"))
+        default_c3_ckpt = str(_default_cosmos3_checkpoint(backend_val))
+        cfg_quant = getattr(args, "backbone_quantize", "none")
         deployment_cfg.update(
             {
                 "cosmos3_checkpoint": str(args.backbone_checkpoint or default_c3_ckpt),
@@ -3901,6 +3948,7 @@ def main(argv: list[str] | None = None) -> int:
                 "cosmos3_lora_rank": args.backbone_lora_rank,
                 "cosmos3_lora_alpha": args.backbone_lora_alpha,
                 "cosmos3_lora_use_dora": bool(getattr(args, "backbone_lora_dora", False)),
+                "cosmos3_quantization": None if cfg_quant in (None, "none") else cfg_quant,
                 "cosmos3_prompt": args.backbone_prompt,
                 "cosmos3_fps": resolved_cfg_fps,
             }

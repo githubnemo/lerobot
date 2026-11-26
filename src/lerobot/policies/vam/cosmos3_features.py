@@ -13,7 +13,9 @@ from __future__ import annotations
 
 import gc
 import hashlib
+import json
 import math
+import os
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -761,6 +763,7 @@ class Cosmos3ExtractorConfig(BaseExtractorConfig):
     trainable_lora: bool = False
     lora_use_dora: bool = False
     lora_pathway: str = "gen_only"
+    quantization: str | None = None
     gradient_checkpointing: bool = False
     compile_dit: bool = False
     compile_vae: bool = False
@@ -771,11 +774,22 @@ class Cosmos3ExtractorConfig(BaseExtractorConfig):
     def __post_init__(self) -> None:
         BaseExtractorConfig.__post_init__(self)
         backbone_key = self.backbone_name.replace("-", "_").lower()
-        if backbone_key == "cosmos3_nano":
+        if backbone_key == "cosmos3_super":
+            if self.hidden_dim == 2048:
+                self.hidden_dim = 5120
+            if self.num_layers == 28:
+                self.num_layers = 64
+        elif backbone_key == "cosmos3_nano":
             if self.hidden_dim == 2048:
                 self.hidden_dim = 4096
             if self.num_layers == 28:
                 self.num_layers = 36
+        if self.quantization == "none":
+            self.quantization = None
+        if self.quantization not in (None, "nf4"):
+            raise ValueError(
+                f"Unsupported Cosmos 3 quantization mode: {self.quantization!r} (use None or 'nf4')"
+            )
         for layer_idx in self.hidden_layers:
             if layer_idx < 1 or layer_idx > self.num_layers:
                 raise ValueError(f"hidden_layer {layer_idx} out of range [1, {self.num_layers}] for Cosmos 3")
@@ -784,6 +798,54 @@ class Cosmos3ExtractorConfig(BaseExtractorConfig):
 @dataclass(frozen=True, slots=True)
 class Cosmos3ExtractionOutput(VAMExtractionOutput):
     """Standard output container for Cosmos 3 Edge extracted features."""
+
+
+def _quantize_module_linears_nf4(
+    module: nn.Module,
+    *,
+    device: torch.device,
+    compute_dtype: torch.dtype,
+) -> int:
+    """Replace nn.Linear submodules inside ``module`` with bitsandbytes 4-bit NF4 Linear4bit on ``device``."""
+    try:
+        import bitsandbytes as bnb
+    except ImportError as exc:
+        raise Cosmos3FeatureError(
+            "4-bit NF4 Cosmos 3 quantization requires bitsandbytes (`uv pip install bitsandbytes`)."
+        ) from exc
+
+    replaced = 0
+    for name, child in list(module.named_modules()):
+        if not name or not isinstance(child, nn.Linear):
+            continue
+        if isinstance(child, bnb.nn.Linear4bit):
+            continue
+        parent_name, attr = name.rsplit(".", 1) if "." in name else ("", name)
+        parent = module.get_submodule(parent_name) if parent_name else module
+        q_lin = bnb.nn.Linear4bit(
+            child.in_features,
+            child.out_features,
+            bias=(child.bias is not None),
+            compute_dtype=compute_dtype,
+            compress_statistics=True,
+            quant_type="nf4",
+        )
+        weight_src = child.weight.detach().to(device="cpu", dtype=compute_dtype).contiguous()
+        q_lin.weight = bnb.nn.Params4bit(
+            weight_src,
+            requires_grad=False,
+            compress_statistics=True,
+            quant_type="nf4",
+        )
+        if child.bias is not None:
+            q_lin.bias = nn.Parameter(
+                child.bias.detach().to(device=device, dtype=compute_dtype).contiguous(),
+                requires_grad=False,
+            )
+        q_lin = q_lin.to(device)
+        setattr(parent, attr, q_lin)
+        replaced += 1
+    return replaced
 
 
 def _apply_cosmos3_lora_pathway_grad(
@@ -845,17 +907,24 @@ class Cosmos3FeatureExtractor(BaseVAMExtractor):
 
         # 1. Initialize or assign Transformer (keep on CPU until unused blocks/heads are pruned)
         loaded_transformer_from_disk = False
-        is_nano = self.config.backbone_name.replace("-", "_").lower() == "cosmos3_nano"
+        streamed_nf4_loaded = False
+        b_key = self.config.backbone_name.replace("-", "_").lower()
+        quant_mode = self.config.quantization
         if config.checkpoint_path is not None and not Path(config.checkpoint_path).exists():
-            fallback_dir = Path.home() / (
-                ".cache/video-vam/cosmos3-nano" if is_nano else ".cache/video-vam/cosmos3-edge"
-            )
+            vam_cache_root = Path(os.environ.get("VAM_CACHE_DIR", str(Path.home() / ".cache/video-vam")))
+            if b_key == "cosmos3_super":
+                cache_name, hf_repo = "cosmos3-super", "nvidia/Cosmos3-Super"
+            elif b_key == "cosmos3_nano":
+                cache_name, hf_repo = "cosmos3-nano", "nvidia/Cosmos3-Nano"
+            else:
+                cache_name, hf_repo = "cosmos3-edge", "nvidia/Cosmos3-Edge"
+            fallback_dir = vam_cache_root / cache_name
             if not (fallback_dir / "transformer").is_dir():
                 from huggingface_hub import snapshot_download
 
                 fallback_dir.mkdir(parents=True, exist_ok=True)
                 snapshot_download(
-                    "nvidia/Cosmos3-Nano" if is_nano else "nvidia/Cosmos3-Edge",
+                    hf_repo,
                     local_dir=str(fallback_dir),
                     allow_patterns=[
                         "transformer/*",
@@ -868,16 +937,38 @@ class Cosmos3FeatureExtractor(BaseVAMExtractor):
                 )
             config.checkpoint_path = fallback_dir
             self.config.checkpoint_path = fallback_dir
+
+        max_layer = max(self.config.hidden_layers)
+        self.prompt_text = config.prompt
+        self.tokenizer = tokenizer
+        self._cached_prompt_embeds: Tensor | None = None
+        self._cached_und_kv: list[tuple[Tensor, Tensor]] | None = None
+        self._cached_gen_rotary: dict[tuple[int, int, int], tuple[Tensor, Tensor]] = {}
+
         if transformer is not None:
             self.transformer = transformer.to(device=self.device, dtype=self._torch_dtype)
         elif config.checkpoint_path is not None:
             trans_path = Path(config.checkpoint_path)
             if (trans_path / "transformer").is_dir():
                 trans_path = trans_path / "transformer"
-            self.transformer = Cosmos3OmniTransformer.from_pretrained(
-                str(trans_path),
-                torch_dtype=self._torch_dtype,
-            )
+            if quant_mode == "nf4":
+                if self.device.type != "cuda":
+                    raise Cosmos3FeatureError("4-bit NF4 quantization requires a CUDA device")
+                if config.trainable_lora and config.lora_pathway != "gen_only":
+                    raise Cosmos3FeatureError(
+                        "4-bit NF4 streaming loader prunes the understanding pathway; use lora_pathway='gen_only'"
+                    )
+                if config.trainable_lora and config.lora_use_dora:
+                    raise Cosmos3FeatureError(
+                        "DoRA requires full-precision base weight norms; use standard LoRA with quantization='nf4'"
+                    )
+                self.transformer = self._load_transformer_streaming_nf4(trans_path, max_layer=max_layer)
+                streamed_nf4_loaded = True
+            else:
+                self.transformer = Cosmos3OmniTransformer.from_pretrained(
+                    str(trans_path),
+                    torch_dtype=self._torch_dtype,
+                )
             loaded_transformer_from_disk = True
         else:
             raise Cosmos3FeatureError("Must provide transformer instance or checkpoint_path")
@@ -887,9 +978,9 @@ class Cosmos3FeatureExtractor(BaseVAMExtractor):
             p.requires_grad_(False)
 
         # 2. Load or inject LoRA/DoRA if requested
-        max_layer = max(self.config.hidden_layers)
         if (
             loaded_transformer_from_disk
+            and not streamed_nf4_loaded
             and hasattr(self.transformer, "layers")
             and len(self.transformer.layers) > max_layer
         ):
@@ -919,7 +1010,7 @@ class Cosmos3FeatureExtractor(BaseVAMExtractor):
                     block_indices=range(len(self.transformer.layers)),
                     use_dora=True if (config.trainable_lora and config.lora_use_dora) else None,
                 )
-                if not config.trainable_lora:
+                if not config.trainable_lora and not streamed_nf4_loaded:
                     merge_lora_into_base(self.transformer)
         elif config.trainable_lora:
             from lerobot.policies.vam.cosmos3_lora import (
@@ -951,14 +1042,10 @@ class Cosmos3FeatureExtractor(BaseVAMExtractor):
         )
 
         # 3. Initialize text prompt embedding cache (before moving/pruning embed_tokens)
-        self.prompt_text = config.prompt
-        self.tokenizer = tokenizer
-        self._cached_prompt_embeds: Tensor | None = None
-        self._cached_und_kv: list[tuple[Tensor, Tensor]] | None = None
-        self._cached_gen_rotary: dict[tuple[int, int, int], tuple[Tensor, Tensor]] = {}
-        self._init_prompt_tokens()
+        if not streamed_nf4_loaded:
+            self._init_prompt_tokens()
 
-        if loaded_transformer_from_disk:
+        if loaded_transformer_from_disk and not streamed_nf4_loaded:
             for unused_attr in ("lm_head", "proj_out", "time_embedder", "action_proj_in", "action_proj_out"):
                 if hasattr(self.transformer, unused_attr):
                     setattr(self.transformer, unused_attr, None)
@@ -1015,11 +1102,193 @@ class Cosmos3FeatureExtractor(BaseVAMExtractor):
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
 
-        # 5. Optional compilation
-        if self.config.compile_dit:
+        # 5. Optional compilation (skip DiT compile for 4-bit NF4 bitsandbytes kernels)
+        if self.config.compile_dit and not streamed_nf4_loaded:
             self.compile_transformer(mode=self.config.dit_compile_mode)
         if self.config.compile_vae and self.vae is not None:
             self.compile_vae(mode=self.config.vae_compile_mode)
+
+    @torch.no_grad()
+    def _load_transformer_streaming_nf4(self, trans_path: Path, *, max_layer: int) -> nn.Module:
+        """Stream Cosmos 3 weights layer-by-layer: cache prompt und K/V, prune und, and quantize gen to NF4.
+
+        Keeps peak host RAM < 8 GB and peak VRAM bounded by the quantized gen-only layers (~11.5 GB for
+        60B Cosmos3-Super at L42/64), enabling QLoRA training and RPC inference on 24 GB GPUs.
+        """
+        import contextlib
+
+        import safetensors
+        from diffusers.models.transformers.transformer_cosmos3 import Cosmos3VLTextRotaryEmbedding
+
+        t_cfg = Cosmos3OmniTransformer.load_config(str(trans_path))
+        with torch.device("meta"):
+            transformer = Cosmos3OmniTransformer.from_config(t_cfg)
+
+        # Re-create rotary_emb on CPU so non-persistent buffers are materialized (not meta)
+        transformer.rotary_emb = Cosmos3VLTextRotaryEmbedding(
+            head_dim=int(transformer.config.head_dim),
+            rope_theta=float(getattr(transformer.config, "rope_theta", 5000000.0)),
+            rope_axes_dim=transformer.config.rope_axes_dim,
+        )
+
+        # Truncate unused upper layers and drop unused modality heads before reading any weights
+        if hasattr(transformer, "layers") and len(transformer.layers) > max_layer:
+            transformer.layers = transformer.layers[:max_layer]
+        for unused_attr in (
+            "lm_head",
+            "proj_out",
+            "time_embedder",
+            "action_proj_in",
+            "action_proj_out",
+            "action_modality_embed",
+            "audio_proj_in",
+            "audio_proj_out",
+            "audio_modality_embed",
+        ):
+            if hasattr(transformer, unused_attr):
+                setattr(transformer, unused_attr, None)
+
+        # Resolve safetensors shard map
+        index_file = trans_path / "diffusion_pytorch_model.safetensors.index.json"
+        single_file = trans_path / "diffusion_pytorch_model.safetensors"
+        if index_file.is_file():
+            weight_map: dict[str, str] = json.loads(index_file.read_text())["weight_map"]
+        elif single_file.is_file():
+            with safetensors.safe_open(str(single_file), framework="pt", device="cpu") as sf:
+                weight_map = dict.fromkeys(sf.keys(), single_file.name)
+        else:
+            raise Cosmos3FeatureError(f"No safetensors weights found in {trans_path}")
+
+        root_prefixes = ("embed_tokens.", "proj_in.", "norm.", "norm_moe_gen.")
+        root_keys = [k for k in weight_map if k.startswith(root_prefixes)]
+        layer_keys: list[list[str]] = [[] for _ in range(len(transformer.layers))]
+        for k in weight_map:
+            if k.startswith("layers."):
+                parts = k.split(".", 2)
+                if len(parts) == 3 and parts[1].isdigit():
+                    li = int(parts[1])
+                    if li < len(layer_keys):
+                        layer_keys[li].append(k)
+
+        with contextlib.ExitStack() as stack:
+            handles: dict[str, Any] = {}
+
+            def _get_tensor(key: str) -> Tensor:
+                shard = weight_map[key]
+                h = handles.get(shard)
+                if h is None:
+                    h = stack.enter_context(
+                        safetensors.safe_open(str(trans_path / shard), framework="pt", device="cpu")
+                    )
+                    handles[shard] = h
+                return h.get_tensor(key)
+
+            # 1. Load root modules (embed_tokens stays on CPU; proj_in + norm_moe_gen move to GPU)
+            root_sd = {k: _get_tensor(k) for k in root_keys}
+            transformer.load_state_dict(root_sd, strict=False, assign=True)
+            del root_sd
+            if getattr(transformer, "proj_in", None) is not None:
+                transformer.proj_in = transformer.proj_in.to(device=self.device, dtype=self._torch_dtype)
+            if getattr(transformer, "norm_moe_gen", None) is not None:
+                transformer.norm_moe_gen = transformer.norm_moe_gen.to(
+                    device=self.device, dtype=self._torch_dtype
+                )
+            if getattr(transformer, "norm", None) is not None:
+                transformer.norm = None
+
+            # 2. Compute cached prompt embeddings via CPU embed_tokens
+            self.transformer = transformer
+            self._init_prompt_tokens()
+            assert self._cached_prompt_embeds is not None
+
+            # 3. Prepare RoPE for text prompt tokens
+            curr_und = self._cached_prompt_embeds.to(device=self.device, dtype=self._torch_dtype)
+            if curr_und.ndim == 3 and curr_und.shape[0] == 1:
+                curr_und = curr_und.squeeze(0)
+            enable_fps = getattr(transformer.config, "enable_fps_modulation", True)
+            text_mrope_ids, _ = get_3d_mrope_ids_text_tokens(
+                num_tokens=curr_und.shape[0],
+                temporal_offset=0,
+                use_float_positions=enable_fps,
+            )
+            cos, sin = transformer.rotary_emb(
+                position_ids=text_mrope_ids.to(device=self.device).unsqueeze(1),
+                device=self.device,
+                dtype=self._torch_dtype,
+            )
+            cos_u = cos.squeeze(0).unsqueeze(1)
+            sin_u = sin.squeeze(0).unsqueeze(1)
+
+            # 4. Stream each layer: compute und KV -> delete und -> NF4-quantize gen onto GPU
+            kv_cache: list[tuple[Tensor, Tensor]] = []
+            for idx, blk in enumerate(transformer.layers):
+                prefix = f"layers.{idx}."
+                layer_sd = {k[len(prefix) :]: _get_tensor(k) for k in layer_keys[idx]}
+                blk.load_state_dict(layer_sd, strict=False, assign=True)
+                del layer_sd
+
+                # Move only und submodules to GPU, compute prompt KV, then immediately discard und
+                attn = blk.self_attn
+                blk.input_layernorm = blk.input_layernorm.to(device=self.device, dtype=self._torch_dtype)
+                blk.post_attention_layernorm = blk.post_attention_layernorm.to(
+                    device=self.device, dtype=self._torch_dtype
+                )
+                blk.mlp = blk.mlp.to(device=self.device, dtype=self._torch_dtype)
+                for attr in ("to_q", "to_k", "to_v", "to_out", "norm_q", "norm_k", "k_norm_und_for_gen"):
+                    sub = getattr(attn, attr, None)
+                    if sub is not None:
+                        setattr(attn, attr, sub.to(device=self.device, dtype=self._torch_dtype))
+
+                u_norm = blk.input_layernorm(curr_und)
+                q_u = attn.norm_q(attn.to_q(u_norm).view(-1, attn.num_attention_heads, attn.head_dim))
+                k_u = attn.norm_k(attn.to_k(u_norm).view(-1, attn.num_key_value_heads, attn.head_dim))
+                v_u = attn.to_v(u_norm).view(-1, attn.num_key_value_heads, attn.head_dim)
+                k_norm_und = getattr(attn, "k_norm_und_for_gen", None)
+                k_u_gen = k_norm_und(k_u) if k_norm_und is not None else k_u
+                q_u = q_u * cos_u + _rotate_half(q_u) * sin_u
+                k_u = k_u * cos_u + _rotate_half(k_u) * sin_u
+                k_u_gen = k_u_gen * cos_u + _rotate_half(k_u_gen) * sin_u
+                kv_cache.append((k_u_gen.unsqueeze(0).contiguous(), v_u.unsqueeze(0).contiguous()))
+                c_out = (
+                    dispatch_attention_fn(
+                        q_u.unsqueeze(0),
+                        k_u.unsqueeze(0),
+                        v_u.unsqueeze(0),
+                        is_causal=True,
+                        enable_gqa=True,
+                    )
+                    .squeeze(0)
+                    .flatten(-2, -1)
+                )
+                res_u = curr_und + attn.to_out(c_out)
+                curr_und = res_u + blk.mlp(blk.post_attention_layernorm(res_u))
+
+                # Prune und pathway immediately
+                blk.mlp = None
+                blk.input_layernorm = None
+                blk.post_attention_layernorm = None
+                for attr in ("to_q", "to_k", "to_v", "to_out", "norm_q", "norm_k", "k_norm_und_for_gen"):
+                    if hasattr(attn, attr):
+                        setattr(attn, attr, None)
+
+                # Quantize remaining gen nn.Linear modules to 4-bit NF4 on GPU and move gen norms
+                _quantize_module_linears_nf4(blk, device=self.device, compute_dtype=self._torch_dtype)
+                for attr in ("input_layernorm_moe_gen", "post_attention_layernorm_moe_gen"):
+                    sub = getattr(blk, attr, None)
+                    if sub is not None:
+                        setattr(blk, attr, sub.to(device=self.device, dtype=self._torch_dtype))
+                for attr in ("norm_added_q", "norm_added_k"):
+                    sub = getattr(attn, attr, None)
+                    if sub is not None:
+                        setattr(attn, attr, sub.to(device=self.device, dtype=self._torch_dtype))
+
+                if (idx + 1) % 8 == 0 or (idx + 1) == len(transformer.layers):
+                    gc.collect()
+                    torch.cuda.empty_cache()
+
+            self._cached_und_kv = kv_cache
+
+        return transformer
 
     def _init_prompt_tokens(self) -> None:
         if self.tokenizer is None:
@@ -1347,15 +1616,22 @@ class Cosmos3FeatureExtractor(BaseVAMExtractor):
         return (t, math.ceil(h / p), math.ceil(w / p))
 
     def get_provenance(self) -> dict[str, Any]:
-        is_nano = self.config.backbone_name.replace("-", "_").lower() == "cosmos3_nano"
+        b_key = self.config.backbone_name.replace("-", "_").lower()
+        if b_key == "cosmos3_super":
+            model_type = "Cosmos3-Super"
+        elif b_key == "cosmos3_nano":
+            model_type = "Cosmos3-Nano"
+        else:
+            model_type = "Cosmos3-Edge"
         prov: dict[str, Any] = {
-            "model_type": "Cosmos3-Nano" if is_nano else "Cosmos3-Edge",
+            "model_type": model_type,
             "hidden_layers": list(self.config.hidden_layers),
             "latent_patch_size": self.config.latent_patch_size,
             "fps": self.config.fps,
             "base_fps": self.config.base_fps,
             "device": str(self.device),
             "dtype": str(self.config.dtype),
+            "quantization": self.config.quantization,
             "prompt": self.prompt_text,
         }
         if self.config.checkpoint_path:

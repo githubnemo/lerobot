@@ -35,18 +35,31 @@ def _read_json(path: Path) -> dict[str, Any]:
 
 
 def _resolve_cosmos3_checkpoint_path(configured: str | Path, *, backend: str = "cosmos3_edge") -> Path:
-    """Resolve Cosmos 3 Edge/Nano checkpoint path across machines and HuggingFace caches."""
+    """Resolve Cosmos 3 Edge/Nano/Super (and Policy-DROID) checkpoint path across machines and caches."""
     configured_path = Path(configured)
     if configured_path.exists():
         return configured_path
 
-    is_nano = backend.replace("-", "_").lower() == "cosmos3_nano"
-    cache_subdir = "cosmos3-nano" if is_nano else "cosmos3-edge"
-    hub_repo_dir = "models--nvidia--Cosmos3-Nano" if is_nano else "models--nvidia--Cosmos3-Edge"
+    vam_cache_root = Path(os.environ.get("VAM_CACHE_DIR", str(Path.home() / ".cache/video-vam")))
+    configured_name = configured_path.name
+    if configured_name:
+        for base_dir in (vam_cache_root, Path.home() / ".cache/video-vam"):
+            candidate = base_dir / configured_name
+            if (candidate / "transformer").is_dir():
+                return candidate
 
-    default_cache = Path.home() / ".cache/video-vam" / cache_subdir
-    if (default_cache / "transformer").is_dir():
-        return default_cache
+    b_key = backend.replace("-", "_").lower()
+    if b_key == "cosmos3_super":
+        cache_subdir, hub_repo_dir = "cosmos3-super", "models--nvidia--Cosmos3-Super"
+    elif b_key == "cosmos3_nano":
+        cache_subdir, hub_repo_dir = "cosmos3-nano", "models--nvidia--Cosmos3-Nano"
+    else:
+        cache_subdir, hub_repo_dir = "cosmos3-edge", "models--nvidia--Cosmos3-Edge"
+
+    for base_dir in (vam_cache_root, Path.home() / ".cache/video-vam"):
+        default_cache = base_dir / cache_subdir
+        if (default_cache / "transformer").is_dir():
+            return default_cache
 
     hub_dirs: list[Path] = []
     if hf_home := os.environ.get("HF_HOME"):
@@ -163,7 +176,12 @@ class VideoVAMPolicy(PreTrainedPolicy):
                 "action_semantics": {"euler_steps": manifest_steps},
             }
         normalizer = _load_normalizer(run_dir, metadata)
-        input_channels = 2048 if config.backend in ("cosmos", "cosmos3_edge") else 4096
+        if config.backend in ("cosmos", "cosmos3_edge"):
+            input_channels = 2048
+        elif config.backend == "cosmos3_super":
+            input_channels = 5120
+        else:
+            input_channels = 4096
         self.decoder = SmolExpertActionDecoder.from_training_checkpoint(
             run_dir / "best.safetensors",
             normalizer=normalizer,
@@ -307,10 +325,9 @@ class VideoVAMPolicy(PreTrainedPolicy):
                         inner_vae.encoder = torch.compile(inner_vae.encoder, mode="default")
             return extractor, prompt
 
-        elif self.config.backend in ("cosmos3_edge", "cosmos3_nano"):
+        elif self.config.backend in ("cosmos3_edge", "cosmos3_nano", "cosmos3_super"):
             from .cosmos3_features import Cosmos3ExtractorConfig, Cosmos3FeatureExtractor
 
-            is_nano = self.config.backend == "cosmos3_nano"
             run_dir = Path(self.config.pretrained_path) if self.config.pretrained_path is not None else None
             lora_ckpt = self.config.cosmos3_lora_weights
             if lora_ckpt is not None and not Path(lora_ckpt).exists():
@@ -326,11 +343,19 @@ class VideoVAMPolicy(PreTrainedPolicy):
             ):
                 lora_ckpt = run_dir / "best_backbone_lora.safetensors"
 
-            default_layer = 18 if is_nano else 20
+            if self.config.backend == "cosmos3_super":
+                backbone_name, default_layer = "cosmos3-super", 42
+            elif self.config.backend == "cosmos3_nano":
+                backbone_name, default_layer = "cosmos3-nano", 18
+            else:
+                backbone_name, default_layer = "cosmos3-edge", 20
             tap_layer = int(getattr(self.config, "cosmos3_layer", None) or default_layer)
+            quant_mode = getattr(self.config, "cosmos3_quantization", None)
+            if quant_mode == "none":
+                quant_mode = None
             extractor = Cosmos3FeatureExtractor(
                 Cosmos3ExtractorConfig(
-                    backbone_name="cosmos3-nano" if is_nano else "cosmos3-edge",
+                    backbone_name=backbone_name,
                     checkpoint_path=_resolve_cosmos3_checkpoint_path(
                         self.config.cosmos3_checkpoint, backend=self.config.backend
                     ),
@@ -343,7 +368,9 @@ class VideoVAMPolicy(PreTrainedPolicy):
                     lora_rank=getattr(self.config, "cosmos3_lora_rank", None) or 16,
                     lora_alpha=getattr(self.config, "cosmos3_lora_alpha", None) or 32.0,
                     lora_use_dora=bool(getattr(self.config, "cosmos3_lora_use_dora", False)),
-                    compile_dit=bool(getattr(self.config, "cosmos_torch_compile", False)),
+                    quantization=quant_mode,
+                    compile_dit=bool(getattr(self.config, "cosmos_torch_compile", False))
+                    and quant_mode is None,
                     compile_vae=bool(getattr(self.config, "cosmos_torch_compile", False)),
                 )
             )
@@ -383,7 +410,7 @@ class VideoVAMPolicy(PreTrainedPolicy):
             return getattr(self.config, "feature_seed_global", 0)
         frame = batch.get(HISTORY_FRAME_INDEX_KEY)
         if not isinstance(frame, Tensor) or frame.numel() != 1:
-            if self.config.backend in ("cosmos3_edge", "cosmos3_nano"):
+            if self.config.backend in ("cosmos3_edge", "cosmos3_nano", "cosmos3_super"):
                 return getattr(self.config, "feature_seed_global", 0)
             frame_val = self._auto_frame_index
             self._auto_frame_index += 1
@@ -404,10 +431,15 @@ class VideoVAMPolicy(PreTrainedPolicy):
     def _extract_context(self, images: Tensor, feature_seed: int) -> Tensor:
         if images.shape[0] != 1:
             raise ValueError("Video-VAM hardware rollout supports batch size one only")
-        if self.config.backend in ("cosmos3_edge", "cosmos3_nano"):
+        if self.config.backend in ("cosmos3_edge", "cosmos3_nano", "cosmos3_super"):
             extraction = self.extractor.extract(rgb_frames=images)
             context = extraction.features
-            expected = (1, 600, 4096 if self.config.backend == "cosmos3_nano" else 2048)
+            expected_ch = (
+                5120
+                if self.config.backend == "cosmos3_super"
+                else (4096 if self.config.backend == "cosmos3_nano" else 2048)
+            )
+            expected = (1, 600, expected_ch)
         elif self.config.backend == "cosmos":
             prompt = self.prompt_embedding
             if prompt.shape[0] != 1:
