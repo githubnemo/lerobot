@@ -423,6 +423,7 @@ class RPCApplication:
                 int(getattr(self.backend.config, "history_size", HISTORY)) if self.name == "video_vam" else 1
             ),
             "fps": 10,
+            "task": str(getattr(self.backend.config, "cosmos3_prompt", "") or ""),
             "action_units": ["degrees"] * 5 + ["range_0_100"],
         }
 
@@ -643,7 +644,6 @@ class RPCApplication:
                     )
             else:
                 actions = self.backend.predict_action_chunk(batch, **kwargs)[0].cpu()
-            actions = _smooth_chunk_nyquist(actions, passes=2)
             original = actions.clone()
         actions = validate_chunk(actions, horizon=self.horizon)
         original = validate_chunk(original, horizon=self.horizon, name="original_chunk")

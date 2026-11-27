@@ -805,7 +805,9 @@ def _run_dry(args: argparse.Namespace, client: VideoVAMRPCClient) -> None:
         for _ in range(client.frames.maxlen or 1):
             client.remember(image)
             time.sleep(1.0 / max(1, client.fps))
-        snapshot = client.snapshot([0.0] * 6, task=args.task, feature_seed=args.feature_seed)
+        snapshot = client.snapshot(
+            [0.0] * 6, task=args.task or client.health.get("task") or "", feature_seed=args.feature_seed
+        )
         snapshot.pop("prev_chunk_left_over")
         snapshot.pop("inference_delay")
         return snapshot
@@ -1138,66 +1140,6 @@ def _run_single_episode(
                     exact_delay = ticks_sent - snapshot_ticks if running and rtc else 0
                     delay = min(max(0, exact_delay), horizon - 1)
                     qsize_before = queue.qsize()
-                    if running and rtc:
-                        prev_remaining = queue.get_processed_left_over()
-                        prev_orig_remaining = queue.get_left_over()
-                        post_delay = actions[delay:].clone()
-                        if prev_remaining is not None and len(prev_remaining) > 0 and len(post_delay) > 0:
-                            blend_len = min(len(prev_remaining), len(post_delay), 6)
-                            alpha = torch.linspace(
-                                0.0, 1.0, blend_len + 2, dtype=actions.dtype, device=actions.device
-                            )[1:-1].unsqueeze(-1)
-                            post_delay[:blend_len] = (1.0 - alpha) * prev_remaining[:blend_len].to(
-                                actions.device, actions.dtype
-                            ) + alpha * post_delay[:blend_len]
-                            actions = actions.clone()
-                            actions[delay:] = post_delay
-                            if prev_orig_remaining is not None and len(prev_orig_remaining) >= blend_len:
-                                orig_post = original[delay:].clone()
-                                orig_post[:blend_len] = (1.0 - alpha) * prev_orig_remaining[:blend_len].to(
-                                    original.device, original.dtype
-                                ) + alpha * orig_post[:blend_len]
-                                original = original.clone()
-                                original[delay:] = orig_post
-                        elif last_action is not None and len(post_delay) > 0:
-                            held = torch.tensor(
-                                [last_action[name] for name in ACTION_NAMES],
-                                dtype=actions.dtype,
-                                device=actions.device,
-                            )
-                            blend_len = min(len(post_delay), 6)
-                            alpha = torch.linspace(
-                                0.0, 1.0, blend_len + 2, dtype=actions.dtype, device=actions.device
-                            )[1:-1].unsqueeze(-1)
-                            post_delay[:blend_len] = (1.0 - alpha) * held.unsqueeze(0) + alpha * post_delay[
-                                :blend_len
-                            ]
-                            actions = actions.clone()
-                            actions[delay:] = post_delay
-                            if client.health.get("original_space") == "physical" and len(original) > delay:
-                                orig_post = original[delay:].clone()
-                                orig_blend_len = min(len(orig_post), blend_len)
-                                orig_alpha = alpha[:orig_blend_len].to(
-                                    device=original.device, dtype=original.dtype
-                                )
-                                orig_held = held.to(device=original.device, dtype=original.dtype)
-                                orig_post[:orig_blend_len] = (1.0 - orig_alpha) * orig_held.unsqueeze(
-                                    0
-                                ) + orig_alpha * orig_post[:orig_blend_len]
-                                original = original.clone()
-                                original[delay:] = orig_post
-                    elif running and not rtc and last_action is not None and len(actions) > 0:
-                        held = torch.tensor(
-                            [last_action[name] for name in ACTION_NAMES],
-                            dtype=actions.dtype,
-                            device=actions.device,
-                        )
-                        blend_len = min(len(actions), 6)
-                        alpha = torch.linspace(
-                            0.0, 1.0, blend_len + 2, dtype=actions.dtype, device=actions.device
-                        )[1:-1].unsqueeze(-1)
-                        actions = actions.clone()
-                        actions[:blend_len] = (1.0 - alpha) * held.unsqueeze(0) + alpha * actions[:blend_len]
                     queue.merge(original, actions, delay)
                     qsize_after = queue.qsize()
                     ticks_since_merge = 0
@@ -1269,7 +1211,7 @@ def _run_single_episode(
                             delay = max(0, len(previous) - 1)
                     snapshot = client.snapshot(
                         state,
-                        task=args.task,
+                        task=args.task or client.health.get("task") or "",
                         feature_seed=args.feature_seed,
                         leftover=previous,
                         inference_delay=delay,
@@ -1804,8 +1746,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--num-episodes",
         type=int,
-        default=-1,
-        help="Number of episodes (-1 for continuous loop until Ctrl+C, default -1)",
+        default=1,
+        help="Number of episodes (-1 for continuous loop until Ctrl+C, default 1)",
     )
     parser.add_argument(
         "--reset-time",
@@ -1819,7 +1761,11 @@ def main(argv: list[str] | None = None) -> int:
         default=3.5,
         help="Duration in seconds for smooth transition back to base position (default 3.5)",
     )
-    parser.add_argument("--task", default="take cube out of box")
+    parser.add_argument(
+        "--task",
+        default=None,
+        help="Task instruction string (defaults to checkpoint config prompt when omitted).",
+    )
     parser.add_argument("--strategy.type", dest="strategy_type", default="base")
     parser.add_argument(
         "--no-rpc",
