@@ -778,6 +778,7 @@ class OnlineVideoDataset(torch.utils.data.Dataset[OnlineVideoItem]):
         stride: int = 1,
         contract: Any = CUBE_OUT_OF_BOX_CONTRACT,
         ram_headroom_gb: int = 26,
+        history_size: int = 5,
     ) -> None:
         self.repo_id = repo_id
         self.root = Path(root).expanduser().resolve() if root is not None else None
@@ -785,6 +786,7 @@ class OnlineVideoDataset(torch.utils.data.Dataset[OnlineVideoItem]):
         self.stride = stride
         self.contract = contract
         self.ram_headroom_gb = ram_headroom_gb
+        self.history_size = int(history_size)
         self.manifest_path = Path(f"online://{repo_id}?stride={stride}&episodes={len(episodes)}")
         revision = getattr(contract, "revision", None) if contract.repo_id == repo_id else None
         self.payload: dict[str, Any] = {
@@ -829,7 +831,7 @@ class OnlineVideoDataset(torch.utils.data.Dataset[OnlineVideoItem]):
         self._ram_actions: list[Tensor] = []
         self._ram_paddings: list[Tensor] = []
         self._ep_video_info: dict[int, tuple[Path, float, list[float]]] = {}
-        self._cam_delta_indices: list[int] = [-4, -3, -2, -1, 0]
+        self._cam_delta_indices: list[int] = list(range(-(self.history_size - 1), 1))
         self._tolerance_s: float = 1e-4
         self._video_backend: str | None = None
         self._maybe_preload_to_ram()
@@ -1785,6 +1787,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         choices=["none", "nf4"],
         default="none",
         help="Optional backbone weight quantization for Cosmos 3 ('nf4' enables streaming 4-bit NF4 QLoRA).",
+    )
+    parser.add_argument(
+        "--history-size",
+        type=int,
+        choices=[1, 5],
+        default=5,
+        help="Number of input camera frames per observation window (default: 5; use 1 for single-frame ablation).",
     )
     parser.add_argument(
         "--backbone-lora-lr",
@@ -2776,6 +2785,7 @@ def main(argv: list[str] | None = None) -> int:
             episodes=eval2_eps,
             stride=20,
             contract=dataset_contract,
+            history_size=args.history_size,
         )
         print(f"Eval-Set 2 Online Dataset Initialized ({len(eval2_dataset)} samples).")
 
@@ -2794,6 +2804,7 @@ def main(argv: list[str] | None = None) -> int:
             episodes=val_eps,
             stride=20,
             contract=dataset_contract,
+            history_size=args.history_size,
         )
 
     train_dataset: Any = None
@@ -2805,6 +2816,7 @@ def main(argv: list[str] | None = None) -> int:
             stride=args.train_stride,
             contract=dataset_contract,
             ram_headroom_gb=12 if args.augment else 26,
+            history_size=args.history_size,
         )
         print(
             f"Loaded online video training dataset with {len(train_dataset)} windows (stride {args.train_stride}, augment={args.augment})"
@@ -3951,6 +3963,7 @@ def main(argv: list[str] | None = None) -> int:
                 "cosmos3_quantization": None if cfg_quant in (None, "none") else cfg_quant,
                 "cosmos3_prompt": args.backbone_prompt,
                 "cosmos3_fps": resolved_cfg_fps,
+                "history_size": int(args.history_size),
             }
         )
     elif backend_val == "cosmos":

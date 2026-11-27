@@ -70,6 +70,7 @@ class VideoVAMConfig(PreTrainedConfig):
     use_amp: bool = False
 
     camera_key: str = "observation.images.front"
+    history_size: int = 5
     chunk_size: int = 30
     n_action_steps: int = 30
     dataset_revision: str = "243370c3c08bcbd860133c4a0d658ea7c1d2e77e"
@@ -228,10 +229,13 @@ class VideoVAMConfig(PreTrainedConfig):
             rollout_config.fps = 10  # type: ignore[attr-defined]
         inference = getattr(rollout_config, "inference", None)
         if getattr(inference, "type", None) == "rtc":
-            if getattr(inference, "observation_history_size", None) == 1:
-                inference.observation_history_size = 5
-            if getattr(inference, "observation_history_size", None) != 5:
-                raise ValueError("Video-VAM rollout requires inference.observation_history_size=5")
+            expected_hist = int(getattr(self, "history_size", 5))
+            if getattr(inference, "observation_history_size", None) == 1 and expected_hist != 1:
+                inference.observation_history_size = expected_hist
+            if getattr(inference, "observation_history_size", None) != expected_hist:
+                raise ValueError(
+                    f"Video-VAM rollout requires inference.observation_history_size={expected_hist}"
+                )
             rtc_cfg = getattr(inference, "rtc", None)
             if rtc_cfg is not None and getattr(rtc_cfg, "max_guidance_weight", 10.0) > 3.0:
                 rtc_cfg.max_guidance_weight = 3.0

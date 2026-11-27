@@ -419,7 +419,9 @@ class RPCApplication:
             "horizon": self.horizon,
             "original_space": self.original_space,
             "action_dim": 6,
-            "history_size": HISTORY if self.name == "video_vam" else 1,
+            "history_size": (
+                int(getattr(self.policy.config, "history_size", HISTORY)) if self.name == "video_vam" else 1
+            ),
             "fps": 10,
             "action_units": ["degrees"] * 5 + ["range_0_100"],
         }

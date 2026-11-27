@@ -2308,3 +2308,19 @@ Key takeaways:
      - `@250`: `Full-30 29.09 | H1 26.46° | F5 26.89°` → `@500`: `22.60 / 19.98° / 19.79°` → `@750`: `21.94 / 19.29° / 19.14° | val_flow 0.1042`.
      - 4-bit NF4 quantization noise across 42 layers + 5,120-dim linear projection severely slowed convergence compared to full bf16 Edge/Nano (`~6–7°` H1 at the same step). Stopped early and shut down `ewg51opg4zywzi` (`status=EXITED`).
 - **Decision**: Stick with full-precision **bf16 general pretrained Cosmos 3** backbones (`exp010` / `exp007` Edge for local 8 GB; `exp002` Nano + `FLUX 3 Action 14.20` for remote 4090 RPC) for tomorrow's live `sahni` tests.
+
+---
+
+## 2026-11-27 — Physical SO-101 (`shabby`) Stage 1 Benchmark (`exp010`, `exp007`, `exp002`, `exp009`) & `history_size=1` Ablation (`exp014`)
+
+- **Setup**: Evaluated all 4 top Cosmos 3 Video-VAM checkpoints (`history_size=5`, 30 Hz, `--home-pose -0.3 -86.7 88.2 71.1 -53.4 17.7`, 10 Euler steps) live on `shabby` (`sahni`, `/dev/ttyACM0`, wrist cam `/dev/video0`).
+  - **Latency / RTC**: Local `sahni` RTX 3050 (`exp010`) ran at `0.866 s/chunk` (`41.0%` starved, no RTC) and `0.699 s/chunk` (`28.8%` starved, `--compile --rtc`). Moving inference to `abakus` RTX 4090 over an SSH bridge (`rpc_server.py --compile --rtc --execution-horizon 10`) dropped GPU latency to **`0.145 s`** (Edge) / **`0.182 s`** (Nano) and total RTT to **`0.30–0.33 s`** (`~0%` starvation).
+- **Physical Results & Archived Rollout Traces (`abakus:/home/anton/lerobot-video-vam/outputs/rollout_debug/2026-11-27_shabby_stage1/`)**:
+  1. **`exp010`** (`exp010_raw_run1`, `exp010_rtc_compiled_run2`, `exp010_abakus_4090_rtc_run3` — 79 chunks / 35 s): Smooth on 4090 RPC, but **failed to grasp cube**.
+  2. **`exp007`** (`exp007_abakus_4090_rtc_120s` — 181 chunks / 2,882 ticks): Smooth on 4090 RPC, **failed to grasp cube** (stopped early by operator).
+  3. **`exp002`** (`exp002_nano_abakus_4090_rtc_120s` — 228 chunks / 3,600 ticks): Smooth on 4090 RPC, **failed to grasp cube**.
+  4. **`exp009`** (`exp009_abakus_4090_rtc_90s` — 167 chunks / 2,700 ticks): Smooth on 4090 RPC, **failed to grasp cube**.
+- **Hypothesis & Next Step (`exp014`)**:
+  - Offline `H1`/`First-5` RMSE (`3.84°–4.39°`) did **not** translate to closed-loop grasping, while single-frame **SmolVLA** performs much better live.
+  - Likely cause: **5-frame history (`history_size=5`)** induces classic BC causal confusion (copy-past-motion inertia) and sensitivity to domain/speed shift.
+  - Skipped Stage 2 EXPO RL (needs a base policy with non-zero grasp rate first). Added `--history-size 1` support across `train_smolexpert.py`, `VideoVAMConfig`, and `rpc_server.py`, and launching **`exp014_c3_edge_hist1_action_lora.sh`** (exact twin of `exp007` with `--history-size 1`) on RunPod RTX 5090.

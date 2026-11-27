@@ -1,6 +1,6 @@
 # Video-VAM status
 
-**Last updated:** 2026-11-26. Supersedes `archive/video_vam_roadmap.md`, `archive/video_vam_technical_report.md`, `archive/EXPERIMENTS_OVERVIEW.md` and `archive/video_vam_execution_plan.md`.
+**Last updated:** 2026-11-27. Supersedes `archive/video_vam_roadmap.md`, `archive/video_vam_technical_report.md`, `archive/EXPERIMENTS_OVERVIEW.md` and `archive/video_vam_execution_plan.md`.
 Numbers here are summaries; the [leaderboard](./video_vam_leaderboard.md) is authoritative.
 
 ## 0c. Short-Term Goal (2026-11-24, Anton — additive to §0 & §0a)
@@ -26,7 +26,12 @@ Numbers here are summaries; the [leaderboard](./video_vam_leaderboard.md) is aut
     - `c3_bs64_joint_lora_warmstart_fixed` → [`Orellius/so101_sort_cubes_no_top_cosmos3_edge_bs64_joint_lora_fixed`](https://huggingface.co/Orellius/so101_sort_cubes_no_top_cosmos3_edge_bs64_joint_lora_fixed)
     - `c3_nano_l24_bs8_10ep` → [`Orellius/so101_sort_cubes_no_top_cosmos3_nano_l24_bs8_10ep`](https://huggingface.co/Orellius/so101_sort_cubes_no_top_cosmos3_nano_l24_bs8_10ep)
   - All Nov 13–14 runs also remain archived on `abakus` (`outputs/train/` symlinked to `/mnt/archive/anton/nvme_archive/lerobot-video-vam/outputs/train/`).
-- **Compute status (`2026-11-26`)**: `abakus` RTX 4090 is **free of all VAM jobs** (yielded back to Anton's other experiments). **All RunPod GPU pods are cleanly stopped (`status=EXITED`, `$0.134/hr` storage-only)** with balance `$615.51`.
+- **Compute status (`2026-11-27`)**: `abakus` RTX 4090 is **free of all VAM jobs** (`1.58 / 24.56 GB, 0%` GPU).
+  - **Stage 1 Physical SO-101 (`shabby`) Real-Robot Benchmark (`2026-11-27`, `abakus` RTX 4090 RPC + RTC, 30 Hz, 0% starvation)**:
+    - Tested **`exp010`** (Edge 2-stage Video→Action), **`exp007`** (Edge 1-stage Direct Action, 120 s), **`exp002`** (Nano `L24/36`, 120 s), and **`exp009`** (Edge Video-LoRA frozen, 90 s) live on `shabby`.
+    - **Inference speed**: Local `sahni` RTX 3050 (`0.70 s/chunk`, `28.8%` starved) → `abakus` RTX 4090 RPC (`0.14–0.18 s` GPU, `0.30–0.33 s` RTT, `~0%` starvation).
+    - **Closed-loop outcome**: **0/4 policies successfully grasped the purple cube** (SmolVLA single-frame policy still clearly outperforms them live). Full rollout traces (wrist-camera frames, 30 Hz `ticks.jsonl`, `chunks.jsonl`, `meta.json`) archived on `abakus:/home/anton/lerobot-video-vam/outputs/rollout_debug/2026-11-27_shabby_stage1/`.
+    - **Next ablation (`exp014`)**: **`history_size=1` single-frame Cosmos 3 Edge** (`scripts/video_vam/experiments/exp014_c3_edge_hist1_action_lora.sh`, exact twin of `exp007` with `--history-size 1`) to test whether 5-frame history causes BC causal confusion ("copy-past-motion" inertia) and hurts closed-loop domain transfer vs. single-frame SmolVLA.
   - **Negative-result ablations (`exp011`, `exp013`, `c87b208d`, manually early-stopped)**:
     - **`exp011` (`Cosmos3-Edge-Policy-DROID`, stopped @ `1,100/3,500` on `abakus`)**: At step `1,000`: `Full-30 17.137`, `H1 6.952°`, `First-5 8.463°` (`+1.58°` worse Full-30 and `+1.35°` worse F5 than matched vanilla `Cosmos3-Edge` `exp007` `@1000`: `15.555 / 5.638° / 7.117°`). DROID Franka 5 Hz multi-view specialization hurt transfer to wrist-only SO-101; `exp012` (`Nano-Policy-DROID`) skipped for the same reason.
     - **`exp013` (`60B Cosmos3-Super L42/64 4-bit NF4 QLoRA`, stopped @ `760/3,500` on RunPod Blackwell `ewg51opg4zywzi`)**: Streaming `und`-pruned 4-bit NF4 loader worked cleanly (`11.26 GB` VRAM, `90.6 ms` B=1 @ `240×320` — fits 24 GB 4090 RPC), **but** 4-bit quantization noise across 42 layers + 5,120-dim feature projection stalled accuracy badly (`@750`: `Full-30 21.937`, `H1 19.288°`, `First-5 19.140°` vs `~6–7°` for bf16 Edge/Nano); stopped early to save RunPod spend.
