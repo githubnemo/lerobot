@@ -779,6 +779,8 @@ class OnlineVideoDataset(torch.utils.data.Dataset[OnlineVideoItem]):
         contract: Any = CUBE_OUT_OF_BOX_CONTRACT,
         ram_headroom_gb: int = 26,
         history_size: int = 5,
+        history_stride: int = 1,
+        history_jitter_frames: int = 0,
     ) -> None:
         self.repo_id = repo_id
         self.root = Path(root).expanduser().resolve() if root is not None else None
@@ -787,6 +789,8 @@ class OnlineVideoDataset(torch.utils.data.Dataset[OnlineVideoItem]):
         self.contract = contract
         self.ram_headroom_gb = ram_headroom_gb
         self.history_size = int(history_size)
+        self.history_stride = max(1, int(history_stride))
+        self.history_jitter_frames = max(0, int(history_jitter_frames))
         self.manifest_path = Path(f"online://{repo_id}?stride={stride}&episodes={len(episodes)}")
         revision = getattr(contract, "revision", None) if contract.repo_id == repo_id else None
         self.payload: dict[str, Any] = {
@@ -800,11 +804,12 @@ class OnlineVideoDataset(torch.utils.data.Dataset[OnlineVideoItem]):
         from lerobot.datasets.lerobot_dataset import LeRobotDataset
 
         ds_delta_timestamps = dict(self.contract.delta_timestamps())
-        if self.history_size != 5 and self.contract.camera_key in ds_delta_timestamps:
+        cam_offsets = [
+            -(self.history_size - 1 - k) * self.history_stride for k in range(self.history_size)
+        ]
+        if (self.history_size != 5 or self.history_stride != 1) and self.contract.camera_key in ds_delta_timestamps:
             step_s = 1.0 / float(self.contract.fps)
-            ds_delta_timestamps[self.contract.camera_key] = [
-                round(offset * step_s, 6) for offset in range(-(self.history_size - 1), 1)
-            ]
+            ds_delta_timestamps[self.contract.camera_key] = [round(offset * step_s, 6) for offset in cam_offsets]
 
         self.lerobot_ds = LeRobotDataset(
             self.repo_id,
@@ -838,7 +843,9 @@ class OnlineVideoDataset(torch.utils.data.Dataset[OnlineVideoItem]):
         self._ram_actions: list[Tensor] = []
         self._ram_paddings: list[Tensor] = []
         self._ep_video_info: dict[int, tuple[Path, float, list[float]]] = {}
-        self._cam_delta_indices: list[int] = list(range(-(self.history_size - 1), 1))
+        self._cam_delta_indices: list[int] = [
+            -(self.history_size - 1 - k) * self.history_stride for k in range(self.history_size)
+        ]
         self._tolerance_s: float = 1e-4
         self._video_backend: str | None = None
         self._maybe_preload_to_ram()
@@ -1050,7 +1057,16 @@ class OnlineVideoDataset(torch.utils.data.Dataset[OnlineVideoItem]):
                 win = [frame_pos[max(0, min(ep_len - 1, frame + d))] for d in self._cam_delta_indices]
             else:
                 ep_len = ep_frames.shape[0]
-                win = [max(0, min(ep_len - 1, frame + d)) for d in self._cam_delta_indices]
+                if self.history_jitter_frames > 0 and len(self._cam_delta_indices) > 1:
+                    # Jitter past frames around nominal offsets while keeping current frame (0) exact
+                    jittered = []
+                    for d in self._cam_delta_indices[:-1]:
+                        j = int(torch.randint(-self.history_jitter_frames, self.history_jitter_frames + 1, (1,)).item())
+                        jittered.append(max(0, min(ep_len - 1, frame + d + j)))
+                    jittered.append(max(0, min(ep_len - 1, frame + self._cam_delta_indices[-1])))
+                    win = jittered
+                else:
+                    win = [max(0, min(ep_len - 1, frame + d)) for d in self._cam_delta_indices]
             camera = ep_frames[win]
             return OnlineVideoItem(
                 rgb=camera,
@@ -1814,6 +1830,18 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         choices=[1, 5],
         default=5,
         help="Number of input camera frames per observation window (default: 5; use 1 for single-frame ablation).",
+    )
+    parser.add_argument(
+        "--history-stride",
+        type=int,
+        default=1,
+        help="Frame stride between history frames in dataset ticks (e.g. 3 for 10 Hz history from a 30 fps recording).",
+    )
+    parser.add_argument(
+        "--history-jitter-frames",
+        type=int,
+        default=0,
+        help="Random +/- frame jitter applied to past history frames during training (e.g. 1-2 frames @ 30 fps = +/-0.03-0.07s).",
     )
     parser.add_argument(
         "--delta-actions",
@@ -2818,6 +2846,7 @@ def main(argv: list[str] | None = None) -> int:
             stride=20,
             contract=dataset_contract,
             history_size=args.history_size,
+            history_stride=args.history_stride,
         )
         print(f"Eval-Set 2 Online Dataset Initialized ({len(eval2_dataset)} samples).")
 
@@ -2837,6 +2866,7 @@ def main(argv: list[str] | None = None) -> int:
             stride=20,
             contract=dataset_contract,
             history_size=args.history_size,
+            history_stride=args.history_stride,
         )
 
     train_dataset: Any = None
@@ -2849,6 +2879,8 @@ def main(argv: list[str] | None = None) -> int:
             contract=dataset_contract,
             ram_headroom_gb=12 if args.augment else 26,
             history_size=args.history_size,
+            history_stride=args.history_stride,
+            history_jitter_frames=args.history_jitter_frames,
         )
         print(
             f"Loaded online video training dataset with {len(train_dataset)} windows (stride {args.train_stride}, augment={args.augment})"

@@ -93,6 +93,14 @@ class SOFollower(Robot):
             features.update({f"{motor}.load": float for motor in self.bus.motors})
         if self.config.record_current:
             features.update({f"{motor}.current": float for motor in self.bus.motors})
+        if self.config.record_voltage:
+            features.update({f"{motor}.voltage": float for motor in self.bus.motors})
+        if self.config.record_temperature:
+            features.update({f"{motor}.temperature": float for motor in self.bus.motors})
+        if self.config.record_moving:
+            features.update({f"{motor}.moving": float for motor in self.bus.motors})
+        if self.config.record_status:
+            features.update({f"{motor}.status": float for motor in self.bus.motors})
         return features
 
     @property
@@ -191,6 +199,26 @@ class SOFollower(Robot):
                 "Present_Current", normalize=False, num_retry=self.config.num_read_retries
             )
             obs_dict.update({f"{motor}.current": float(val) for motor, val in curr_dict.items()})
+        if self.config.record_voltage:
+            volt_dict = self.bus.sync_read(
+                "Present_Voltage", normalize=False, num_retry=self.config.num_read_retries
+            )
+            obs_dict.update({f"{motor}.voltage": float(val) for motor, val in volt_dict.items()})
+        if self.config.record_temperature:
+            temp_dict = self.bus.sync_read(
+                "Present_Temperature", normalize=False, num_retry=self.config.num_read_retries
+            )
+            obs_dict.update({f"{motor}.temperature": float(val) for motor, val in temp_dict.items()})
+        if self.config.record_moving:
+            mov_dict = self.bus.sync_read(
+                "Moving", normalize=False, num_retry=self.config.num_read_retries
+            )
+            obs_dict.update({f"{motor}.moving": float(val) for motor, val in mov_dict.items()})
+        if self.config.record_status:
+            stat_dict = self.bus.sync_read(
+                "Status", normalize=False, num_retry=self.config.num_read_retries
+            )
+            obs_dict.update({f"{motor}.status": float(val) for motor, val in stat_dict.items()})
         dt_ms = (time.perf_counter() - start) * 1e3
         logger.debug(f"{self} read state: {dt_ms:.1f}ms")
 

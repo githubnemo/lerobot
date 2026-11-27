@@ -1835,6 +1835,10 @@ def main(argv: list[str] | None = None) -> int:
         help="Optional directory to save per-episode debug traces (meta.json, chunks.jsonl, ticks.jsonl, snapshot frames).",
     )
     args = parser.parse_args(argv)
+    if args.debug_dir is None and not args.dry_run and not args.stop_server:
+        stamp = time.strftime("%Y%m%d_%H%M%S")
+        ckpt_slug = re.sub(r"[^A-Za-z0-9._-]+", "_", Path(str(args.checkpoint or "default")).name)[:48]
+        args.debug_dir = Path("outputs/rollout_debug") / f"{stamp}_{args.policy}_{ckpt_slug}"
     SSH_HOST = args.remote_host
     if _is_local_host(SSH_HOST):
         REPO = str(Path(__file__).resolve().parents[2])
