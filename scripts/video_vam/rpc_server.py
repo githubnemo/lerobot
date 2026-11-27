@@ -329,6 +329,14 @@ class RPCApplication:
                 self.shared_detector.load_state_dict(det_state, strict=False)
                 self.shared_detector.eval()
 
+        if self.name == "smolvla" and self.online_expo_enabled and self.multiframe_detector is None:
+            from lerobot.rewards.sequence_detector import MultiFrameSuccessDetector
+
+            self.multiframe_detector = MultiFrameSuccessDetector(
+                seq_len=8, state_dim=6, pretrained=True
+            ).to(self.device)
+            self.multiframe_detector.eval()
+
         if (
             self.expo_checkpoint_path is not None
             or self.online_expo_enabled
