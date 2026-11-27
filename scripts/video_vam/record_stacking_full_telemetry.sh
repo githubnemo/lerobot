@@ -18,6 +18,10 @@ EPISODE_TIME_S="${EPISODE_TIME_S:-45}"
 RESET_TIME_S="${RESET_TIME_S:-10}"
 
 export HF_HOME="${HF_HOME:-/home/nemo/.cache/pysandbox-lerobot/huggingface}"
+if [ -z "${HF_TOKEN:-}" ] && [ -s "$HOME/.cache/orellius_hf_token" ]; then
+  export HF_TOKEN="$(cat "$HOME/.cache/orellius_hf_token")"
+fi
+PUSH_TO_HUB="${PUSH_TO_HUB:-$([ -n "${HF_TOKEN:-}" ] && echo true || echo false)}"
 LEROBOT_BIN="${LEROBOT_BIN:-/home/nemo/envs/lerobot/bin/lerobot-record}"
 command -v "$LEROBOT_BIN" >/dev/null 2>&1 || LEROBOT_BIN="lerobot-record"
 
@@ -42,5 +46,5 @@ exec "$LEROBOT_BIN" \
   --dataset.episode_time_s="$EPISODE_TIME_S" \
   --dataset.reset_time_s="$RESET_TIME_S" \
   --dataset.single_task="$TASK" \
-  --dataset.push_to_hub=false \
+  --dataset.push_to_hub="$PUSH_TO_HUB" \
   --display_data=false
