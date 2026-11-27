@@ -40,5 +40,5 @@ exec "$LEROBOT_BIN" \
   --dataset.episode_time_s="$EPISODE_TIME_S" \
   --dataset.reset_time_s="$RESET_TIME_S" \
   --dataset.single_task="$TASK" \
-  --dataset.push_to_hub=true \
+  --dataset.push_to_hub=false \
   --display_data=false

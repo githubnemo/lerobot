@@ -78,7 +78,16 @@ class SOFollowerConfig:
 @RobotConfig.register_subclass("so100_follower")
 @dataclass
 class SOFollowerRobotConfig(RobotConfig, SOFollowerConfig):
-    pass
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        if self.record_all_telemetry:
+            self.record_velocity = True
+            self.record_load = True
+            self.record_current = True
+            self.record_voltage = True
+            self.record_temperature = True
+            self.record_moving = True
+            self.record_status = True
 
 
 SO100FollowerConfig = SOFollowerRobotConfig
