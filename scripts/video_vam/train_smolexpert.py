@@ -939,7 +939,7 @@ class OnlineVideoDataset(torch.utils.data.Dataset[OnlineVideoItem]):
                 ep_needed_frames[ep] = sorted(
                     {
                         max(0, min(ep_len - 1, f + d))
-                        for f in range(4, ep_len, self.stride)
+                        for f in range(self.history_size - 1, ep_len, self.stride)
                         for d in self._cam_delta_indices
                     }
                 )
