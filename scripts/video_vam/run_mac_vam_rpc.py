@@ -402,7 +402,8 @@ class VideoVAMRPCClient:
         self.timeout, self.health = timeout, health or {}
         self.fps = fps
         self.in_process_app = in_process_app
-        self.frames: deque[Any] = deque(maxlen=5 if policy == "video_vam" else 1)
+        hist_len = int(self.health.get("history_size", 5 if policy == "video_vam" else 1))
+        self.frames: deque[Any] = deque(maxlen=hist_len)
         self.frame_times: deque[float] = deque(maxlen=self.frames.maxlen)
         self.frame_index = -1
         self._http_conn: Any = None
@@ -1647,7 +1648,11 @@ def _validate_health(health: dict[str, Any], args: argparse.Namespace) -> None:
         or health.get("fps") != 10
         or health.get("original_space") != ("normalized" if args.policy == "smolvla" else "physical")
         or health.get("rtc") is not (args.inference_type == "rtc")
-        or health.get("history_size") != (5 if args.policy == "video_vam" else 1)
+        or (
+            health.get("history_size") not in (1, 5)
+            if args.policy == "video_vam"
+            else health.get("history_size") != 1
+        )
         or health.get("action_units") != ["degrees"] * 5 + ["range_0_100"]
         or not isinstance(health.get("horizon"), int)
         or health["horizon"] <= args.execution_horizon

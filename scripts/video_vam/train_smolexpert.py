@@ -799,11 +799,18 @@ class OnlineVideoDataset(torch.utils.data.Dataset[OnlineVideoItem]):
 
         from lerobot.datasets.lerobot_dataset import LeRobotDataset
 
+        ds_delta_timestamps = dict(self.contract.delta_timestamps())
+        if self.history_size != 5 and self.contract.camera_key in ds_delta_timestamps:
+            step_s = 1.0 / float(self.contract.fps)
+            ds_delta_timestamps[self.contract.camera_key] = [
+                round(offset * step_s, 6) for offset in range(-(self.history_size - 1), 1)
+            ]
+
         self.lerobot_ds = LeRobotDataset(
             self.repo_id,
             root=str(self.root) if self.root is not None else None,
             revision=revision,
-            delta_timestamps=self.contract.delta_timestamps(),
+            delta_timestamps=ds_delta_timestamps,
             episodes=list(self.episodes),
             return_uint8=True,
             download_videos=False,
@@ -816,10 +823,10 @@ class OnlineVideoDataset(torch.utils.data.Dataset[OnlineVideoItem]):
             cum += int(self.lerobot_ds.meta.episodes[ep]["length"])
 
         self.index_map: list[tuple[int, int, int]] = []
+        min_start_frame = self.history_size - 1
         for ep in self.episodes:
             ep_len = int(self.lerobot_ds.meta.episodes[ep]["length"])
-            # Causal 5-frame window: earliest end frame is 4
-            for f in range(4, ep_len, self.stride):
+            for f in range(min_start_frame, ep_len, self.stride):
                 local_idx = self.ep_starts[ep] + f
                 self.index_map.append((ep, f, local_idx))
 
@@ -895,7 +902,7 @@ class OnlineVideoDataset(torch.utils.data.Dataset[OnlineVideoItem]):
         hf_ds = reader.hf_dataset if reader.hf_dataset is not None else reader.load_and_activate()
         vid_key = self.contract.camera_key
         if reader.delta_indices is not None and vid_key in reader.delta_indices:
-            self._cam_delta_indices = list(reader.delta_indices[vid_key])
+            self._cam_delta_indices = list(reader.delta_indices[vid_key])[-self.history_size :]
 
         rel_indices = [local_idx for _, _, local_idx in self.index_map]
         base = hf_ds[rel_indices]

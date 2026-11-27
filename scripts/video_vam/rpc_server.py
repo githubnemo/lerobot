@@ -420,7 +420,7 @@ class RPCApplication:
             "original_space": self.original_space,
             "action_dim": 6,
             "history_size": (
-                int(getattr(self.policy.config, "history_size", HISTORY)) if self.name == "video_vam" else 1
+                int(getattr(self.backend.config, "history_size", HISTORY)) if self.name == "video_vam" else 1
             ),
             "fps": 10,
             "action_units": ["degrees"] * 5 + ["range_0_100"],
@@ -573,9 +573,12 @@ class RPCApplication:
                     if live_reward_prob >= 0.80:
                         live_reward_detected = True
         else:
+            expected_hist = int(getattr(self.backend.config, "history_size", HISTORY))
             frames = _frame(value)
-            if frames.ndim != 4 or frames.shape[0] != HISTORY:
-                raise ValueError("video_vam requires five frames in images_front_u8_png_b64 or raw list")
+            if frames.ndim != 4 or frames.shape[0] != expected_hist:
+                raise ValueError(
+                    f"video_vam requires {expected_hist} frame(s) in images_front_u8_png_b64 or raw list"
+                )
             frames = torch.stack([_validate_frame(frame) for frame in frames])
             batch = {
                 self.history_key: frames.permute(3, 0, 1, 2).unsqueeze(0).float().div(255.0),

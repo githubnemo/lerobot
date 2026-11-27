@@ -95,14 +95,16 @@ def _load_normalizer(run_dir: Path, checkpoint_metadata: dict[str, Any]) -> Smol
     return SmolVLANormalizer(**{key: tensors[key].float() for key in required})
 
 
-def restore_uint8_history(history: Tensor) -> Tensor:
-    """Invert rollout uint8-to-float preparation and ensure [B, 3, 5, 480, 640] uint8."""
+def restore_uint8_history(history: Tensor, expected_frames: int = 5) -> Tensor:
+    """Invert rollout uint8-to-float preparation and ensure [B, 3, T, 480, 640] uint8."""
 
     if history.ndim == 4:
-        # [B, 3, H, W] -> repeat 5 frames along temporal dimension
-        history = history.unsqueeze(2).expand(-1, -1, 5, -1, -1).contiguous()
-    if history.ndim != 5 or history.shape[1] != 3 or history.shape[2] != 5:
-        raise ValueError(f"history must have shape [B, 3, 5, H, W], got {tuple(history.shape)}")
+        # [B, 3, H, W] -> expand to expected_frames along temporal dimension
+        history = history.unsqueeze(2).expand(-1, -1, expected_frames, -1, -1).contiguous()
+    if history.ndim != 5 or history.shape[1] != 3 or history.shape[2] != expected_frames:
+        raise ValueError(
+            f"history must have shape [B, 3, {expected_frames}, H, W], got {tuple(history.shape)}"
+        )
     if tuple(history.shape[3:]) != (480, 640):
         b, c, t, h, w = history.shape
         flat = history.permute(0, 2, 1, 3, 4).reshape(b * t, c, h, w).float()
@@ -330,12 +332,13 @@ class VideoVAMPolicy(PreTrainedPolicy):
 
             run_dir = Path(self.config.pretrained_path) if self.config.pretrained_path is not None else None
             lora_ckpt = self.config.cosmos3_lora_weights
-            if lora_ckpt is not None and not Path(lora_ckpt).exists():
-                repo_root = Path(__file__).resolve().parents[4]
-                if (repo_root / lora_ckpt).exists():
-                    lora_ckpt = repo_root / lora_ckpt
-                elif run_dir is not None and (run_dir / Path(lora_ckpt).name).exists():
+            if lora_ckpt is not None:
+                if run_dir is not None and (run_dir / Path(lora_ckpt).name).exists():
                     lora_ckpt = run_dir / Path(lora_ckpt).name
+                elif not Path(lora_ckpt).exists():
+                    repo_root = Path(__file__).resolve().parents[4]
+                    if (repo_root / lora_ckpt).exists():
+                        lora_ckpt = repo_root / lora_ckpt
             elif (
                 lora_ckpt is None
                 and run_dir is not None
@@ -439,7 +442,8 @@ class VideoVAMPolicy(PreTrainedPolicy):
                 if self.config.backend == "cosmos3_super"
                 else (4096 if self.config.backend == "cosmos3_nano" else 2048)
             )
-            expected = (1, 600, expected_ch)
+            expected_tokens = 300 if int(getattr(self.config, "history_size", 5)) == 1 else 600
+            expected = (1, expected_tokens, expected_ch)
         elif self.config.backend == "cosmos":
             prompt = self.prompt_embedding
             if prompt.shape[0] != 1:
@@ -543,22 +547,29 @@ class VideoVAMPolicy(PreTrainedPolicy):
     ) -> Tensor:
         if self._closed:
             raise RuntimeError("VideoVAMPolicy is closed")
+        expected_hist = int(getattr(self.config, "history_size", 5))
         history_key = f"{self.config.camera_key}.history"
         history = batch.get(history_key)
+        if not isinstance(history, Tensor) and expected_hist == 1:
+            single = batch.get(self.config.camera_key)
+            if isinstance(single, Tensor):
+                history = single.unsqueeze(0) if single.ndim == 3 else single
         if not isinstance(history, Tensor):
             if _history_already_updated and self._frame_history:
                 history = torch.stack(list(self._frame_history), dim=2)
             else:
                 history = self._update_frame_history(batch)
             if not isinstance(history, Tensor):
-                raise ValueError(f"batch is missing {history_key}; use inference.observation_history_size=5")
+                raise ValueError(
+                    f"batch is missing {history_key}; use inference.observation_history_size={expected_hist}"
+                )
         expected_state_dim = getattr(self.decoder, "state_dim", 6)
         state = batch.get(OBS_STATE)
         if isinstance(state, Tensor) and state.ndim == 1 and state.shape[0] == expected_state_dim:
             state = state.unsqueeze(0)
         if not isinstance(state, Tensor) or tuple(state.shape) != (1, expected_state_dim):
             raise ValueError(f"{OBS_STATE} must have shape [1, {expected_state_dim}]")
-        images = restore_uint8_history(history)
+        images = restore_uint8_history(history, expected_frames=expected_hist)
         feature_seed = self._feature_seed(batch, feature_noise_seed)
         context = self._extract_context(images, feature_seed)
         rtc = self.rtc_processor if prev_chunk_left_over is not None else None
