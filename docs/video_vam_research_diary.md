@@ -2324,3 +2324,21 @@ Key takeaways:
   - Offline `H1`/`First-5` RMSE (`3.84°–4.39°`) did **not** translate to closed-loop grasping, while single-frame **SmolVLA** performs much better live.
   - Likely cause: **5-frame history (`history_size=5`)** induces classic BC causal confusion (copy-past-motion inertia) and sensitivity to domain/speed shift.
   - Skipped Stage 2 EXPO RL (needs a base policy with non-zero grasp rate first). Added `--history-size 1` support across `train_smolexpert.py`, `VideoVAMConfig`, and `rpc_server.py`, and launching **`exp014_c3_edge_hist1_action_lora.sh`** (exact twin of `exp007` with `--history-size 1`) on RunPod RTX 5090.
+
+### 2026-11-27 (Evening Follow-Up) — Native `lerobot-rollout`, SmolVLA EXPO-FT, 60-Ep 48-D Stacking Dataset & Step 0 Robustness (`9f5f6104c`)
+
+- **Native `lerobot-rollout --inference.type=rtc --fps=10` vs. Custom Script (`run_mac_vam_rpc.py`)**:
+  - Switching to native `lerobot-rollout` at `10 Hz` (running 100% locally on `sahni`'s 8 GB RTX 3050, `9.98 Hz`, `0` starved) noticeably improved motion smoothness across every policy:
+    - `Orellius/so101_sort_cubes_no_top_smolvla_base_100k` (`305 ms` turnaround) and `..._smolvla_base` (`318 ms`) moved carefully and grasped the cube.
+    - `exp010` (`676 ms`, `5.25/7.7 GB` VRAM) achieved its first live cube grasp and looked better than `exp007` (still far from reliable overall).
+  - Audited and fixed the custom script & EXPO bugs: removed Nyquist smoothing + 6-step linear blend (`bdb3fa9c3`), routed EXPO RL through single-pass RTC-guided `predict_action_chunk` (`b0f84139a`), added SmolVLA visual stem auto-init (`c0a10b9b0`, `510a374c8`), and blocked untrained `MultiFrameSuccessDetector` from auto-terminating/auto-labeling episodes (`0bf5a9433`).
+- **Live Online EXPO-FT (`smolvla_base_100k`, 20 episodes)**:
+  - Smooth execution (`0.399 s/chunk`, `q=11→46`, `0` starved), ~30–40% success (`R_mean` reached `0.42` by Ep 19, `Δa ≈ 0.1°–0.4°`). Not yet enough evidence of policy improvement over base without a controlled exploration-off A/B eval.
+  - All `sahni` rollouts + `expo_online` checkpoints archived to `abakus:/home/anton/lerobot-video-vam/outputs/rollout_debug/2026-11-27_shabby_all` (`60 MB` + `15 MB`).
+- **New 60-Episode Full-Telemetry Cube-Stacking Dataset**:
+  - Added `--robot.record_all_telemetry=true` (fixed `SOFollowerRobotConfig.__post_init__` MRO in `0d1281636`), recording all 8 Feetech STS3215 registers (`pos`, `vel`, `load`, `current`, `voltage`, `temperature`, `moving`, `status` = 48-D state) at `30 fps` (`29.91 Hz` effective, `0/12,948` ticks over budget, `20.8 ms` headroom).
+  - Uploaded cleanly to [`Orellius/so101_stack_cubes_full_telemetry`](https://huggingface.co/datasets/Orellius/so101_stack_cubes_full_telemetry) @ `d7fc3c81f124886f9a1ec4840891660d60691424` (`60` eps, `26,636` frames, 48-D only — earlier 6-D runs excluded).
+- **Offline-to-Real Analysis (`arXiv:2611.00283v1`) & Step 0 Robustness Build (`9f5f6104c`)**:
+  - Analyzed Cowling's SO-101 study confirming why `val_flow_loss` rises 2×–5× while actions improve and why uniform RMSE misses initiation failure, causal confusion, and calibration/lighting shifts.
+  - Stopped RunPod `sfijmgdsbo1wgi` (`EXITED`, zero idle spend). Built and CPU-verified (`16/16` tests passed) shared robustness primitives (`src/lerobot/policies/vam/robustness.py`), Cosmos 3 & SmolVLA `H ∈ {1, 3, 5}` randomized variable-FPS/jitter + static-history rest-start aug + `4×` critical / `0.1×` idle loss weighting + delta arm actions / `±5°` cal-aug / state dropout + 6-D vs. 24-D (`pos+vel+load+current`) state slicing, plus the **5-Metric Offline Stress-Test Suite** (`scripts/video_vam/eval_stress_suite.py`) and **MuJoCo Mismatch Eval Harness** (`scripts/video_vam/eval_mujoco_mismatch.py`).
+  - Codified mandatory daily session traces (`docs/daily/YYYY-MM-DD.md`) in `AGENTS.md` (`68cafc06d`).
