@@ -572,6 +572,7 @@ class VideoVAMPolicy(PreTrainedPolicy):
         images = restore_uint8_history(history, expected_frames=expected_hist)
         feature_seed = self._feature_seed(batch, feature_noise_seed)
         context = self._extract_context(images, feature_seed)
+        self._last_context = context
         rtc = self.rtc_processor if prev_chunk_left_over is not None else None
         if prev_chunk_left_over is not None and rtc is None:
             raise ValueError("prev_chunk_left_over requires init_rtc_processor()")

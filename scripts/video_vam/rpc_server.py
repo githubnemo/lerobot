@@ -592,10 +592,6 @@ class RPCApplication:
                 raise RuntimeError("RTC leftover received but rtc_processor is not initialized")
             live_edit_norm = 0.0
             if getattr(self, "expo_critic", None) is not None:
-                from lerobot.policies.vam.modeling_video_vam import restore_uint8_history
-
-                images = restore_uint8_history(batch[self.history_key].to(self.device))
-                context = self.backend._extract_context(images, int(supplied_seed or frame_index))
                 state_t = state.unsqueeze(0).to(self.device, dtype=torch.float32)
                 if self.rtc_enabled and "prev_chunk_left_over" not in kwargs:
                     self.current_episode_steps.clear()
@@ -605,12 +601,37 @@ class RPCApplication:
                 t_norm = torch.tensor(
                     [[min(1.0, ep_step_idx / 80.0)]], device=self.device, dtype=torch.float32
                 )
-                base_actions = self.backend.decoder.sample_actions(
-                    state_t, context, seed=int(supplied_seed or 0), use_cuda_graph=False
-                )[0].cpu()
-                edited = self.expo_critic.select_best_edited_chunk(
-                    self.backend.decoder, state_t, context, t_norm, base_seed=int(supplied_seed or 0)
-                )[0].cpu()
+                # Single RTC-guided forward pass (identical to native lerobot-rollout, no double Cosmos3 pass)
+                base_actions_gpu = self.backend.predict_action_chunk(batch, **kwargs)
+                context = getattr(self.backend, "_last_context", None)
+                if context is None:
+                    from lerobot.policies.vam.modeling_video_vam import restore_uint8_history
+
+                    expected_hist = int(getattr(self.backend.config, "history_size", HISTORY))
+                    images = restore_uint8_history(
+                        batch[self.history_key].to(self.device), expected_frames=expected_hist
+                    )
+                    context = self.backend._extract_context(images, int(supplied_seed or frame_index))
+                base_actions = base_actions_gpu[0].cpu()
+                ctx_pooled = self.expo_critic.pool_ctx_tokens(context)
+                if ep_step_idx == 0 or self.expo_critic._cached_init_grid is None:
+                    self.expo_critic._cached_init_grid = ctx_pooled[:1].detach().clone()
+                edited_gpu = self.expo_critic.forward_edit(
+                    ctx_pooled,
+                    state_t,
+                    t_norm,
+                    base_actions_gpu.to(device=self.device, dtype=torch.float32),
+                    init_ctx=self.expo_critic._cached_init_grid,
+                )
+                edited = edited_gpu[0].cpu()
+                # Anchor prefix [:delay] to RTC-guided base chunk so chunk merges stay seamless
+                rtc_delay = int(kwargs.get("inference_delay") or 0)
+                if rtc_delay > 0 and rtc_delay < self.horizon:
+                    delta = edited - base_actions
+                    blend_tail = torch.linspace(0.0, 1.0, self.horizon - rtc_delay).unsqueeze(-1)
+                    ramp_mask = torch.zeros((self.horizon, 1), dtype=delta.dtype)
+                    ramp_mask[rtc_delay:] = blend_tail.clamp(0.0, 1.0)
+                    edited = base_actions + delta * ramp_mask
                 live_edit_norm = float((edited - base_actions).abs().mean().item())
                 actions = edited
                 if getattr(self, "online_expo_enabled", False):
@@ -622,19 +643,21 @@ class RPCApplication:
                         )
                     )
                     arm_noise = torch.randn((1, 5), generator=expl_gen) * 1.0
-                    ramp = torch.sin(torch.linspace(0.0, math.pi, self.horizon)).unsqueeze(-1)
                     expl_delta = torch.zeros_like(actions)
-                    expl_delta[:, :5] = ramp * arm_noise
+                    start_t = min(max(0, rtc_delay), self.horizon - 1)
+                    tail_len = self.horizon - start_t
+                    if tail_len > 1:
+                        ramp = torch.sin(torch.linspace(0.0, math.pi, tail_len)).unsqueeze(-1)
+                        expl_delta[start_t:, :5] = ramp * arm_noise
                     actions = actions + expl_delta
                 if self.lower is not None and self.upper is not None:
                     lo = torch.tensor(self.lower, dtype=actions.dtype)
                     hi = torch.tensor(self.upper, dtype=actions.dtype)
                     actions = torch.max(torch.min(actions, hi), lo)
                 if hasattr(self, "current_episode_steps"):
-                    ctx_pooled = self.expo_critic.pool_ctx_tokens(context)[0].detach().cpu()
                     self.current_episode_steps.append(
                         {
-                            "ctx": ctx_pooled,
+                            "ctx": ctx_pooled[0].detach().cpu(),
                             "state": state.detach().cpu(),
                             "t_norm": t_norm[0].detach().cpu(),
                             "base_action": base_actions.detach().cpu(),
