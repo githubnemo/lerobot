@@ -431,7 +431,7 @@ class RPCApplication:
                 int(getattr(self.backend.config, "history_size", HISTORY)) if self.name == "video_vam" else 1
             ),
             "fps": 10,
-            "task": str(getattr(self.backend.config, "cosmos3_prompt", "") or ""),
+            "task": str(getattr(getattr(self.backend, "config", None), "cosmos3_prompt", "") or ""),
             "action_units": ["degrees"] * 5 + ["range_0_100"],
         }
 
