@@ -407,6 +407,13 @@ class SmolVLAPolicy(PreTrainedPolicy):
 
         images, img_masks = self.prepare_images(batch)
         state = self.prepare_state(batch)
+        if self.training and float(getattr(self.config, "state_dropout_prob", 0.0)) > 0.0:
+            drop = (
+                torch.rand((state.shape[0], 1), device=state.device)
+                < float(self.config.state_dropout_prob)
+            )
+            if drop.any():
+                state = state.masked_fill(drop, 0.0)
         lang_tokens = batch[f"{OBS_LANGUAGE_TOKENS}"]
         lang_masks = batch[f"{OBS_LANGUAGE_ATTENTION_MASK}"]
         actions = self.prepare_action(batch)
@@ -438,8 +445,15 @@ class SmolVLAPolicy(PreTrainedPolicy):
             loss_dict["loss"] = per_sample_loss.mean().item()
             return per_sample_loss, loss_dict
         else:
-            # Default: return scalar mean loss over valid (time, action) entries
-            if actions_is_pad is None:
+            sample_w = batch.get("sample_weight")
+            if isinstance(sample_w, Tensor):
+                w = sample_w.to(device=losses.device, dtype=losses.dtype).view(-1, 1, 1)
+                if actions_is_pad is None:
+                    loss = (losses * w).sum() / (w.sum() * losses.shape[1] * losses.shape[2]).clamp_min(1.0)
+                else:
+                    w_valid = (~actions_is_pad).to(dtype=losses.dtype).unsqueeze(-1) * w
+                    loss = (losses * w_valid).sum() / (w_valid.sum() * losses.shape[-1]).clamp_min(1.0)
+            elif actions_is_pad is None:
                 loss = losses.mean()
             else:
                 num_valid = ((~actions_is_pad).sum() * losses.shape[-1]).clamp_min(1)
@@ -490,30 +504,44 @@ class SmolVLAPolicy(PreTrainedPolicy):
                 f"All image features are missing from the batch. At least one expected. (batch: {batch.keys()}) (image_features:{self.config.image_features})"
             )
         # Preprocess image features present in the batch
+        expected_hist = max(1, int(getattr(self.config, "history_size", 1)))
         for key in present_img_keys:
-            img = batch[key][:, -1, :, :, :] if batch[key].ndim == 5 else batch[key]
-            if img.dtype == torch.uint8:
-                img = img.to(torch.float32) / 255.0
-            if self.config.resize_imgs_with_padding is not None:
-                # SmolVLA stores the target as (width, height); the shared helper expects (height, width).
-                img = resize_with_pad(
-                    img,
-                    self.config.resize_imgs_with_padding[1],
-                    self.config.resize_imgs_with_padding[0],
-                    pad_value=0,
-                )
-
-            # Normalize from range [0,1] to [-1,1] as expacted by siglip
-            img = img * 2.0 - 1.0
-
-            bsize = img.shape[0]
-            device = img.device
-            if f"{key}_padding_mask" in batch:
-                mask = batch[f"{key}_padding_mask"].bool()
+            hist_key = f"{key}.history"
+            raw_img = batch[hist_key] if (expected_hist > 1 and hist_key in batch) else batch[key]
+            if expected_hist > 1 and raw_img.ndim == 5:
+                # Support both [B, T, C, H, W] and [B, C, T, H, W]
+                if raw_img.shape[1] == 3 and raw_img.shape[2] == expected_hist:
+                    frame_list = [raw_img[:, :, t, :, :] for t in range(raw_img.shape[2])]
+                else:
+                    frame_list = [raw_img[:, t, :, :, :] for t in range(raw_img.shape[1])]
+            elif expected_hist > 1 and raw_img.ndim == 4:
+                frame_list = [raw_img] * expected_hist
             else:
-                mask = torch.ones(bsize, dtype=torch.bool, device=device)
-            images.append(img)
-            img_masks.append(mask)
+                frame_list = [raw_img[:, -1, :, :, :] if raw_img.ndim == 5 else raw_img]
+
+            for img in frame_list:
+                if img.dtype == torch.uint8:
+                    img = img.to(torch.float32) / 255.0
+                if self.config.resize_imgs_with_padding is not None:
+                    # SmolVLA stores the target as (width, height); the shared helper expects (height, width).
+                    img = resize_with_pad(
+                        img,
+                        self.config.resize_imgs_with_padding[1],
+                        self.config.resize_imgs_with_padding[0],
+                        pad_value=0,
+                    )
+
+                # Normalize from range [0,1] to [-1,1] as expected by siglip
+                img = img * 2.0 - 1.0
+
+                bsize = img.shape[0]
+                device = img.device
+                if f"{key}_padding_mask" in batch:
+                    mask = batch[f"{key}_padding_mask"].bool()
+                else:
+                    mask = torch.ones(bsize, dtype=torch.bool, device=device)
+                images.append(img)
+                img_masks.append(mask)
 
         # Create image features not present in the batch
         # as fully 0 padded images.
@@ -554,8 +582,13 @@ class SmolVLAPolicy(PreTrainedPolicy):
         return actions
 
     def prepare_state(self, batch):
-        """Pad state"""
+        """Slice configured telemetry subset (if wider) and pad state."""
         state = batch[OBS_STATE][:, -1, :] if batch[OBS_STATE].ndim > 2 else batch[OBS_STATE]
+        groups = str(getattr(self.config, "state_feature_groups", "pos"))
+        if groups == "pos" and state.shape[-1] > 6:
+            state = state[..., :6]
+        elif groups == "pos_vel_load_curr" and state.shape[-1] > 24:
+            state = state[..., :24]
         state = pad_vector(state, self.config.max_state_dim)
         return state
 

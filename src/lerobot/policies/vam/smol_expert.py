@@ -803,6 +803,7 @@ class SmolExpertActionDecoder(nn.Module):
         generator: torch.Generator | None = None,
         action_is_pad: Tensor | None = None,
         obs_dropout: float = 0.0,
+        sample_weight: Tensor | None = None,
     ) -> Tensor:
         """Compute SmolVLA's mean/std-normalized flow-matching loss."""
         if action.shape[-2:] != (ACTION_HORIZON, self.action_dim):
@@ -844,6 +845,16 @@ class SmolExpertActionDecoder(nn.Module):
             t,
         )
         squared_error = (prediction.float() - target.float()).square()
+        if sample_weight is not None:
+            w = sample_weight.to(device=squared_error.device, dtype=squared_error.dtype).view(-1, 1, 1)
+            if action_is_pad is None:
+                return (squared_error * w).sum() / torch.clamp(
+                    w.sum() * ACTION_HORIZON * self.max_action_dim, min=1.0
+                )
+            valid = (~action_is_pad).to(dtype=squared_error.dtype).unsqueeze(-1)
+            weighted_valid = valid * w
+            valid_count = torch.clamp(weighted_valid.sum() * self.max_action_dim, min=1.0)
+            return (squared_error * weighted_valid).sum() / valid_count
         if action_is_pad is None:
             return squared_error.mean()
         valid = (~action_is_pad).to(dtype=squared_error.dtype).unsqueeze(-1)

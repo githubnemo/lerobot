@@ -46,6 +46,7 @@ import importlib.util
 import json
 import math
 import os
+import re
 import shlex
 import shutil
 import subprocess
@@ -1591,7 +1592,7 @@ def _validate_health(health: dict[str, Any], args: argparse.Namespace) -> None:
         or health.get("original_space") != ("normalized" if args.policy == "smolvla" else "physical")
         or health.get("rtc") is not (args.inference_type == "rtc")
         or (
-            health.get("history_size") not in (1, 5)
+            health.get("history_size") not in (1, 3, 5)
             if args.policy == "video_vam"
             else health.get("history_size") != 1
         )

@@ -141,7 +141,7 @@ class VideoVAMPolicy(PreTrainedPolicy):
     ) -> None:
         super().__init__(config)
         self._action_queue: deque[Tensor] = deque()
-        self._frame_history: deque[Tensor] = deque(maxlen=5)
+        self._frame_history: deque[Tensor] = deque(maxlen=max(1, int(getattr(config, "history_size", 5))))
         self._auto_frame_index: int = 0
         self.rtc_processor: RTCProcessor | None = None
         self._closed = False
@@ -442,8 +442,9 @@ class VideoVAMPolicy(PreTrainedPolicy):
                 if self.config.backend == "cosmos3_super"
                 else (4096 if self.config.backend == "cosmos3_nano" else 2048)
             )
-            expected_tokens = 300 if int(getattr(self.config, "history_size", 5)) == 1 else 600
-            expected = (1, expected_tokens, expected_ch)
+            hist_t = int(images.shape[2])
+            expected_t_lat = 1 if hist_t <= 1 else (1 + (hist_t - 1 + 3) // 4)
+            expected = (1, expected_t_lat * 300, expected_ch)
         elif self.config.backend == "cosmos":
             prompt = self.prompt_embedding
             if prompt.shape[0] != 1:
@@ -526,8 +527,9 @@ class VideoVAMPolicy(PreTrainedPolicy):
             single_frame = single_frame.permute(2, 0, 1).unsqueeze(0)
         elif single_frame.ndim == 3 and single_frame.shape[0] == 3:
             single_frame = single_frame.unsqueeze(0)
+        expected_hist = max(1, int(getattr(self.config, "history_size", 5)))
         if not self._frame_history:
-            for _ in range(5):
+            for _ in range(expected_hist):
                 self._frame_history.append(single_frame)
         else:
             self._frame_history.append(single_frame)
@@ -563,10 +565,13 @@ class VideoVAMPolicy(PreTrainedPolicy):
                 raise ValueError(
                     f"batch is missing {history_key}; use inference.observation_history_size={expected_hist}"
                 )
-        expected_state_dim = getattr(self.decoder, "state_dim", 6)
+        expected_state_dim = getattr(self.decoder, "state_dim", int(getattr(self.config, "state_dim", 6)))
         state = batch.get(OBS_STATE)
-        if isinstance(state, Tensor) and state.ndim == 1 and state.shape[0] == expected_state_dim:
+        if isinstance(state, Tensor) and state.ndim == 1:
             state = state.unsqueeze(0)
+        if isinstance(state, Tensor) and state.ndim == 2 and state.shape[1] > expected_state_dim:
+            # Slice full 48-D telemetry state to configured feature subset (e.g. 6-D pos or 24-D pos+vel+load+current)
+            state = state[:, :expected_state_dim]
         if not isinstance(state, Tensor) or tuple(state.shape) != (1, expected_state_dim):
             raise ValueError(f"{OBS_STATE} must have shape [1, {expected_state_dim}]")
         images = restore_uint8_history(history, expected_frames=expected_hist)

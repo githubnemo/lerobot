@@ -59,6 +59,13 @@ from lerobot.datasets.vam import CUBE_OUT_OF_BOX_CONTRACT
 from lerobot.policies.vam.base.split_guard import (
     validate_manifests_for_protocol,
 )
+from lerobot.policies.vam.robustness import (
+    STATE_FEATURE_GROUP_DIMS,
+    apply_calibration_and_dropout,
+    compute_episode_frame_weights,
+    sample_history_window_indices,
+    slice_state_features,
+)
 from lerobot.policies.vam.smol_expert import (
     ACTION_DIM,
     ACTION_HORIZON,
@@ -683,6 +690,7 @@ class OnlineVideoItem:
         "episode_index",
         "frame_index",
         "context",
+        "sample_weight",
     )
 
     def __init__(
@@ -694,6 +702,7 @@ class OnlineVideoItem:
         sample_id: str,
         episode_index: int,
         frame_index: int,
+        sample_weight: float = 1.0,
     ) -> None:
         self.rgb = rgb
         self.state = state
@@ -703,6 +712,7 @@ class OnlineVideoItem:
         self.episode_index = episode_index
         self.frame_index = frame_index
         self.context: Tensor | None = None
+        self.sample_weight = float(sample_weight)
 
 
 def joints_to_cartesian(joints: torch.Tensor, kin: Any) -> torch.Tensor:
@@ -780,7 +790,13 @@ class OnlineVideoDataset(torch.utils.data.Dataset[OnlineVideoItem]):
         ram_headroom_gb: int = 26,
         history_size: int = 5,
         history_stride: int = 1,
+        history_min_stride: int = 0,
+        history_max_stride: int = 0,
         history_jitter_frames: int = 0,
+        static_history_prob: float = 0.0,
+        critical_weight: float = 1.0,
+        idle_weight: float = 1.0,
+        state_feature_groups: str = "pos",
     ) -> None:
         self.repo_id = repo_id
         self.root = Path(root).expanduser().resolve() if root is not None else None
@@ -790,7 +806,13 @@ class OnlineVideoDataset(torch.utils.data.Dataset[OnlineVideoItem]):
         self.ram_headroom_gb = ram_headroom_gb
         self.history_size = int(history_size)
         self.history_stride = max(1, int(history_stride))
+        self.history_min_stride = max(0, int(history_min_stride))
+        self.history_max_stride = max(0, int(history_max_stride))
         self.history_jitter_frames = max(0, int(history_jitter_frames))
+        self.static_history_prob = float(static_history_prob)
+        self.critical_weight = float(critical_weight)
+        self.idle_weight = float(idle_weight)
+        self.state_feature_groups = str(state_feature_groups)
         self.manifest_path = Path(f"online://{repo_id}?stride={stride}&episodes={len(episodes)}")
         revision = getattr(contract, "revision", None) if contract.repo_id == repo_id else None
         self.payload: dict[str, Any] = {
@@ -842,6 +864,7 @@ class OnlineVideoDataset(torch.utils.data.Dataset[OnlineVideoItem]):
         self._ram_states: list[Tensor] = []
         self._ram_actions: list[Tensor] = []
         self._ram_paddings: list[Tensor] = []
+        self._ram_sample_weights: list[float] = []
         self._ep_video_info: dict[int, tuple[Path, float, list[float]]] = {}
         self._cam_delta_indices: list[int] = [
             -(self.history_size - 1 - k) * self.history_stride for k in range(self.history_size)
@@ -922,10 +945,31 @@ class OnlineVideoDataset(torch.utils.data.Dataset[OnlineVideoItem]):
             query_indices_per_item.append(q_idx)
             paddings_per_item.append(pad)
         tabular_list = reader._query_hf_dataset(query_indices_per_item)
-        for tab, pad in zip(tabular_list, paddings_per_item, strict=True):
-            self._ram_states.append(tab[self.contract.state_key].squeeze(0).contiguous())
-            self._ram_actions.append(tab[self.contract.action_key].contiguous())
+        raw_states_by_ep: dict[int, list[tuple[int, Tensor, Tensor]]] = defaultdict(list)
+        for item_pos, (tab, pad) in enumerate(zip(tabular_list, paddings_per_item, strict=True)):
+            raw_st = tab[self.contract.state_key].squeeze(0).contiguous()
+            act = tab[self.contract.action_key].contiguous()
+            self._ram_states.append(slice_state_features(raw_st, self.state_feature_groups))
+            self._ram_actions.append(act)
             self._ram_paddings.append(pad[f"{self.contract.action_key}_is_pad"].contiguous())
+            ep_k, _, _ = self.index_map[item_pos]
+            raw_states_by_ep[ep_k].append((item_pos, raw_st, act))
+
+        self._ram_sample_weights = [1.0] * len(self._ram_states)
+        if self.critical_weight != 1.0 or self.idle_weight != 1.0:
+            ds_fps = int(round(float(getattr(self.contract, "fps", 30))))
+            for ep_items in raw_states_by_ep.values():
+                ep_st_t = torch.stack([x[1] for x in ep_items], dim=0)
+                ep_act_t = torch.stack([x[2] for x in ep_items], dim=0)
+                w_ep = compute_episode_frame_weights(
+                    ep_st_t,
+                    ep_act_t,
+                    critical_weight=self.critical_weight,
+                    idle_weight=self.idle_weight,
+                    fps=max(1, ds_fps // max(1, self.stride)),
+                )
+                for (item_pos, _, _), w_val in zip(ep_items, w_ep.tolist(), strict=True):
+                    self._ram_sample_weights[item_pos] = float(w_val)
 
         ts_col_all = reader._column_view("timestamp")[list(range(len(hf_ds)))]["timestamp"]
         for ep in self.episodes:
@@ -1057,17 +1101,18 @@ class OnlineVideoDataset(torch.utils.data.Dataset[OnlineVideoItem]):
                 win = [frame_pos[max(0, min(ep_len - 1, frame + d))] for d in self._cam_delta_indices]
             else:
                 ep_len = ep_frames.shape[0]
-                if self.history_jitter_frames > 0 and len(self._cam_delta_indices) > 1:
-                    # Jitter past frames around nominal offsets while keeping current frame (0) exact
-                    jittered = []
-                    for d in self._cam_delta_indices[:-1]:
-                        j = int(torch.randint(-self.history_jitter_frames, self.history_jitter_frames + 1, (1,)).item())
-                        jittered.append(max(0, min(ep_len - 1, frame + d + j)))
-                    jittered.append(max(0, min(ep_len - 1, frame + self._cam_delta_indices[-1])))
-                    win = jittered
-                else:
-                    win = [max(0, min(ep_len - 1, frame + d)) for d in self._cam_delta_indices]
+                win = sample_history_window_indices(
+                    frame=frame,
+                    ep_len=ep_len,
+                    history_size=self.history_size,
+                    base_stride=self.history_stride,
+                    min_stride=self.history_min_stride,
+                    max_stride=self.history_max_stride,
+                    jitter_frames=self.history_jitter_frames,
+                    static_prob=self.static_history_prob,
+                )
             camera = ep_frames[win]
+            w_sample = self._ram_sample_weights[idx] if self._ram_sample_weights else 1.0
             return OnlineVideoItem(
                 rgb=camera,
                 state=self._ram_states[idx],
@@ -1076,6 +1121,7 @@ class OnlineVideoDataset(torch.utils.data.Dataset[OnlineVideoItem]):
                 sample_id=sample_id,
                 episode_index=ep,
                 frame_index=frame,
+                sample_weight=w_sample,
             )
 
         if self._tabular_preloaded and ep in self._ep_video_info:
@@ -1084,7 +1130,16 @@ class OnlineVideoDataset(torch.utils.data.Dataset[OnlineVideoItem]):
 
             video_path, from_ts, ep_ts = self._ep_video_info[ep]
             ep_len = len(ep_ts)
-            win = [max(0, min(ep_len - 1, frame + d)) for d in self._cam_delta_indices]
+            win = sample_history_window_indices(
+                frame=frame,
+                ep_len=ep_len,
+                history_size=self.history_size,
+                base_stride=self.history_stride,
+                min_stride=self.history_min_stride,
+                max_stride=self.history_max_stride,
+                jitter_frames=self.history_jitter_frames,
+                static_prob=self.static_history_prob,
+            )
             win_ts = shift_timestamps([ep_ts[w] for w in win], from_ts)
             camera = decode_video_frames(
                 video_path,
@@ -1093,6 +1148,7 @@ class OnlineVideoDataset(torch.utils.data.Dataset[OnlineVideoItem]):
                 self._video_backend,
                 return_uint8=True,
             ).squeeze(0)
+            w_sample = self._ram_sample_weights[idx] if self._ram_sample_weights else 1.0
             return OnlineVideoItem(
                 rgb=camera,
                 state=self._ram_states[idx],
@@ -1101,11 +1157,12 @@ class OnlineVideoDataset(torch.utils.data.Dataset[OnlineVideoItem]):
                 sample_id=sample_id,
                 episode_index=ep,
                 frame_index=frame,
+                sample_weight=w_sample,
             )
 
         sample = self.lerobot_ds[local_idx]
         camera = sample[self.contract.camera_key]
-        state = sample[self.contract.state_key].squeeze(0).contiguous()
+        state = slice_state_features(sample[self.contract.state_key].squeeze(0).contiguous(), self.state_feature_groups)
         action = sample[self.contract.action_key].contiguous()
         action_is_pad = sample[f"{self.contract.action_key}_is_pad"].contiguous()
 
@@ -1117,6 +1174,7 @@ class OnlineVideoDataset(torch.utils.data.Dataset[OnlineVideoItem]):
             sample_id=sample_id,
             episode_index=ep,
             frame_index=frame,
+            sample_weight=1.0,
         )
 
 
@@ -1827,21 +1885,39 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--history-size",
         type=int,
-        choices=[1, 5],
+        choices=[1, 3, 5],
         default=5,
-        help="Number of input camera frames per observation window (default: 5; use 1 for single-frame ablation).",
+        help="Number of input camera frames per observation window (1, 3, or 5; default: 5).",
     )
     parser.add_argument(
         "--history-stride",
         type=int,
         default=1,
-        help="Frame stride between history frames in dataset ticks (e.g. 3 for 10 Hz history from a 30 fps recording).",
+        help="Nominal frame stride between history frames in dataset ticks (e.g. 3 for 10 Hz history from a 30 fps recording).",
+    )
+    parser.add_argument(
+        "--history-min-stride",
+        type=int,
+        default=0,
+        help="Minimum random stride for variable-FPS history training (e.g. 1; 0 = fixed --history-stride).",
+    )
+    parser.add_argument(
+        "--history-max-stride",
+        type=int,
+        default=0,
+        help="Maximum random stride for variable-FPS history training (e.g. 4; 0 = fixed --history-stride).",
     )
     parser.add_argument(
         "--history-jitter-frames",
         type=int,
         default=0,
         help="Random +/- frame jitter applied to past history frames during training (e.g. 1-2 frames @ 30 fps = +/-0.03-0.07s).",
+    )
+    parser.add_argument(
+        "--static-history-prob",
+        type=float,
+        default=0.0,
+        help="Probability of replacing multi-frame history with repeated current frame (trains against rest-pose initiation failure).",
     )
     parser.add_argument(
         "--delta-actions",
@@ -1854,6 +1930,31 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         type=float,
         default=0.0,
         help="Random per-sample calibration-offset augmentation +/-deg on arm joints 0..4 during training (e.g. 5.0).",
+    )
+    parser.add_argument(
+        "--state-dropout-prob",
+        type=float,
+        default=0.0,
+        help="Random per-sample proprioception zeroing probability during training (e.g. 0.25) to force wrist-camera visual servoing.",
+    )
+    parser.add_argument(
+        "--critical-weight",
+        type=float,
+        default=1.0,
+        help="Loss weight multiplier on critical grasp/release/contact windows (+/-0.5s around gripper transitions or load spikes; e.g. 4.0).",
+    )
+    parser.add_argument(
+        "--idle-weight",
+        type=float,
+        default=1.0,
+        help="Loss weight multiplier on static/idle frames (e.g. 0.1 to prevent idle-copying / initiation failure).",
+    )
+    parser.add_argument(
+        "--state-feature-groups",
+        type=str,
+        choices=sorted(STATE_FEATURE_GROUP_DIMS.keys()),
+        default="pos",
+        help="Subset of observation.state channels to feed into the policy ('pos'=6D, 'pos_vel_load_curr'=24D, 'all'=full).",
     )
     parser.add_argument(
         "--backbone-lora-lr",
@@ -2847,6 +2948,7 @@ def main(argv: list[str] | None = None) -> int:
             contract=dataset_contract,
             history_size=args.history_size,
             history_stride=args.history_stride,
+            state_feature_groups=args.state_feature_groups,
         )
         print(f"Eval-Set 2 Online Dataset Initialized ({len(eval2_dataset)} samples).")
 
@@ -2867,6 +2969,7 @@ def main(argv: list[str] | None = None) -> int:
             contract=dataset_contract,
             history_size=args.history_size,
             history_stride=args.history_stride,
+            state_feature_groups=args.state_feature_groups,
         )
 
     train_dataset: Any = None
@@ -2880,7 +2983,13 @@ def main(argv: list[str] | None = None) -> int:
             ram_headroom_gb=12 if args.augment else 26,
             history_size=args.history_size,
             history_stride=args.history_stride,
+            history_min_stride=args.history_min_stride,
+            history_max_stride=args.history_max_stride,
             history_jitter_frames=args.history_jitter_frames,
+            static_history_prob=args.static_history_prob,
+            critical_weight=args.critical_weight,
+            idle_weight=args.idle_weight,
+            state_feature_groups=args.state_feature_groups,
         )
         print(
             f"Loaded online video training dataset with {len(train_dataset)} windows (stride {args.train_stride}, augment={args.augment})"
@@ -3614,26 +3723,31 @@ def main(argv: list[str] | None = None) -> int:
                 states = joints_to_cartesian(states, kinematics)
                 actions = joints_to_cartesian(actions, kinematics)
             else:
-                if args.delta_actions:
-                    actions = actions.clone()
-                    actions[:, :, :5] = actions[:, :, :5] - states[:, None, :5]
-                if args.state_offset_aug_deg > 0.0:
-                    cal_off = (
-                        (torch.rand((states.shape[0], 5), device=states.device, dtype=states.dtype) * 2.0 - 1.0)
-                        * float(args.state_offset_aug_deg)
-                    )
-                    states = states.clone()
-                    states[:, :5] = states[:, :5] + cal_off
-                    if not args.delta_actions:
-                        actions = actions.clone()
-                        actions[:, :, :5] = actions[:, :, :5] + cal_off[:, None, :]
+                states, actions_out = apply_calibration_and_dropout(
+                    states,
+                    actions,
+                    delta_actions=bool(args.delta_actions),
+                    offset_aug_deg=float(args.state_offset_aug_deg),
+                    state_dropout_prob=float(args.state_dropout_prob),
+                )
+                assert actions_out is not None
+                actions = actions_out
 
-            # Flow matching loss with strict padding masking
+            sample_w: Tensor | None = None
+            if args.critical_weight != 1.0 or args.idle_weight != 1.0:
+                sample_w = torch.tensor(
+                    [float(getattr(item, "sample_weight", 1.0)) for item in batch_items],
+                    device=device,
+                    dtype=torch.float32,
+                )
+
+            # Flow matching loss with strict padding masking (and optional critical/idle sample weights)
             loss = flow_matching_loss_fn(
                 state=states,
                 action=actions,
                 context=contexts,
                 action_is_pad=action_is_pad,
+                sample_weight=sample_w,
             )
 
             loss_scaled = loss / args.grad_accum_steps
@@ -4048,6 +4162,8 @@ def main(argv: list[str] | None = None) -> int:
                 "cosmos3_fps": resolved_cfg_fps,
                 "history_size": int(args.history_size),
                 "delta_actions": bool(args.delta_actions),
+                "state_dim": int(normalizer.state_mean.shape[0]),
+                "state_feature_groups": str(args.state_feature_groups),
             }
         )
     elif backend_val == "cosmos":

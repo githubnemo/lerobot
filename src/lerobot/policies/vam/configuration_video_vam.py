@@ -72,6 +72,8 @@ class VideoVAMConfig(PreTrainedConfig):
     camera_key: str = "observation.images.front"
     history_size: int = 5
     delta_actions: bool = False
+    state_dim: int = 6
+    state_feature_groups: str = "pos"
     chunk_size: int = 30
     n_action_steps: int = 30
     dataset_revision: str = "243370c3c08bcbd860133c4a0d658ea7c1d2e77e"

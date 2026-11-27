@@ -26,6 +26,10 @@ from ..rtc.configuration_rtc import RTCConfig
 class SmolVLAConfig(PreTrainedConfig):
     # Input / output structure.
     n_obs_steps: int = 1
+    history_size: int = 1
+    delta_actions: bool = False
+    state_feature_groups: str = "pos"
+    state_dropout_prob: float = 0.0
     chunk_size: int = 50
     n_action_steps: int = 50
 

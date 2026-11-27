@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# exp015 (Single-Frame + Delta Arm Actions + Calibration-Offset Aug):
+# exp015 (Phase 1A — Single-Frame + Delta Arm Actions + Calibration/Dropout + Critical Weighting):
 # Cosmos 3 Edge (L20) + Joint Action-LoRA (gen_only r=16/a=32, BS 64 = 16x4 for 24 GB RTX 4090),
-# --history-size 1 (current frame only), --delta-actions (relative arm joint deltas q_{t+k} - q_t,
-# absolute gripper), and --state-offset-aug-deg 5.0 (+/-5 deg calibration-offset augmentation).
+# --history-size 1, --delta-actions, --state-offset-aug-deg 5.0, --state-dropout-prob 0.25,
+# --critical-weight 4.0 --idle-weight 0.1.
 # Target host: abakus RTX 4090 (24 GB) | Dataset: Orellius/so101_sort_cubes_no_top@a7c156de
 set -Eeuo pipefail
 
@@ -18,6 +18,9 @@ bash scripts/video_vam/run_experiment.sh c3_sort_cubes_portable \
   --history-size 1 \
   --delta-actions \
   --state-offset-aug-deg 5.0 \
+  --state-dropout-prob 0.25 \
+  --critical-weight 4.0 \
+  --idle-weight 0.1 \
   --train-backbone-lora \
   --backbone-lora-pathway gen_only \
   --backbone-lora-rank 16 \
