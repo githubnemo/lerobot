@@ -587,6 +587,15 @@ class VideoVAMPolicy(PreTrainedPolicy):
                 if prev_len > 0:
                     execution_horizon = min(prev_len, max(execution_horizon, int(inference_delay) + 5))
         state_dev = state.to(device=self.config.device, dtype=torch.float32)
+        use_delta = bool(getattr(self.config, "delta_actions", False))
+        rtc_leftover = prev_chunk_left_over
+        if use_delta and rtc_leftover is not None:
+            rtc_leftover = rtc_leftover.clone()
+            arm_ref = state_dev[:, :5].to(device=rtc_leftover.device, dtype=rtc_leftover.dtype)
+            if rtc_leftover.ndim == 2:
+                rtc_leftover[:, :5] = rtc_leftover[:, :5] - arm_ref
+            elif rtc_leftover.ndim == 3:
+                rtc_leftover[:, :, :5] = rtc_leftover[:, :, :5] - arm_ref.unsqueeze(1)
         base_seed = self.config.action_seed if action_seed is None else action_seed
         if self.jepa_world_model is not None and self.config.jepa_planning_mode != "none" and noise is None:
             n_cand = max(2, int(self.config.jepa_num_candidates))
@@ -630,8 +639,13 @@ class VideoVAMPolicy(PreTrainedPolicy):
                 noise=noise,
                 rtc_processor=rtc,
                 inference_delay=inference_delay,
-                prev_chunk_left_over=prev_chunk_left_over,
+                prev_chunk_left_over=rtc_leftover,
                 execution_horizon=execution_horizon,
+            )
+        if use_delta:
+            actions = actions.clone()
+            actions[:, :, :5] = actions[:, :, :5] + state_dev[:, None, :5].to(
+                device=actions.device, dtype=actions.dtype
             )
         return self._apply_action_safety(actions)
 

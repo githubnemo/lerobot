@@ -1220,6 +1220,7 @@ def compute_online_training_normalizer(
     train_episodes: Sequence[int],
     output_dir: Path,
     kinematics: Any | None = None,
+    delta_actions: bool = False,
 ) -> SmolVLANormalizer:
     """Compute SmolVLA normalization statistics from online training dataset."""
     states: list[Tensor] = []
@@ -1241,6 +1242,9 @@ def compute_online_training_normalizer(
     if kinematics is not None:
         all_states = joints_to_cartesian(all_states, kinematics)
         all_actions = joints_to_cartesian(all_actions, kinematics)
+    elif delta_actions:
+        all_actions = all_actions.clone()
+        all_actions[:, :, :5] = all_actions[:, :, :5] - all_states[:, None, :5]
 
     normalizer = SmolVLANormalizer.from_training_tensors(
         state=all_states,
@@ -1497,11 +1501,16 @@ def evaluate_validation(
 
             noise = torch.cat(sample_noises, dim=0)
 
+            use_delta = bool(getattr(decoder, "_delta_actions", False))
             if kinematics is not None:
                 true_joint_actions = actions
                 true_joint_states = states
                 actions = joints_to_cartesian(actions, kinematics)
                 states = joints_to_cartesian(states, kinematics)
+            elif use_delta:
+                true_abs_actions = actions
+                actions = actions.clone()
+                actions[:, :, :5] = actions[:, :, :5] - states[:, None, :5]
 
             # 2. Action sampling with explicit noise
             pred_actions = decoder.sample_actions(states, contexts, noise=noise, num_steps=num_steps)
@@ -1515,6 +1524,10 @@ def evaluate_validation(
                 total_cart_pos_err_mm += float((cart_pos_err * valid_b).sum().item())
                 pred_joint_actions = cartesian_to_joints_ik(true_joint_states, pred_actions, kinematics)
                 squared_err = (pred_joint_actions.double() - true_joint_actions.double()).square() * valid
+            elif use_delta:
+                pred_abs = pred_actions.clone()
+                pred_abs[:, :, :5] = pred_abs[:, :, :5] + states[:, None, :5]
+                squared_err = (pred_abs.double() - true_abs_actions.double()).square() * valid  # [B, 30, 6]
             else:
                 squared_err = (pred_actions.double() - actions.double()).square() * valid  # [B, 30, 6]
 
@@ -1801,6 +1814,18 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         choices=[1, 5],
         default=5,
         help="Number of input camera frames per observation window (default: 5; use 1 for single-frame ablation).",
+    )
+    parser.add_argument(
+        "--delta-actions",
+        action="store_true",
+        default=False,
+        help="Predict relative arm joint deltas (q_{t+k} - q_t) for joints 0..4 (gripper 5 stays absolute) to be robust to calibration offsets.",
+    )
+    parser.add_argument(
+        "--state-offset-aug-deg",
+        type=float,
+        default=0.0,
+        help="Random per-sample calibration-offset augmentation +/-deg on arm joints 0..4 during training (e.g. 5.0).",
     )
     parser.add_argument(
         "--backbone-lora-lr",
@@ -2868,7 +2893,11 @@ def main(argv: list[str] | None = None) -> int:
         else:
             print("Computing SmolVLA normalizer from online train split...")
             normalizer = compute_online_training_normalizer(
-                train_dataset, train_eps, args.output_dir, kinematics=kinematics
+                train_dataset,
+                train_eps,
+                args.output_dir,
+                kinematics=kinematics,
+                delta_actions=bool(args.delta_actions),
             )
             print(f"Normalizer computed and saved to {args.output_dir / 'normalizer.safetensors'}")
     elif args.eval_only:
@@ -3195,6 +3224,7 @@ def main(argv: list[str] | None = None) -> int:
             input_channels=input_channels,
         )
 
+    decoder._delta_actions = bool(args.delta_actions)
     decoder_trainable_params = [p for p in decoder.parameters() if p.requires_grad]
     backbone_trainable_params = (
         [p for p in backbone_extractor.parameters() if p.requires_grad]
@@ -3551,6 +3581,20 @@ def main(argv: list[str] | None = None) -> int:
             if kinematics is not None:
                 states = joints_to_cartesian(states, kinematics)
                 actions = joints_to_cartesian(actions, kinematics)
+            else:
+                if args.delta_actions:
+                    actions = actions.clone()
+                    actions[:, :, :5] = actions[:, :, :5] - states[:, None, :5]
+                if args.state_offset_aug_deg > 0.0:
+                    cal_off = (
+                        (torch.rand((states.shape[0], 5), device=states.device, dtype=states.dtype) * 2.0 - 1.0)
+                        * float(args.state_offset_aug_deg)
+                    )
+                    states = states.clone()
+                    states[:, :5] = states[:, :5] + cal_off
+                    if not args.delta_actions:
+                        actions = actions.clone()
+                        actions[:, :, :5] = actions[:, :, :5] + cal_off[:, None, :]
 
             # Flow matching loss with strict padding masking
             loss = flow_matching_loss_fn(
@@ -3971,6 +4015,7 @@ def main(argv: list[str] | None = None) -> int:
                 "cosmos3_prompt": args.backbone_prompt,
                 "cosmos3_fps": resolved_cfg_fps,
                 "history_size": int(args.history_size),
+                "delta_actions": bool(args.delta_actions),
             }
         )
     elif backend_val == "cosmos":
