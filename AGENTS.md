@@ -130,6 +130,12 @@ Every training, evaluation, or RL post-training experiment MUST leave a complete
 3. **Checkpoint portability (RunPod / `abakus` / `sahni` / Mac)**:
    - Never hardcode `/home/anton/...` in new presets or `expNNN` scripts; resolve model caches via `${VAM_CACHE_DIR:-$HOME/.cache/video-vam}` and compute/save normalizers inside the run output dir when training on a new dataset.
    - Push candidate checkpoints intended for live robot testing or cross-host RL post-training to Hugging Face Hub (`Orellius/...`) and record the HF repo ID in the leaderboard.
+4. **Daily Session Trace (`docs/daily/YYYY-MM-DD.md` — Mandatory, Auto-Created & Continuously Updated)**:
+   - On every active working day, automatically create (if missing) and update **`docs/daily/YYYY-MM-DD.md`** (and list it in **`docs/daily/README.md`**) whenever substantial work, experiments, rollouts, dataset recordings, or code changes happen — so Anton can always ask about or revisit any previous day.
+   - Every daily trace must include: **Commits & Code Changes**, **Datasets & Rollouts Recorded** (exact paths on `sahni`/`abakus` + HF Hub repo & SHA), **Experiments & Live Tests** (grounded, unhyped outcomes), **Key Findings / Bugs Caught**, and **Next Steps / Open Questions**.
+5. **Data Collection & Rollout Recording Invariants**:
+   - **Always record rollouts** (never discard rollout data) and sync them to `abakus:/home/anton/lerobot-video-vam/outputs/rollout_debug/` via `scripts/video_vam/sync_rollouts_to_abakus.sh` (or record full 30 fps LeRobot datasets via `lerobot-rollout --dataset.repo_id=...` when collecting data for further training/eval).
+   - **Always record teleop datasets at the camera's highest supported FPS** (`30 fps` on `shabby`) with **full STS3215 servo telemetry** (`--robot.record_all_telemetry=true`: `pos`, `vel`, `load`, `current`, `voltage`, `temperature`, `moving`, `status`).
 
 ---
 
