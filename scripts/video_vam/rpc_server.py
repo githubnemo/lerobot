@@ -286,6 +286,7 @@ class RPCApplication:
         self.online_expo_enabled = bool(getattr(args, "online_expo", False))
         self.shared_detector = None
         self.multiframe_detector = None
+        self.detector_pretrained = False
         self.current_episode_steps: list[dict[str, Any]] = []
         self.online_rollout_buffer: list[dict[str, Any]] = []
         self.latest_frame_b64: str | None = None
@@ -321,6 +322,7 @@ class RPCApplication:
                 ).to(self.device)
                 self.multiframe_detector.load_state_dict(det_state, strict=False)
                 self.multiframe_detector.eval()
+                self.detector_pretrained = True
             else:
                 from lerobot.rewards.sequence_detector import SharedFeatureSequenceDetector
 
@@ -579,7 +581,7 @@ class RPCApplication:
                     live_pre_grasp_prob = float(pre_probs[best_k].item())
                     self.current_episode_steps[-1]["det_prob"] = live_reward_prob
                     self.current_episode_steps[-1]["pre_grasp_prob"] = live_pre_grasp_prob
-                    if live_reward_prob >= 0.80:
+                    if self.detector_pretrained and live_reward_prob >= 0.80:
                         live_reward_detected = True
         else:
             expected_hist = int(getattr(self.backend.config, "history_size", HISTORY))
@@ -722,7 +724,12 @@ class RPCApplication:
         if manual_reward is not None:
             reward_prob = float(manual_reward)
             reward = 1.0 if reward_prob >= 0.5 else 0.0
-        elif getattr(self, "multiframe_detector", None) is not None and steps and "vis_raw" in steps[0]:
+        elif (
+            self.detector_pretrained
+            and getattr(self, "multiframe_detector", None) is not None
+            and steps
+            and "vis_raw" in steps[0]
+        ):
             seq_len = self.multiframe_detector.seq_len
             n_st = len(steps)
             win_vis_list = []
