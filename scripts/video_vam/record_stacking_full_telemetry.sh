@@ -29,11 +29,13 @@ exec "$LEROBOT_BIN" \
   --robot.type=so101_follower \
   --robot.port="$FOLLOWER_PORT" \
   --robot.id="$FOLLOWER_ID" \
+  --robot.num_read_retries=10 \
   --robot.record_all_telemetry=true \
   --robot.cameras="{front: {type: opencv, index_or_path: ${CAMERA_INDEX}, width: 640, height: 480, fps: ${RECORD_FPS}}}" \
   --teleop.type=so101_leader \
   --teleop.port="$LEADER_PORT" \
   --teleop.id="$LEADER_ID" \
+  --teleop.num_read_retries=10 \
   --dataset.repo_id="$REPO_ID" \
   --dataset.num_episodes="$NUM_EPISODES" \
   --dataset.fps="$RECORD_FPS" \
